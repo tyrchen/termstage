@@ -3,7 +3,7 @@
 Status: draft v1
 Last updated: 2026-05-19
 
-This spec set defines the browser-based terminal presentation mode for `presenterm`.
+This spec set defines the browser-based terminal presentation mode for `termstage`.
 Read in numbered order for build order, then use the roadmap and implementation plan
 to map that order to user-visible milestones.
 

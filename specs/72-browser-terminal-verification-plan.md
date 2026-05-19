@@ -1,7 +1,7 @@
 # 72-browser-terminal-verification: Test and Quality Gates
 
 Status: draft v1
-Owner: presenterm
+Owner: termstage
 Depends on: [10-browser-terminal-protocol-design.md](./10-browser-terminal-protocol-design.md),
 [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md),
 [20-browser-terminal-web-design.md](./20-browser-terminal-web-design.md),

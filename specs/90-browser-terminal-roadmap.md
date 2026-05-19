@@ -1,7 +1,7 @@
 # Roadmap - Browser Terminal Presentation Mode
 
 Status: draft v1
-Owner: presenterm
+Owner: termstage
 Last updated: 2026-05-19
 
 ## 1. Principles
@@ -16,7 +16,7 @@ Last updated: 2026-05-19
 
 ### M0 - Local Browser Terminal
 
-User-visible outcome: a presenter runs `presenterm --session presentation --open`,
+User-visible outcome: a presenter runs `termstage --session presentation --open`,
 Chrome opens, and the tab controls a local tmux-backed terminal.
 
 Specs touched: 00, 10, 11, 20, 50, 61, 70, 72.

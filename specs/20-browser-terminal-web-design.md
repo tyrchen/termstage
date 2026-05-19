@@ -1,7 +1,7 @@
 # 20-browser-terminal-web: Server and Browser UI
 
 Status: draft v1
-Owner: presenterm
+Owner: termstage
 Depends on: [10-browser-terminal-protocol-design.md](./10-browser-terminal-protocol-design.md),
 [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md),
 [70-browser-terminal-security-design.md](./70-browser-terminal-security-design.md)
@@ -88,7 +88,7 @@ emits a redacted structured log event.
   leaking tokens or terminal payloads.
 - Async/concurrency: handler tasks are supervised; no unbounded spawned task per frame.
 - Type design: route state is a typed `AppState`; token/host/origin checks use domain
-  types from `presenterm-core`.
+  types from `termstage-core`.
 - Safety/security: local-service security follows
   [70-browser-terminal-security-design.md](./70-browser-terminal-security-design.md).
 - Serialization: JSON control messages use `serde` and immediate validation.

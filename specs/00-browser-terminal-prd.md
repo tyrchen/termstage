@@ -1,7 +1,7 @@
 # PRD - Browser Terminal Presentation Mode
 
 Status: draft v1
-Owner: presenterm
+Owner: termstage
 Last updated: 2026-05-19
 
 ## 1. Problem
@@ -19,7 +19,7 @@ tmux session during a live demo.
 
 ## 2. Vision
 
-`presenterm --session presentation --open` starts a local-only Rust service on a
+`termstage --session presentation --open` starts a local-only Rust service on a
 random loopback port, opens a Chrome tab containing an xterm.js terminal, and bridges
 browser terminal bytes to a PTY-backed shell or shared tmux session. The presenter can
 keep sharing Chrome while using slides and terminal tabs side by side.
@@ -27,7 +27,7 @@ keep sharing Chrome while using slides and terminal tabs side by side.
 ```text
 Presenter workflow
 
-1. presenterm --session presentation --open
+1. termstage --session presentation --open
 2. Chrome opens http://127.0.0.1:<random>/?token=<redacted>
 3. Browser terminal attaches to tmux session "presentation"
 4. Presenter runs demo commands without switching Zoom share targets
@@ -78,13 +78,13 @@ model.
 
 ## 7. Naming Conventions
 
-- Product command: `presenterm`.
+- Product command: `termstage`.
 - Feature name in specs and code modules: `browser_terminal`.
 - Default tmux session name: `presentation`.
 - Browser route names: `/`, `/assets/*`, `/ws`.
 - Rust workspace ownership:
-  - `presenterm-core`: protocol, validation newtypes, session/runtime contracts.
-  - `presenterm-server`: CLI, Axum routes, static asset serving, PTY process wiring.
+  - `termstage-core`: protocol, validation newtypes, session/runtime contracts.
+  - `termstage`: CLI, Axum routes, static asset serving, PTY process wiring.
 
 ## 8. Cross-References
 

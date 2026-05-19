@@ -1,7 +1,7 @@
 # 50-browser-terminal-cli: Command Surface and Presentation UX
 
 Status: draft v1
-Owner: presenterm
+Owner: termstage
 Depends on: [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md),
 [20-browser-terminal-web-design.md](./20-browser-terminal-web-design.md)
 
@@ -15,7 +15,7 @@ owns argument parsing, defaults, browser opening, and terminal session mode sele
 M0 command:
 
 ```text
-presenterm --session presentation --open
+termstage --session presentation --open
 ```
 
 Planned arguments:

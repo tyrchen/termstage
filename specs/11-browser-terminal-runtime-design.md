@@ -1,7 +1,7 @@
 # 11-browser-terminal-runtime: PTY and Session Runtime
 
 Status: draft v1
-Owner: presenterm
+Owner: termstage
 Depends on: [10-browser-terminal-protocol-design.md](./10-browser-terminal-protocol-design.md)
 
 ## 1. Purpose
@@ -44,12 +44,12 @@ argv form.
 ## 2a. Architecture
 
 ```text
-                         presenterm-server
+                         termstage
                                |
                                | validated RuntimeCommand
                                v
         +------------------------------------------------+
-        | presenterm-core runtime                         |
+        | termstage-core runtime                         |
         |                                                |
         |  +-------------------+       +---------------+  |
         |  | Session Manager   | ----> | Session Actor |  |

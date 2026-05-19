@@ -1,7 +1,7 @@
 # Key Decisions - Browser Terminal Presentation Mode
 
 Status: draft v1
-Owner: presenterm
+Owner: termstage
 Last updated: 2026-05-19
 
 Each decision is permanent. Supersede with a new decision rather than editing history
@@ -51,13 +51,13 @@ after implementation begins.
   [90-browser-terminal-roadmap.md](./90-browser-terminal-roadmap.md).
 - Date: 2026-05-19.
 
-## D5 - Keep Domain Contracts in `presenterm-core`
+## D5 - Keep Domain Contracts in `termstage-core`
 
 - Context: Workspace ownership.
 - Alternatives considered: put all code in `apps/server`, create a separate protocol
-  crate, use current `presenterm-core`.
+  crate, use current `termstage-core`.
 - Decision: Put protocol, validation, security, and runtime contracts in
-  `presenterm-core`; put integration code in `presenterm-server`.
+  `termstage-core`; put integration code in `termstage`.
 - Why: The current workspace already has a core/server split, and keeping validation
   contracts outside Axum handlers makes testing and review cleaner.
 - Pinned by: [61-browser-terminal-crates-and-features.md](./61-browser-terminal-crates-and-features.md).

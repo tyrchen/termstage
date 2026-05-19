@@ -1,7 +1,7 @@
 # Browser Terminal Phase 0 Validation
 
 Status: complete
-Owner: presenterm
+Owner: termstage
 Last updated: 2026-05-19
 
 ## Scope
@@ -55,12 +55,12 @@ Primary docs checked:
 
 ## 0.1 PTY Validation
 
-A throwaway Rust probe in `/tmp/presenterm-phase0-pty` used:
+A throwaway Rust probe in `/tmp/termstage-phase0-pty` used:
 
 - `portable-pty = 0.9.0`
 - `anyhow = 1.0.102`
 - `/bin/zsh -f`
-- `/usr/bin/env -u TMUX tmux new-session -A -s presenterm-phase0`
+- `/usr/bin/env -u TMUX tmux new-session -A -s termstage-phase0`
 
 Validated operations:
 
@@ -93,7 +93,7 @@ Implementation notes:
 
 ## 0.2 xterm and Vite Validation
 
-A throwaway frontend probe in `/tmp/presenterm-phase0-xterm` used:
+A throwaway frontend probe in `/tmp/termstage-phase0-xterm` used:
 
 - `@xterm/xterm = 6.0.0`
 - `@xterm/addon-fit = 0.11.0`
@@ -134,7 +134,7 @@ Implementation notes:
 
 ## 0.3 Axum WebSocket Validation
 
-A throwaway Rust probe in `/tmp/presenterm-phase0-axum` used:
+A throwaway Rust probe in `/tmp/termstage-phase0-axum` used:
 
 - `axum = { version = "0.8.9", default-features = false, features = ["ws", "http1"] }`
 - `tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }`

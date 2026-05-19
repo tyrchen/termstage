@@ -1,7 +1,7 @@
 # 61-browser-terminal-crates: Crates, Features, and Dependencies
 
 Status: draft v1
-Owner: presenterm
+Owner: termstage
 Depends on: [10-browser-terminal-protocol-design.md](./10-browser-terminal-protocol-design.md),
 [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md),
 [20-browser-terminal-web-design.md](./20-browser-terminal-web-design.md)
@@ -15,7 +15,7 @@ starts from current packages instead of stale examples.
 ## 2. Workspace Layout
 
 ```text
-presenterm/
+termstage/
   crates/core/
     src/browser_terminal/
       protocol.rs
@@ -37,7 +37,7 @@ presenterm/
         presentation.ts
 ```
 
-`presenterm-core` owns reusable domain contracts. `presenterm-server` owns integration
+`termstage-core` owns reusable domain contracts. `termstage` owns integration
 code that depends on Axum, browser asset tooling, and process spawning.
 
 ## 3. Dependency Baseline
@@ -47,12 +47,12 @@ Versions verified on 2026-05-19. Phase 0 validation evidence is in
 
 | Dependency | Version | Owner | Feature notes |
 | --- | --- | --- | --- |
-| `axum` | `0.8.9` | `presenterm-server` | Use `ws`; avoid unnecessary optional features. |
-| `portable-pty` | `0.9.0` | `presenterm-server` initially | PTY creation/spawn/resize; wrap behind core-owned traits if needed. |
-| `tower-http` | `0.6.11` | `presenterm-server` | Use trace and static asset helpers only when feature-scoped. |
+| `axum` | `0.8.9` | `termstage` | Use `ws`; avoid unnecessary optional features. |
+| `portable-pty` | `0.9.0` | `termstage` initially | PTY creation/spawn/resize; wrap behind core-owned traits if needed. |
+| `tower-http` | `0.6.11` | `termstage` | Use trace and static asset helpers only when feature-scoped. |
 | `tokio` | workspace | both | Explicit features; runtime already in workspace. |
-| `thiserror` | workspace | `presenterm-core` | Domain errors. |
-| `anyhow` | workspace | `presenterm-server` | CLI/application context. |
+| `thiserror` | workspace | `termstage-core` | Domain errors. |
+| `anyhow` | workspace | `termstage` | CLI/application context. |
 | `serde` / `serde_json` | workspace | both | Control message protocol. |
 | `bytes` | latest compatible `1` | both | Efficient terminal frame payloads. |
 | `secrecy` | `0.10.3` | core/server | Token redaction and explicit exposure. |

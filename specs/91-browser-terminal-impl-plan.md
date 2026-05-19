@@ -1,7 +1,7 @@
 # Implementation Plan - Browser Terminal Presentation Mode
 
 Status: draft v1
-Owner: presenterm
+Owner: termstage
 Last updated: 2026-05-19
 
 ## 0. Readiness Assessment
@@ -76,7 +76,7 @@ Maps to roadmap: closes M0.
 | --- | --- | --- | --- |
 | 3.1 | Add Axum routes, loopback bind, token URL, and security middleware/checks. | [20](./20-browser-terminal-web-design.md), [70](./70-browser-terminal-security-design.md) | 1.5 days |
 | 3.2 | Add WebSocket bridge from frames to runtime commands and runtime output to browser. | [10](./10-browser-terminal-protocol-design.md), [20](./20-browser-terminal-web-design.md) | 1.5 days |
-| 3.3 | Add CLI parsing and `presenterm --session presentation --open`. | [50](./50-browser-terminal-cli-design.md) | 1 day |
+| 3.3 | Add CLI parsing and `termstage --session presentation --open`. | [50](./50-browser-terminal-cli-design.md) | 1 day |
 | 3.4 | Add route/security integration tests. | [72](./72-browser-terminal-verification-plan.md) | 1 day |
 
 Exit criteria: M0 roadmap criteria pass end to end.

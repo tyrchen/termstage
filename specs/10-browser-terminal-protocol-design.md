@@ -1,7 +1,7 @@
 # 10-browser-terminal-protocol: Data Model and Wire Contract
 
 Status: draft v1
-Owner: presenterm
+Owner: termstage
 Depends on: [00-browser-terminal-prd.md](./00-browser-terminal-prd.md)
 
 ## 1. Purpose
@@ -114,7 +114,7 @@ messages arrive rapidly. The PTY actor processes them sequentially in mailbox or
 ## 5. AGENTS.md Binding
 
 - Error handling: per `AGENTS.md` Error Handling, domain errors use `thiserror` in
-  `presenterm-core`; CLI/application layers use `anyhow` with context.
+  `termstage-core`; CLI/application layers use `anyhow` with context.
 - Async/concurrency: per `AGENTS.md`, messages cross actor boundaries through bounded
   channels; no shared mutable PTY state.
 - Type design: dimensions, tokens, and names are newtypes with fallible constructors.

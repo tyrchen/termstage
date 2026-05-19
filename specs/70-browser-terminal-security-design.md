@@ -1,7 +1,7 @@
 # 70-browser-terminal-security: Local Shell Threat Model
 
 Status: draft v1
-Owner: presenterm
+Owner: termstage
 Depends on: [00-browser-terminal-prd.md](./00-browser-terminal-prd.md),
 [10-browser-terminal-protocol-design.md](./10-browser-terminal-protocol-design.md)
 

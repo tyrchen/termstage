@@ -1,7 +1,7 @@
 # 80-browser-terminal-glossary
 
 Status: draft v1
-Owner: presenterm
+Owner: termstage
 
 ## Browser terminal
 
