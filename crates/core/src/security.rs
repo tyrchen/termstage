@@ -1,4 +1,4 @@
-//! Local-only security validation for the browser terminal server.
+//! Security validation for browser terminal server exposure modes.
 //!
 //! These types validate trust-boundary values before HTTP or WebSocket handlers
 //! allocate runtime sessions.
@@ -6,6 +6,7 @@
 use std::{
     fmt::{self, Debug, Formatter},
     net::{IpAddr, SocketAddr},
+    str::FromStr,
 };
 
 use thiserror::Error;
@@ -25,9 +26,32 @@ pub enum SecurityError {
     /// The peer socket address was not loopback.
     #[error("forbidden")]
     InvalidPeer,
+    /// The public base URL was invalid for internet exposure mode.
+    #[error("invalid public url")]
+    InvalidPublicUrl,
     /// The supplied token did not match the server token.
     #[error("forbidden")]
     InvalidToken,
+}
+
+/// Request exposure policy selected at server startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExposurePolicy {
+    /// Local loopback-only service.
+    Local(LoopbackBind),
+    /// Public service behind an HTTPS ingress or reverse proxy.
+    Public(PublicBaseUrl),
+}
+
+impl ExposurePolicy {
+    /// Creates a local loopback policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecurityError::InvalidPeer`] when `host` is not loopback.
+    pub fn local(host: IpAddr, port: u16) -> Result<Self, SecurityError> {
+        Ok(Self::Local(LoopbackBind::new(host, port)?))
+    }
 }
 
 /// Selected loopback bind target that requests must match.
@@ -68,6 +92,88 @@ impl LoopbackBind {
     }
 }
 
+/// Browser-visible HTTPS base URL for public exposure mode.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PublicBaseUrl {
+    url: Url,
+    host: String,
+    port: u16,
+}
+
+impl PublicBaseUrl {
+    /// Creates a validated public base URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecurityError::InvalidPublicUrl`] when the URL is not HTTPS, has
+    /// no host, contains credentials, query, or fragment, or has a non-root path.
+    pub fn parse(value: &str) -> Result<Self, SecurityError> {
+        let mut url = Url::parse(value).map_err(|_error| SecurityError::InvalidPublicUrl)?;
+        if url.scheme() != "https" {
+            return Err(SecurityError::InvalidPublicUrl);
+        }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.path() != "/"
+        {
+            return Err(SecurityError::InvalidPublicUrl);
+        }
+        let host = url
+            .host_str()
+            .ok_or(SecurityError::InvalidPublicUrl)?
+            .to_ascii_lowercase();
+        let port = url
+            .port_or_known_default()
+            .ok_or(SecurityError::InvalidPublicUrl)?;
+        url.set_path("/");
+        Ok(Self { url, host, port })
+    }
+
+    /// Returns the public URL as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.url.as_str()
+    }
+
+    /// Returns the public URL with token and presentation settings.
+    #[must_use]
+    pub fn launch_url(&self, token: &AccessToken, font_size: u16, theme: &str) -> String {
+        let mut url = self.url.clone();
+        url.query_pairs_mut()
+            .append_pair("token", &token.to_url_token())
+            .append_pair("fontSize", &font_size.to_string())
+            .append_pair("theme", theme);
+        url.to_string()
+    }
+
+    fn host_matches(&self, host: &str) -> bool {
+        host.eq_ignore_ascii_case(&self.host)
+    }
+
+    fn port_matches(&self, port: Option<u16>) -> bool {
+        port.unwrap_or(443) == self.port
+    }
+}
+
+impl Debug for PublicBaseUrl {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicBaseUrl")
+            .field("url", &self.url.as_str())
+            .finish_non_exhaustive()
+    }
+}
+
+impl FromStr for PublicBaseUrl {
+    type Err = SecurityError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
 /// Validated HTTP Host header.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AllowedHost(String);
@@ -85,6 +191,30 @@ impl AllowedHost {
             Ok(Self(value.to_owned()))
         } else {
             Err(SecurityError::InvalidHost)
+        }
+    }
+
+    /// Validates a Host header against the configured exposure policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecurityError::InvalidHost`] when the host header is invalid for
+    /// the selected policy.
+    pub fn validate_for_policy(
+        value: &str,
+        policy: &ExposurePolicy,
+    ) -> Result<Self, SecurityError> {
+        match policy {
+            ExposurePolicy::Local(bind) => Self::validate(value, *bind),
+            ExposurePolicy::Public(url) => {
+                let (host, port) =
+                    split_host_optional_port(value).ok_or(SecurityError::InvalidHost)?;
+                if url.host_matches(host) && url.port_matches(port) {
+                    Ok(Self(value.to_owned()))
+                } else {
+                    Err(SecurityError::InvalidHost)
+                }
+            }
         }
     }
 
@@ -131,6 +261,36 @@ impl AllowedOrigin {
         }
     }
 
+    /// Validates an Origin header against the configured exposure policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecurityError::InvalidOrigin`] when the origin is invalid for
+    /// the selected policy.
+    pub fn validate_for_policy(
+        value: &str,
+        policy: &ExposurePolicy,
+    ) -> Result<Self, SecurityError> {
+        match policy {
+            ExposurePolicy::Local(bind) => Self::validate(value, *bind),
+            ExposurePolicy::Public(url) => {
+                let origin = Url::parse(value).map_err(|_error| SecurityError::InvalidOrigin)?;
+                if origin.scheme() != "https" {
+                    return Err(SecurityError::InvalidOrigin);
+                }
+                if origin.path() != "/" || origin.query().is_some() || origin.fragment().is_some() {
+                    return Err(SecurityError::InvalidOrigin);
+                }
+                let host = origin.host_str().ok_or(SecurityError::InvalidOrigin)?;
+                if url.host_matches(host) && url.port_matches(origin.port_or_known_default()) {
+                    Ok(Self(value.to_owned()))
+                } else {
+                    Err(SecurityError::InvalidOrigin)
+                }
+            }
+        }
+    }
+
     /// Returns the validated origin.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -172,6 +332,22 @@ impl PeerAddr {
     }
 }
 
+/// Validates that a socket peer is allowed by the exposure policy.
+///
+/// # Errors
+///
+/// Returns [`SecurityError::InvalidPeer`] when local mode receives a non-loopback
+/// peer.
+pub fn validate_peer_for_policy(
+    value: SocketAddr,
+    policy: &ExposurePolicy,
+) -> Result<PeerAddr, SecurityError> {
+    match policy {
+        ExposurePolicy::Local(_bind) => PeerAddr::validate(value),
+        ExposurePolicy::Public(_url) => Ok(PeerAddr(value)),
+    }
+}
+
 /// Validates an access token without leaking token contents.
 ///
 /// # Errors
@@ -200,6 +376,29 @@ fn split_host_port(value: &str) -> Option<(&str, u16)> {
     };
     let port = port.parse().ok()?;
     Some((host, port))
+}
+
+fn split_host_optional_port(value: &str) -> Option<(&str, Option<u16>)> {
+    if value.is_empty() || value.contains('/') {
+        return None;
+    }
+    if let Some(rest) = value.strip_prefix('[') {
+        let (host, suffix) = rest.split_once(']')?;
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            let port = suffix.strip_prefix(':')?.parse().ok()?;
+            Some(port)
+        };
+        return Some((host, port));
+    }
+    if let Some((host, port)) = value.rsplit_once(':') {
+        if host.contains(':') {
+            return Some((value, None));
+        }
+        return Some((host, Some(port.parse().ok()?)));
+    }
+    Some((value, None))
 }
 
 #[cfg(test)]
@@ -274,6 +473,55 @@ mod tests {
     fn test_should_validate_ipv6_loopback_host() -> anyhow::Result<()> {
         let bind = LoopbackBind::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 49200)?;
         assert!(AllowedHost::validate("[::1]:49200", bind).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_validate_public_base_url() -> anyhow::Result<()> {
+        let url = PublicBaseUrl::parse("https://term.example.com/")?;
+        assert_eq!(url.as_str(), "https://term.example.com/");
+        assert!(matches!(
+            PublicBaseUrl::parse("http://term.example.com/"),
+            Err(SecurityError::InvalidPublicUrl)
+        ));
+        assert!(matches!(
+            PublicBaseUrl::parse("https://term.example.com/path"),
+            Err(SecurityError::InvalidPublicUrl)
+        ));
+        assert!(matches!(
+            PublicBaseUrl::parse("https://user@term.example.com/"),
+            Err(SecurityError::InvalidPublicUrl)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_validate_public_host_and_origin() -> anyhow::Result<()> {
+        let policy = ExposurePolicy::Public(PublicBaseUrl::parse("https://term.example.com/")?);
+        assert!(AllowedHost::validate_for_policy("term.example.com", &policy).is_ok());
+        assert!(AllowedHost::validate_for_policy("term.example.com:443", &policy).is_ok());
+        assert!(AllowedOrigin::validate_for_policy("https://term.example.com", &policy).is_ok());
+        assert!(matches!(
+            AllowedHost::validate_for_policy("evil.example", &policy),
+            Err(SecurityError::InvalidHost)
+        ));
+        assert!(matches!(
+            AllowedOrigin::validate_for_policy("https://evil.example", &policy),
+            Err(SecurityError::InvalidOrigin)
+        ));
+        assert!(matches!(
+            AllowedOrigin::validate_for_policy("http://term.example.com", &policy),
+            Err(SecurityError::InvalidOrigin)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_allow_public_non_loopback_peer() -> anyhow::Result<()> {
+        let policy = ExposurePolicy::Public(PublicBaseUrl::parse("https://term.example.com/")?);
+        let remote = SocketAddr::from(([192, 0, 2, 1], 5000));
+        let peer = validate_peer_for_policy(remote, &policy)?;
+        assert_eq!(peer.get(), remote);
         Ok(())
     }
 

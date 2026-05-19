@@ -25,12 +25,15 @@ Planned arguments:
 | `--session <name>` | `presentation` | Attach/create a tmux session with the validated name. |
 | `--mode <tmux|shell>` | `tmux` | Choose shared tmux or fresh shell mode. |
 | `--shell <path>` | `$SHELL` on Unix | Shell executable for shell mode only. |
-| `--host <loopback>` | `127.0.0.1` | Bind address; only loopback accepted before remote-share mode exists. |
+| `--host <addr>` | `127.0.0.1` | Bind address; non-loopback requires `--expose-public`. |
 | `--port <port>` | `0` | Port `0` means OS-chosen random port. |
 | `--open` | false | Open the tokenized URL in the default browser. |
 | `--font-size <px>` | `24` | Browser terminal font size. |
 | `--theme <name>` | `high-contrast` | Presentation theme preset. |
 | `--keepalive <policy>` | `session` | Keep tmux session after browser disconnect. |
+| `--expose-public` | false | Enable pod/internet mode; required before non-loopback bind addresses are accepted. |
+| `--public-url <url>` | unset | HTTPS browser-visible base URL for public mode. |
+| `--token-env <name>` | unset | Environment variable containing a 64-hex-character access token for public mode. |
 
 ## 2a. User Flow
 
@@ -53,14 +56,17 @@ CLI                 Server              Browser              Runtime
 
 ## 3. Invariants
 
-- CLI never accepts a non-loopback bind address until a dedicated remote-sharing spec
-  exists.
+- CLI never accepts a non-loopback bind address unless `--expose-public` is present
+  and [21-browser-terminal-public-exposure-design.md](./21-browser-terminal-public-exposure-design.md)
+  validation succeeds.
 - CLI arguments crossing trust boundaries are validated before server startup.
 - `--session` is a tmux session name, not a shell command.
 - `--shell` is an executable path plus argv handling, not a string passed through
   `sh -c`.
 - Browser URL printed to logs redacts token unless the output is the explicit user
   launch URL.
+- Public mode requires `--public-url` and `--token-env`; local mode rejects both to
+  keep exposure intent explicit.
 
 ## 4. Behavior
 
@@ -79,7 +85,8 @@ connections, stop runtime actors according to keepalive policy, and join tasks.
 - Error handling: CLI uses `anyhow` with context and typed core errors underneath.
 - Async/concurrency: Ctrl-C shutdown is coordinated through runtime channels.
 - Type design: `CliArgs` validates into a separate `ValidatedCliConfig`.
-- Safety/security: no shell string concatenation; loopback-only bind.
+- Safety/security: no shell string concatenation; loopback-only bind by default;
+  public exposure only through [21](./21-browser-terminal-public-exposure-design.md).
 - Serialization: N/A.
 - Testing: parser tests for invalid session names, bind addresses, ports, and shell
   paths; smoke test for default config.
@@ -90,6 +97,7 @@ connections, stop runtime actors according to keepalive policy, and join tasks.
 ## 6. Cross-References
 
 - Depends on: [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md),
-  [20-browser-terminal-web-design.md](./20-browser-terminal-web-design.md).
+  [20-browser-terminal-web-design.md](./20-browser-terminal-web-design.md),
+  [21-browser-terminal-public-exposure-design.md](./21-browser-terminal-public-exposure-design.md).
 - Consumed by: [90-browser-terminal-roadmap.md](./90-browser-terminal-roadmap.md),
   [91-browser-terminal-impl-plan.md](./91-browser-terminal-impl-plan.md).

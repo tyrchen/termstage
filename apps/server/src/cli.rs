@@ -1,6 +1,7 @@
 //! Command-line interface for browser terminal mode.
 
 use std::{
+    env,
     ffi::OsString,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
@@ -14,24 +15,27 @@ use termstage_core::{
     runtime::{
         ReconnectPolicy, RuntimeConfig, RuntimeSession, SessionMode, ShellCommand, ShutdownReason,
     },
+    security::PublicBaseUrl,
 };
 use tracing::info;
 
-use crate::web::{PresentationSettings, PresentationTheme, WebConfig, serve};
+use crate::web::{PresentationSettings, PresentationTheme, WebConfig, WebExposure, serve};
 
 const DEFAULT_SESSION: &str = "presentation";
 const DEFAULT_FONT_SIZE: u16 = 24;
 const MIN_FONT_SIZE: u16 = 12;
 const MAX_FONT_SIZE: u16 = 96;
+const TOKEN_ENV_MAX_BYTES: usize = 128;
 
 /// Browser terminal command-line arguments.
 #[derive(Debug, Parser)]
 #[command(name = "termstage")]
-#[command(about = "Run a loopback-only browser terminal for presentations")]
+#[command(about = "Run a browser terminal for presentations")]
 #[command(
-    long_about = "Run a loopback-only browser terminal for presentations. This is a local shell \
-                  bridge, not a sandbox: browser input is sent to a real shell or tmux session \
-                  with the current OS user's privileges."
+    long_about = "Run a browser terminal for presentations. By default the server is \
+                  loopback-only. Public pod exposure requires --expose-public, --public-url, and \
+                  --token-env. This is a shell bridge, not a sandbox: browser input is sent to a \
+                  real shell or tmux session with the current OS user's privileges."
 )]
 pub struct CliArgs {
     /// Attach to or create this tmux session.
@@ -43,7 +47,7 @@ pub struct CliArgs {
     /// Shell executable for shell mode.
     #[arg(long)]
     shell: Option<PathBuf>,
-    /// Loopback bind address. Non-loopback addresses are rejected.
+    /// Bind address. Non-loopback addresses require --expose-public.
     #[arg(long, default_value = "127.0.0.1")]
     host: IpAddr,
     /// TCP port. Use 0 for an OS-selected random port.
@@ -61,6 +65,15 @@ pub struct CliArgs {
     /// Session keepalive policy for browser refresh and shutdown.
     #[arg(long, value_enum, default_value_t = CliKeepalive::Session)]
     keepalive: CliKeepalive,
+    /// Enable internet-facing pod mode behind an HTTPS ingress.
+    #[arg(long, default_value_t = false)]
+    expose_public: bool,
+    /// Browser-visible HTTPS base URL for public mode.
+    #[arg(long)]
+    public_url: Option<String>,
+    /// Environment variable containing the 64-hex-character access token.
+    #[arg(long)]
+    token_env: Option<String>,
 }
 
 /// Validated CLI configuration.
@@ -68,26 +81,28 @@ pub struct CliArgs {
 pub struct ValidatedCliConfig {
     /// Runtime configuration.
     pub runtime: RuntimeConfig,
-    /// Loopback bind host.
+    /// Bind host.
     pub host: IpAddr,
-    /// Loopback bind port.
+    /// TCP bind port.
     pub port: u16,
     /// Whether to open the browser.
     pub open: bool,
     /// Browser presentation settings.
     pub presentation: PresentationSettings,
+    /// Browser terminal exposure mode.
+    pub exposure: WebExposure,
+    /// Access token for this server run.
+    pub token: AccessToken,
 }
 
 impl TryFrom<CliArgs> for ValidatedCliConfig {
     type Error = anyhow::Error;
 
     fn try_from(args: CliArgs) -> Result<Self, Self::Error> {
-        if !args.host.is_loopback() {
-            bail!("browser terminal bind host must be loopback");
-        }
         if !(MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(&args.font_size) {
             bail!("font size must be in {MIN_FONT_SIZE}..={MAX_FONT_SIZE}");
         }
+        let (exposure, token) = exposure_and_token(&args)?;
         let initial_size = TerminalSize::new(80, 24).context("default terminal size is invalid")?;
         let mode = match args.mode {
             CliMode::Tmux => SessionMode::Tmux {
@@ -111,6 +126,8 @@ impl TryFrom<CliArgs> for ValidatedCliConfig {
                 font_size: args.font_size,
                 theme: args.theme.into(),
             },
+            exposure,
+            token,
         })
     }
 }
@@ -137,11 +154,11 @@ pub async fn run_with_config(config: ValidatedCliConfig) -> anyhow::Result<()> {
     reject_root_user()?;
     let session = RuntimeSession::start(config.runtime.clone())
         .context("failed to start browser terminal runtime")?;
-    let token = AccessToken::generate().context("failed to generate browser access token")?;
-    let mut web_config = WebConfig::local(token, session.command_sender(), config.runtime);
+    let mut web_config = WebConfig::local(config.token, session.command_sender(), config.runtime);
     web_config.host = config.host;
     web_config.port = config.port;
     web_config.presentation = config.presentation;
+    web_config.exposure = config.exposure;
 
     let server = serve(web_config)
         .await
@@ -172,6 +189,69 @@ fn shell_command(path: Option<PathBuf>) -> anyhow::Result<ShellCommand> {
         Some(path) => ShellCommand::new(path, Vec::<OsString>::new()).map_err(Into::into),
         None => ShellCommand::default_unix().map_err(Into::into),
     }
+}
+
+fn exposure_and_token(args: &CliArgs) -> anyhow::Result<(WebExposure, AccessToken)> {
+    exposure_and_token_with_env(args, |name| env::var(name))
+}
+
+fn exposure_and_token_with_env(
+    args: &CliArgs,
+    get_env: impl Fn(&str) -> Result<String, env::VarError>,
+) -> anyhow::Result<(WebExposure, AccessToken)> {
+    if args.expose_public {
+        let public_url = args
+            .public_url
+            .as_deref()
+            .context("--public-url is required with --expose-public")
+            .and_then(|value| {
+                value
+                    .parse::<PublicBaseUrl>()
+                    .context("invalid --public-url for public exposure")
+            })?;
+        let token_env = args
+            .token_env
+            .as_deref()
+            .context("--token-env is required with --expose-public")?;
+        validate_token_env_name(token_env)?;
+        let token_value = get_env(token_env)
+            .with_context(|| format!("failed to read access token from ${token_env}"))?;
+        let token = AccessToken::from_str(&token_value)
+            .with_context(|| format!("invalid access token in ${token_env}"))?;
+        Ok((WebExposure::Public { public_url }, token))
+    } else {
+        if !args.host.is_loopback() {
+            bail!("browser terminal bind host must be loopback unless --expose-public is set");
+        }
+        if args.public_url.is_some() {
+            bail!("--public-url requires --expose-public");
+        }
+        if args.token_env.is_some() {
+            bail!("--token-env requires --expose-public");
+        }
+        let token = AccessToken::generate().context("failed to generate browser access token")?;
+        Ok((WebExposure::Local, token))
+    }
+}
+
+fn validate_token_env_name(value: &str) -> anyhow::Result<()> {
+    let bytes = value.as_bytes();
+    let Some(first) = bytes.first() else {
+        bail!("--token-env must not be empty");
+    };
+    if value.len() > TOKEN_ENV_MAX_BYTES {
+        bail!("--token-env must be at most {TOKEN_ENV_MAX_BYTES} bytes");
+    }
+    if !first.is_ascii_uppercase() && *first != b'_' {
+        bail!("--token-env must start with A-Z or _");
+    }
+    let valid_rest = bytes
+        .iter()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_');
+    if !valid_rest {
+        bail!("--token-env must contain only A-Z, 0-9, and _");
+    }
+    Ok(())
 }
 
 async fn wait_for_shutdown() {
@@ -246,6 +326,9 @@ impl Default for CliArgs {
             font_size: DEFAULT_FONT_SIZE,
             theme: CliTheme::HighContrast,
             keepalive: CliKeepalive::Session,
+            expose_public: false,
+            public_url: None,
+            token_env: None,
         }
     }
 }
@@ -260,6 +343,7 @@ mod tests {
         assert!(config.host.is_loopback());
         assert_eq!(config.port, 0);
         assert_eq!(config.presentation.font_size, DEFAULT_FONT_SIZE);
+        assert!(matches!(config.exposure, WebExposure::Local));
         assert!(matches!(config.runtime.mode, SessionMode::Tmux { .. }));
         Ok(())
     }
@@ -271,6 +355,57 @@ mod tests {
             ..CliArgs::default()
         };
         assert!(ValidatedCliConfig::try_from(args).is_err());
+    }
+
+    #[test]
+    fn test_should_validate_public_exposure_config() -> anyhow::Result<()> {
+        let token = AccessToken::from_bytes([3; 32]).to_url_token();
+        let args = CliArgs {
+            host: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 8080,
+            expose_public: true,
+            public_url: Some("https://term.example.com/".to_owned()),
+            token_env: Some("TERMSTAGE_TOKEN".to_owned()),
+            ..CliArgs::default()
+        };
+        let (exposure, parsed_token) = exposure_and_token_with_env(&args, |name| {
+            if name == "TERMSTAGE_TOKEN" {
+                Ok(token.clone())
+            } else {
+                Err(env::VarError::NotPresent)
+            }
+        })?;
+        assert!(matches!(exposure, WebExposure::Public { .. }));
+        assert!(parsed_token.constant_time_eq(&AccessToken::from_bytes([3; 32])));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_public_mode_without_required_flags() {
+        let args = CliArgs {
+            expose_public: true,
+            ..CliArgs::default()
+        };
+        assert!(
+            exposure_and_token_with_env(&args, |_name| Err(env::VarError::NotPresent)).is_err()
+        );
+    }
+
+    #[test]
+    fn test_should_reject_public_args_without_public_mode() {
+        let args = CliArgs {
+            public_url: Some("https://term.example.com/".to_owned()),
+            ..CliArgs::default()
+        };
+        assert!(ValidatedCliConfig::try_from(args).is_err());
+    }
+
+    #[test]
+    fn test_should_reject_invalid_token_env_name() {
+        assert!(validate_token_env_name("TERMSTAGE_TOKEN").is_ok());
+        assert!(validate_token_env_name("termstage_token").is_err());
+        assert!(validate_token_env_name("").is_err());
+        assert!(validate_token_env_name("TERMSTAGE-TOKEN").is_err());
     }
 
     #[test]

@@ -30,7 +30,8 @@ use termstage_core::{
     },
     runtime::{ClientId, ClientOutput, RuntimeCommand, RuntimeConfig, RuntimeSession},
     security::{
-        AllowedHost, AllowedOrigin, LoopbackBind, PeerAddr, SecurityError, validate_access_token,
+        AllowedHost, AllowedOrigin, ExposurePolicy, PublicBaseUrl, SecurityError,
+        validate_access_token, validate_peer_for_policy,
     },
 };
 use tokio::{
@@ -84,13 +85,15 @@ impl Default for PresentationSettings {
     }
 }
 
-/// Local web server configuration.
+/// Web server configuration.
 #[derive(Debug, Clone)]
 pub struct WebConfig {
-    /// Loopback bind host.
+    /// Bind host.
     pub host: IpAddr,
     /// TCP port. `0` lets the OS choose a free port.
     pub port: u16,
+    /// Browser terminal exposure mode.
+    pub exposure: WebExposure,
     /// Per-server access token.
     pub token: AccessToken,
     /// Runtime command sender.
@@ -112,6 +115,7 @@ impl WebConfig {
         Self {
             host: DEFAULT_BIND_HOST,
             port: 0,
+            exposure: WebExposure::Local,
             token,
             commands,
             runtime,
@@ -120,11 +124,24 @@ impl WebConfig {
     }
 }
 
-/// Running local web server.
+/// Browser terminal exposure mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebExposure {
+    /// Local loopback-only service.
+    Local,
+    /// Public service behind an HTTPS ingress or reverse proxy.
+    Public {
+        /// Browser-visible public base URL.
+        public_url: PublicBaseUrl,
+    },
+}
+
+/// Running web server.
 pub struct RunningServer {
     address: SocketAddr,
     token: AccessToken,
     presentation: PresentationSettings,
+    exposure: WebExposure,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<anyhow::Result<()>>,
 }
@@ -136,6 +153,7 @@ impl Debug for RunningServer {
             .field("address", &self.address)
             .field("token", &self.token)
             .field("presentation", &self.presentation)
+            .field("exposure", &self.exposure)
             .finish_non_exhaustive()
     }
 }
@@ -150,13 +168,22 @@ impl RunningServer {
     /// Returns the explicit browser launch URL.
     #[must_use]
     pub fn launch_url(&self) -> String {
-        format!(
-            "http://{}/?token={}&fontSize={}&theme={}",
-            self.address,
-            self.token.to_url_token(),
-            self.presentation.font_size,
-            self.presentation.theme.as_str()
-        )
+        match &self.exposure {
+            WebExposure::Local => {
+                format!(
+                    "http://{}/?token={}&fontSize={}&theme={}",
+                    self.address,
+                    self.token.to_url_token(),
+                    self.presentation.font_size,
+                    self.presentation.theme.as_str()
+                )
+            }
+            WebExposure::Public { public_url } => public_url.launch_url(
+                &self.token,
+                self.presentation.font_size,
+                self.presentation.theme.as_str(),
+            ),
+        }
     }
 
     /// Requests server shutdown and waits for the serving task to finish.
@@ -186,6 +213,7 @@ impl RunningServer {
             address,
             token,
             presentation,
+            exposure: WebExposure::Local,
             shutdown: Some(shutdown),
             task,
         }
@@ -198,7 +226,7 @@ struct AppState {
 }
 
 struct AppStateInner {
-    bind: LoopbackBind,
+    exposure: ExposurePolicy,
     token: AccessToken,
     commands: mpsc::Sender<RuntimeCommand>,
     runtime: RuntimeConfig,
@@ -210,7 +238,7 @@ impl Debug for AppState {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AppState")
-            .field("bind", &self.inner.bind)
+            .field("exposure", &self.inner.exposure)
             .field("token", &self.inner.token)
             .field("runtime", &self.inner.runtime)
             .field("presentation", &self.inner.presentation)
@@ -220,10 +248,13 @@ impl Debug for AppState {
 
 impl AppState {
     fn new(config: WebConfig) -> Result<Self, SecurityError> {
-        let bind = LoopbackBind::new(config.host, config.port)?;
+        let exposure = match config.exposure {
+            WebExposure::Local => ExposurePolicy::local(config.host, config.port)?,
+            WebExposure::Public { public_url } => ExposurePolicy::Public(public_url),
+        };
         Ok(Self {
             inner: Arc::new(AppStateInner {
-                bind,
+                exposure,
                 token: config.token,
                 commands: config.commands,
                 runtime: config.runtime,
@@ -243,7 +274,7 @@ impl AppState {
 ///
 /// # Errors
 ///
-/// Returns [`SecurityError`] if the configured bind address is not loopback.
+/// Returns [`SecurityError`] if the configured exposure policy is invalid.
 pub fn router(config: WebConfig) -> Result<Router, SecurityError> {
     let state = AppState::new(config)?;
     Ok(Router::new()
@@ -254,7 +285,7 @@ pub fn router(config: WebConfig) -> Result<Router, SecurityError> {
         .with_state(state))
 }
 
-/// Starts the loopback Axum server.
+/// Starts the Axum server.
 ///
 /// # Errors
 ///
@@ -268,6 +299,7 @@ pub async fn serve(config: WebConfig) -> anyhow::Result<RunningServer> {
         .context("failed to read bound browser terminal address")?;
     let token = config.token.clone();
     let presentation = config.presentation;
+    let exposure = config.exposure.clone();
     let app = router(WebConfig {
         port: address.port(),
         ..config
@@ -289,6 +321,7 @@ pub async fn serve(config: WebConfig) -> anyhow::Result<RunningServer> {
         address,
         token,
         presentation,
+        exposure,
         shutdown: Some(shutdown_tx),
         task,
     })
@@ -489,10 +522,10 @@ fn validate_http_request(
     query: &TokenQuery,
     require_origin: bool,
 ) -> Result<(), WebError> {
-    PeerAddr::validate(peer)?;
-    validate_host(headers, state.inner.bind)?;
+    validate_peer_for_policy(peer, &state.inner.exposure)?;
+    validate_host(headers, &state.inner.exposure)?;
     validate_token(&state.inner.token, &query.token)?;
-    validate_origin(headers, state.inner.bind, require_origin)?;
+    validate_origin(headers, &state.inner.exposure, require_origin)?;
     Ok(())
 }
 
@@ -501,17 +534,17 @@ fn validate_asset_request(
     peer: SocketAddr,
     headers: &HeaderMap,
 ) -> Result<(), WebError> {
-    PeerAddr::validate(peer)?;
-    validate_host(headers, state.inner.bind)?;
+    validate_peer_for_policy(peer, &state.inner.exposure)?;
+    validate_host(headers, &state.inner.exposure)?;
     Ok(())
 }
 
-fn validate_host(headers: &HeaderMap, bind: LoopbackBind) -> Result<(), SecurityError> {
+fn validate_host(headers: &HeaderMap, exposure: &ExposurePolicy) -> Result<(), SecurityError> {
     let value = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .ok_or(SecurityError::InvalidHost)?;
-    AllowedHost::validate(value, bind).map(|_host| ())
+    AllowedHost::validate_for_policy(value, exposure).map(|_host| ())
 }
 
 fn validate_token(expected: &AccessToken, supplied: &str) -> Result<(), SecurityError> {
@@ -521,7 +554,7 @@ fn validate_token(expected: &AccessToken, supplied: &str) -> Result<(), Security
 
 fn validate_origin(
     headers: &HeaderMap,
-    bind: LoopbackBind,
+    exposure: &ExposurePolicy,
     required: bool,
 ) -> Result<(), SecurityError> {
     let Some(value) = headers.get(header::ORIGIN) else {
@@ -534,7 +567,7 @@ fn validate_origin(
     let value = value
         .to_str()
         .map_err(|_error| SecurityError::InvalidOrigin)?;
-    AllowedOrigin::validate(value, bind).map(|_origin| ())
+    AllowedOrigin::validate_for_policy(value, exposure).map(|_origin| ())
 }
 
 #[derive(Debug)]
@@ -616,6 +649,25 @@ mod tests {
         Ok(response.status())
     }
 
+    async fn request_from_peer(
+        path: &str,
+        host: &str,
+        peer: SocketAddr,
+        config: WebConfig,
+    ) -> anyhow::Result<StatusCode> {
+        let app = router(config)?;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(header::HOST, host)
+                    .extension(ConnectInfo(peer))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        Ok(response.status())
+    }
+
     #[tokio::test]
     async fn test_should_serve_index_with_valid_token_and_host() -> anyhow::Result<()> {
         let (config, token) = test_config()?;
@@ -665,6 +717,98 @@ mod tests {
             )
             .await?;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_accept_public_host_and_non_loopback_peer() -> anyhow::Result<()> {
+        let (mut config, token) = test_config()?;
+        config.host = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        config.exposure = WebExposure::Public {
+            public_url: PublicBaseUrl::parse("https://term.example.com/")?,
+        };
+        let path = format!("/?token={}", token.to_url_token());
+        assert_eq!(
+            request_from_peer(
+                &path,
+                "term.example.com",
+                SocketAddr::from(([192, 0, 2, 10], 50000)),
+                config.clone(),
+            )
+            .await?,
+            StatusCode::OK
+        );
+        assert_eq!(
+            request_from_peer(
+                &path,
+                "evil.example",
+                SocketAddr::from(([192, 0, 2, 10], 50000)),
+                config,
+            )
+            .await?,
+            StatusCode::FORBIDDEN
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_validate_public_websocket_origin() -> anyhow::Result<()> {
+        let (mut config, token) = test_config()?;
+        config.host = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        config.exposure = WebExposure::Public {
+            public_url: PublicBaseUrl::parse("https://term.example.com/")?,
+        };
+        let state = AppState::new(config)?;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "term.example.com".parse()?);
+        headers.insert(header::ORIGIN, "https://term.example.com".parse()?);
+        let query = TokenQuery {
+            token: token.to_url_token(),
+        };
+        assert!(
+            validate_http_request(
+                &state,
+                SocketAddr::from(([192, 0, 2, 10], 50000)),
+                &headers,
+                &query,
+                true,
+            )
+            .is_ok()
+        );
+        headers.insert(header::ORIGIN, "https://evil.example".parse()?);
+        assert!(matches!(
+            validate_http_request(
+                &state,
+                SocketAddr::from(([192, 0, 2, 10], 50000)),
+                &headers,
+                &query,
+                true,
+            ),
+            Err(WebError(SecurityError::InvalidOrigin))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_build_public_launch_url() -> anyhow::Result<()> {
+        let token = AccessToken::from_bytes([4; 32]);
+        let server = RunningServer {
+            address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8080)),
+            token: token.clone(),
+            presentation: PresentationSettings::default(),
+            exposure: WebExposure::Public {
+                public_url: PublicBaseUrl::parse("https://term.example.com/")?,
+            },
+            shutdown: None,
+            task: tokio::spawn(async { Ok(()) }),
+        };
+        assert_eq!(
+            server.launch_url(),
+            format!(
+                "https://term.example.com/?token={}&fontSize=24&theme=high-contrast",
+                token.to_url_token()
+            )
+        );
         Ok(())
     }
 

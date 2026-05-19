@@ -114,7 +114,20 @@ consumes them. PTY runtime is next because it proves real terminal semantics bef
 polish. The browser UI is later because its correct behavior depends on the runtime
 and WebSocket contract, not the other way around.
 
-## 10. Cross-References
+## 10. Phase 6 - Explicit Public Pod Exposure
+
+Maps to roadmap: closes M4.
+
+| # | Task | Spec | Effort |
+| --- | --- | --- | --- |
+| 6.1 | Add exposure-mode configuration, public base URL validation, and public Host/Origin/peer checks. | [20](./20-browser-terminal-web-design.md), [21](./21-browser-terminal-public-exposure-design.md), [70](./70-browser-terminal-security-design.md) | 1 day |
+| 6.2 | Add CLI flags `--expose-public`, `--public-url`, and `--token-env`, including token env-name/value validation. | [21](./21-browser-terminal-public-exposure-design.md), [50](./50-browser-terminal-cli-design.md) | 1 day |
+| 6.3 | Add route and CLI tests covering public-mode required flags, launch URL construction, matching Host/Origin acceptance, and mismatch rejection. | [72](./72-browser-terminal-verification-plan.md) | 1 day |
+
+Exit criteria: M4 roadmap criteria pass; local loopback tests still pass; standard
+Cargo quality gates remain green.
+
+## 11. Cross-References
 
 - Depends on: all numbered browser terminal specs.
 - Pairs with: [90-browser-terminal-roadmap.md](./90-browser-terminal-roadmap.md).

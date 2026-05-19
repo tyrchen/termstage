@@ -7,10 +7,11 @@ Depends on: [00-browser-terminal-prd.md](./00-browser-terminal-prd.md),
 
 ## 1. Purpose
 
-This spec defines the security boundary for a local browser terminal. The core risk is
-simple and severe: any page that can write to the WebSocket can write bytes to a local
-shell. Therefore the M0/M1 product is local-only, token-gated, origin-checked, and
-single-controller by default.
+This spec defines the security boundary for browser terminal access. The core risk is
+simple and severe: any page that can write to the WebSocket can write bytes to a shell.
+Therefore the default product is local-only, token-gated, origin-checked, and
+single-controller. Internet-facing pod mode is a separate explicit exposure mode
+defined by [21-browser-terminal-public-exposure-design.md](./21-browser-terminal-public-exposure-design.md).
 
 ## 2. Trust Boundaries
 
@@ -43,11 +44,11 @@ single-controller by default.
 
 | Control | Requirement |
 | --- | --- |
-| Bind address | M0 binds `127.0.0.1`; `::1` allowed only after tests. Never `0.0.0.0`. |
+| Bind address | Local mode binds `127.0.0.1`; public mode requires `--expose-public` before `0.0.0.0` or other non-loopback addresses. |
 | Token | 256-bit CSPRNG per server start; constant-time comparison; redacted debug/logs. |
-| Host | Accept exact loopback host and selected port only. Reject other Host headers. |
-| Origin | Accept same-origin browser requests only. Reject missing or mismatched Origin for WebSocket. |
-| Peer IP | Reject non-loopback socket peers. |
+| Host | Local mode accepts exact loopback host and selected port only; public mode accepts only the configured public URL host and port. |
+| Origin | Local mode accepts same-origin browser requests only; public mode accepts only the configured HTTPS public origin. Reject missing or mismatched Origin for WebSocket. |
+| Peer IP | Local mode rejects non-loopback socket peers; public mode allows ingress/proxy peers after Host/Origin/token validation. |
 | Assets | Bundle first-party JS/CSS. No CDN, eval, or runtime script injection. |
 | Controller count | One write-capable client by default. |
 | Frame limits | Explicit WebSocket frame/message size caps. |
@@ -60,12 +61,14 @@ HTTP requests that fail Host, token, or peer validation return a generic forbidd
 response without saying which check failed. WebSocket requests perform the same checks
 before upgrade.
 
-The server does not implement TLS for local-only loopback M0. Any LAN, tunnel, or
-remote-share mode requires a separate spec with WSS, authentication, authorization,
-rate limiting, audit logging, and read-only/viewer semantics.
+The server does not implement TLS itself. Local mode uses plain HTTP on loopback.
+Public mode requires a browser-visible HTTPS `--public-url` and assumes TLS
+termination before the pod.
 
-DNS rebinding is mitigated by requiring all of: unpredictable token, exact Host,
-same-origin Origin, and loopback peer address. No single check is treated as sufficient.
+DNS rebinding in local mode is mitigated by requiring all of: unpredictable token,
+exact Host, same-origin Origin, and loopback peer address. Public mode replaces the
+loopback peer check with an explicit operator-configured public URL and continues to
+require token, Host, and Origin checks. No single check is treated as sufficient.
 
 ## 5. AGENTS.md Binding
 
@@ -86,4 +89,5 @@ same-origin Origin, and loopback peer address. No single check is treated as suf
 - Depends on: [00-browser-terminal-prd.md](./00-browser-terminal-prd.md),
   [10-browser-terminal-protocol-design.md](./10-browser-terminal-protocol-design.md).
 - Consumed by: [20-browser-terminal-web-design.md](./20-browser-terminal-web-design.md),
+  [21-browser-terminal-public-exposure-design.md](./21-browser-terminal-public-exposure-design.md),
   [72-browser-terminal-verification-plan.md](./72-browser-terminal-verification-plan.md).

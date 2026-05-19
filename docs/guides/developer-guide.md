@@ -1,6 +1,6 @@
 # Browser Terminal Developer Guide
 
-Status: draft v1  
+Status: draft v1
 Last updated: 2026-05-19
 
 This guide explains how the browser terminal mode is organized for developers. It
@@ -262,7 +262,8 @@ business/runtime logic
 
 Do not add:
 
-- Non-loopback bind support.
+- Implicit non-loopback bind support; public exposure must stay behind the explicit
+  `--expose-public`/`--public-url`/`--token-env` contract.
 - CDN JavaScript.
 - Shell command strings built with concatenation.
 - Unbounded channels or unbounded terminal output buffers.
@@ -603,7 +604,8 @@ socket close
 
 不要引入这些东西：
 
-- 非 loopback bind 支持。
+- 隐式的非 loopback bind 支持；公网暴露必须继续走显式的
+  `--expose-public`/`--public-url`/`--token-env` 契约。
 - CDN JavaScript。
 - 用字符串拼接 shell 命令。
 - 无界 channel，或者无界终端输出缓冲。
