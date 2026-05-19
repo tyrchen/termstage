@@ -13,7 +13,7 @@ Last updated: 2026-05-19
 
 | Document | Purpose |
 | --- | --- |
-| [user-guide.md](./guides/user-guide.md) | Bilingual user guide for running the local browser terminal, presentation workflow, reconnect behavior, security boundary, and troubleshooting. |
+| [user-guide.md](./guides/user-guide.md) | Bilingual user guide for running the browser terminal, local and public pod exposure, presentation workflow, reconnect behavior, security boundary, and troubleshooting. |
 | [developer-guide.md](./guides/developer-guide.md) | Bilingual developer guide for workspace layout, architecture, runtime/WebSocket/frontend flow, safety rules, and quality gates. |
 
 ## 中文
@@ -24,7 +24,7 @@ Last updated: 2026-05-19
 
 | 文档 | 内容 |
 | --- | --- |
-| [用户指南](./guides/user-guide.md) | 介绍如何启动本地浏览器终端、如何演示、刷新后如何重连、遇到问题怎么排查。 |
+| [用户指南](./guides/user-guide.md) | 介绍如何启动浏览器终端、本地和 pod 暴露方式、如何演示、刷新后如何重连、遇到问题怎么排查。 |
 | [开发者指南](./guides/developer-guide.md) | 介绍工作区结构、架构边界、runtime/WebSocket/frontend 流程、安全规则和质量门禁。 |
 
 ### 研究记录

@@ -74,3 +74,18 @@ after implementation begins.
 - Pinned by: [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md),
   [70-browser-terminal-security-design.md](./70-browser-terminal-security-design.md).
 - Date: 2026-05-19.
+
+## D7 - Public Pod Exposure Requires Explicit Operator Intent
+
+- Context: Running `termstage` in a pod behind internet-facing ingress.
+- Alternatives considered: allow any non-loopback `--host`, infer public mode from
+  `--host 0.0.0.0`, require explicit `--expose-public` plus public URL and token env.
+- Decision: Require `--expose-public`, `--public-url https://...`, and
+  `--token-env <NAME>` before accepting non-loopback bind addresses.
+- Why: A web terminal is shell control. Binding to all interfaces must never be an
+  accidental consequence of a host flag, and generated local tokens do not fit
+  reproducible pod deployments.
+- Pinned by: [21-browser-terminal-public-exposure-design.md](./21-browser-terminal-public-exposure-design.md),
+  [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md),
+  [70-browser-terminal-security-design.md](./70-browser-terminal-security-design.md).
+- Date: 2026-05-19.

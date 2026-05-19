@@ -34,7 +34,7 @@ Frontend modules:
 ## 2a. Flow
 
 ```text
-+--------------------------- loopback only ---------------------------+
++--------------------- selected exposure policy ----------------------+
 |                                                                     |
 |  Chrome tab                                                         |
 |  +--------------------+      binary/text WS       +--------------+  |
@@ -58,7 +58,8 @@ Frontend modules:
 ## 3. Invariants
 
 - The server listens on `127.0.0.1` by default. `::1` support is allowed after tests
-  cover IPv6 loopback handling.
+  cover IPv6 loopback handling. Non-loopback binds require explicit public exposure
+  mode from [21-browser-terminal-public-exposure-design.md](./21-browser-terminal-public-exposure-design.md).
 - Static assets are bundled with the binary or served from a trusted local build
   directory in development; production UI never loads CDN JavaScript.
 - The WebSocket upgrade validates token, Host, Origin, and peer IP before calling
@@ -72,6 +73,13 @@ Frontend modules:
 The server starts on port `0` unless the CLI provides a loopback port. After binding,
 it builds a tokenized URL and optionally opens the browser. The URL token is exchanged
 for an in-memory token check; it is not persisted.
+
+When public exposure mode is enabled by
+[21-browser-terminal-public-exposure-design.md](./21-browser-terminal-public-exposure-design.md),
+the server binds the requested pod address but builds launch URLs from the validated
+public base URL. Host and Origin validation use that same public URL instead of the
+pod socket address, and non-loopback peers are accepted because ingress traffic enters
+the pod as ordinary TCP peers.
 
 The frontend uses `@xterm/xterm`, `@xterm/addon-fit`, and `@xterm/addon-web-links`.
 The WebGL addon is optional and guarded behind a frontend feature because rendering
@@ -104,4 +112,5 @@ emits a redacted structured log event.
   [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md),
   [70-browser-terminal-security-design.md](./70-browser-terminal-security-design.md).
 - Consumed by: [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md),
+  [21-browser-terminal-public-exposure-design.md](./21-browser-terminal-public-exposure-design.md),
   [72-browser-terminal-verification-plan.md](./72-browser-terminal-verification-plan.md).

@@ -15,6 +15,7 @@ to map that order to user-visible milestones.
 | [10-browser-terminal-protocol-design.md](./10-browser-terminal-protocol-design.md) | Data model | WebSocket message contract, session identifiers, validation ranges. |
 | [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md) | Runtime design | PTY/session actor model, lifecycle, shutdown, reconnection. |
 | [20-browser-terminal-web-design.md](./20-browser-terminal-web-design.md) | Web design | Axum server, WebSocket upgrade, static asset serving, browser terminal frontend. |
+| [21-browser-terminal-public-exposure-design.md](./21-browser-terminal-public-exposure-design.md) | Public exposure design | Opt-in pod/internet mode, public URL validation, token-env token source. |
 | [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md) | CLI design | Command surface, presentation UX, tmux/new-shell modes. |
 | [61-browser-terminal-crates-and-features.md](./61-browser-terminal-crates-and-features.md) | Crates/features | Workspace placement, dependency versions, feature policy. |
 | [70-browser-terminal-security-design.md](./70-browser-terminal-security-design.md) | Security design | Threat model and mandatory local-service controls. |
@@ -54,15 +55,21 @@ to map that order to user-visible milestones.
                     | HTTP/WS/UI     |
                     +-------+--------+
                             |
-             +--------------+--------------+
-             |                             |
-             v                             v
-     +---------------+             +----------------+
-     | 50 CLI UX     |             | 61 Crates      |
-     | commands      |             | features/deps  |
-     +-------+-------+             +-------+--------+
-             |                             |
-             +--------------+--------------+
+                 +----------+----------+
+                 |                     |
+                 v                     v
+        +----------------+     +---------------+
+        | 21 Public Mode |     | 50 CLI UX     |
+        | pod exposure   |     | commands      |
+        +-------+--------+     +-------+-------+
+                |                      |
+                +----------+-----------+
+                           |
+                           v
+                    +----------------+
+                    | 61 Crates      |
+                    | features/deps  |
+                    +-------+--------+
                             |
                             v
                     +----------------+

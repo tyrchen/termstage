@@ -38,7 +38,7 @@ ad hoc scripts should become the primary automation entry point.
 | Web routes | `/`, `/assets`, `/ws`, `/healthz`, invalid token, invalid Host, invalid Origin. |
 | Browser UI | xterm renders, sends input bytes, receives output bytes, resizes on viewport changes. |
 | Terminal compatibility | `printf`, Ctrl-C, paste, `less`, `vim` smoke where environment supports it. |
-| Security | Non-loopback bind rejected, peer checks, frame caps, no CDN assets, no token in logs. |
+| Security | Non-loopback bind rejected unless public mode is explicit, peer checks, public Host/Origin checks, token-env parsing, frame caps, no CDN assets, no token in logs. |
 
 ## 4. Browser Verification
 
@@ -59,6 +59,9 @@ round-trips to PTY output.
 - M2: reconnect to tmux-backed session preserves state across browser refresh.
 - M3: hardening gates include `cargo audit`, `cargo deny check`, and documented release
   packaging checks.
+- M4: public pod mode requires `--expose-public`, `--public-url`, and `--token-env`;
+  generated local tokens still work by default; public Host/Origin validation accepts
+  only the configured public URL.
 
 ## 6. Cross-References
 

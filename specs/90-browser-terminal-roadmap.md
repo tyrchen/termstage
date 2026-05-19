@@ -8,8 +8,8 @@ Last updated: 2026-05-19
 
 - Always shippable: every milestone leaves the standard Cargo quality gates green.
 - Presentation-first: prioritize Chrome-share demo flow over generic web shell features.
-- Local security first: remote sharing is out of scope until a dedicated security spec
-  exists.
+- Local security first: the default remains loopback-only; internet-facing pod mode is
+  opt-in and requires its dedicated public exposure spec.
 - Terminal compatibility by byte stream: do not regress to command-string transport.
 
 ## 2. Milestones
@@ -76,10 +76,29 @@ Exit criteria:
 
 Estimate: 1 focused week.
 
+### M4 - Explicit Public Pod Exposure
+
+User-visible outcome: an operator can run `termstage` inside a pod behind HTTPS
+ingress, supply a token from a Kubernetes secret-backed environment variable, and
+accept internet traffic only through explicit public-mode validation.
+
+Specs touched: 20, 21, 50, 70, 72.
+
+Exit criteria:
+
+- `--host 0.0.0.0` is rejected unless `--expose-public` is present.
+- Public mode requires `--public-url https://...` and `--token-env <NAME>`.
+- Launch URLs use the public URL, not the pod bind address.
+- Public route tests accept matching public Host/Origin and reject mismatches.
+- Local loopback behavior and generated token flow remain unchanged.
+
+Estimate: 0.5-1 focused week.
+
 ## 3. Deferred Milestones
 
 - Read-only mirror clients.
-- Remote/LAN sharing with WSS and stronger auth.
+- Stronger remote auth beyond one bearer token, including cookie/header auth,
+  rate limiting, audit logging, and viewer/controller authorization.
 - Recording/replay.
 - Demo command palette and script runner.
 - Windows PowerShell support.
