@@ -1,4 +1,4 @@
-![](https://github.com/tyrchen/rust-lib-template/workflows/build/badge.svg)
+![](https://github.com/tyrchen/termstage/workflows/build/badge.svg)
 
 # termstage
 

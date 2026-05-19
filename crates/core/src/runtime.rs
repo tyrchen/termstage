@@ -280,7 +280,7 @@ impl RuntimeSession {
         let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
         let reader = spawn_reader(reader, pty_tx)?;
         let actor = thread::Builder::new()
-            .name("presenterm-pty-actor".to_owned())
+            .name("termstage-pty-actor".to_owned())
             .spawn(move || {
                 let actor = SessionActor {
                     config,
@@ -618,7 +618,7 @@ fn spawn_reader(
     pty_tx: mpsc::SyncSender<PtyEvent>,
 ) -> Result<JoinHandle<()>, RuntimeError> {
     thread::Builder::new()
-        .name("presenterm-pty-reader".to_owned())
+        .name("termstage-pty-reader".to_owned())
         .spawn(move || {
             let mut buffer = [0_u8; PTY_READ_CHUNK_SIZE];
             loop {
@@ -798,7 +798,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_start_tmux_mode() -> anyhow::Result<()> {
-        let session_name = SessionName::new(format!("presenterm-test-{}", std::process::id()))?;
+        let session_name = SessionName::new(format!("termstage-test-{}", std::process::id()))?;
         let config = RuntimeConfig {
             mode: SessionMode::Tmux {
                 session: session_name.clone(),

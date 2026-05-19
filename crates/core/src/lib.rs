@@ -1,4 +1,4 @@
-//! Core domain contracts and runtime primitives for `presenterm`.
+//! Core domain contracts and runtime primitives for `termstage`.
 //!
 //! The browser terminal mode is split into protocol validation, local-only security
 //! checks, and a PTY runtime actor. Application crates wire these pieces to HTTP,

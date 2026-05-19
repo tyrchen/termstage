@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 test('terminal app renders and round-trips through the Rust PTY bridge', async ({
   page
 }, testInfo) => {
-  const server = await startPresentermServer();
+  const server = await startTermstageServer();
   try {
     testInfo.attach('launch-url-redacted', {
       body: server.url.replace(/token=[^&]+/, 'token=[REDACTED]'),
@@ -34,7 +34,7 @@ test('terminal app renders and round-trips through the Rust PTY bridge', async (
   }
 });
 
-async function startPresentermServer(): Promise<{
+async function startTermstageServer(): Promise<{
   url: string;
   stop: () => Promise<void>;
 }> {
@@ -45,9 +45,9 @@ async function startPresentermServer(): Promise<{
     [
       'run',
       '-p',
-      'presenterm-server',
+      'termstage',
       '--bin',
-      'presenterm',
+      'termstage',
       '--',
       '--mode',
       'shell',
@@ -64,7 +64,7 @@ async function startPresentermServer(): Promise<{
       cwd: repoRoot,
       env: {
         ...process.env,
-        RUST_LOG: 'presenterm=warn'
+        RUST_LOG: 'termstage=warn'
       }
     }
   );
@@ -82,7 +82,7 @@ async function readLaunchUrl(child: ChildProcessWithoutNullStreams): Promise<str
   const chunks: string[] = [];
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
-      reject(new Error(`presenterm server did not print launch URL: ${chunks.join('')}`));
+      reject(new Error(`termstage server did not print launch URL: ${chunks.join('')}`));
     }, 30000);
     const onData = (chunk: Buffer): void => {
       chunks.push(chunk.toString('utf8'));
@@ -100,7 +100,7 @@ async function readLaunchUrl(child: ChildProcessWithoutNullStreams): Promise<str
     });
     child.once('exit', code => {
       clearTimeout(timeout);
-      reject(new Error(`presenterm server exited before printing URL: ${code}`));
+      reject(new Error(`termstage server exited before printing URL: ${code}`));
     });
   });
 }

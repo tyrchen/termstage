@@ -1,18 +1,20 @@
 [package]
-name = "presenterm-server"
-description = """
-
-"""
+name = "termstage"
+description = "Local browser terminal presentation tool for live demos."
+categories = ["command-line-utilities", "development-tools"]
+keywords = ["terminal", "presentation", "browser", "tmux", "websocket"]
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 documentation.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme.workspace = true
 
 [[bin]]
-name = "presenterm"
+name = "termstage"
 path = "src/main.rs"
 
 [dependencies]
@@ -22,7 +24,7 @@ bytes.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 open.workspace = true
-presenterm-core.workspace = true
+termstage-core.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true

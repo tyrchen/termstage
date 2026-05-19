@@ -1,4 +1,4 @@
-# presenterm
+# termstage
 
 IMPORTANT: Never enter plan mode automatically!!! Never enter plan mode automatically!!!
 

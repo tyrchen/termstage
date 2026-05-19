@@ -22,7 +22,8 @@ use axum::{
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
-use presenterm_core::{
+use serde::Deserialize;
+use termstage_core::{
     protocol::{
         AccessToken, ClientControlMessage, ErrorCode, SafeMessage, ServerControlMessage,
         TerminalSize,
@@ -32,7 +33,6 @@ use presenterm_core::{
         AllowedHost, AllowedOrigin, LoopbackBind, PeerAddr, SecurityError, validate_access_token,
     },
 };
-use serde::Deserialize;
 use tokio::{
     net::TcpListener,
     sync::{mpsc, oneshot},
@@ -564,7 +564,7 @@ mod tests {
     };
     use bytes::Bytes;
     use http_body_util::BodyExt;
-    use presenterm_core::{
+    use termstage_core::{
         protocol::{AccessToken, SessionName, TerminalSize},
         runtime::{ReconnectPolicy, RuntimeSession, SessionMode, ShellCommand, ShutdownReason},
     };
@@ -800,7 +800,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_replay_tmux_state_after_browser_refresh() -> anyhow::Result<()> {
         let token = AccessToken::from_bytes([8; 32]);
-        let session_name = SessionName::new(format!("presenterm-phase5-{}", std::process::id()))?;
+        let session_name = SessionName::new(format!("termstage-phase5-{}", std::process::id()))?;
         let runtime = RuntimeConfig {
             mode: SessionMode::Tmux {
                 session: session_name.clone(),

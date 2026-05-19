@@ -6,15 +6,22 @@ resolver = "3"
 version = "0.1.0"
 authors = ["Tyr Chen <tyr.chen@gmail.com>"]
 edition = "2024"
+rust-version = "1.95"
 license = "MIT"
-documentation = "https://docs.rs/presenterm"
-repository = "https://github.com/tyrchen/presenterm"
-homepage = "https://github.com/tyrchen/presenterm"
+documentation = "https://docs.rs/termstage"
+repository = "https://github.com/tyrchen/termstage"
+homepage = "https://github.com/tyrchen/termstage"
 readme = "README.md"
 
 [workspace.dependencies]
 anyhow = "1.0.102"
-axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
+axum = { version = "0.8.9", default-features = false, features = [
+  "http1",
+  "json",
+  "query",
+  "tokio",
+  "ws",
+] }
 bytes = "1.11.1"
 clap = { version = "4.6.1", features = ["derive"] }
 futures-util = { version = "0.3.31", features = ["sink"] }
@@ -38,14 +45,16 @@ tokio = { version = "1.52", features = [
   "time",
 ] }
 tower = "0.5.2"
-tower-http = { version = "0.6.11", default-features = false, features = ["trace"] }
+tower-http = { version = "0.6.11", default-features = false, features = [
+  "trace",
+] }
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 url = "2.5.8"
 which = "8.0.2"
 
 # workspace crates
-presenterm-core = { path = "crates/core" }
+termstage-core = { version = "0.1.0", path = "crates/core" }
 
 [workspace.lints.rust]
 rust_2024_compatibility = { level = "warn", priority = -1 }

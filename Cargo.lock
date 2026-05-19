@@ -827,47 +827,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "presenterm-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "getrandom 0.4.2",
- "portable-pty",
- "serde",
- "serde_json",
- "subtle",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "url",
- "which",
-]
-
-[[package]]
-name = "presenterm-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "bytes",
- "clap",
- "futures-util",
- "http-body-util",
- "open",
- "presenterm-core",
- "rustix",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1167,6 +1126,47 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "termstage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bytes",
+ "clap",
+ "futures-util",
+ "http-body-util",
+ "open",
+ "rustix",
+ "serde",
+ "serde_json",
+ "termstage-core",
+ "tokio",
+ "tokio-tungstenite",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "termstage-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "getrandom 0.4.2",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "subtle",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "which",
 ]
 
 [[package]]

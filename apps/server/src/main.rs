@@ -1,4 +1,4 @@
-//! Server entry point for `presenterm`.
+//! Server entry point for `termstage`.
 
 mod assets;
 mod cli;

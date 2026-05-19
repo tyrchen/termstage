@@ -1,17 +1,17 @@
 [package]
-name = "presenterm-core"
-description = """
-
-"""
+name = "termstage-core"
+description = "Core protocol, security, and runtime primitives for termstage."
 categories = ["development-tools"]
-keywords = []
+keywords = ["terminal", "presentation", "pty", "tmux", "websocket"]
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
-documentation.workspace = true
+documentation = "https://docs.rs/termstage-core"
 repository.workspace = true
 homepage.workspace = true
+readme.workspace = true
 
 [dependencies]
 anyhow.workspace = true

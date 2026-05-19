@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use clap::{Parser, ValueEnum};
-use presenterm_core::{
+use termstage_core::{
     protocol::{AccessToken, SessionName, TerminalSize},
     runtime::{
         ReconnectPolicy, RuntimeConfig, RuntimeSession, SessionMode, ShellCommand, ShutdownReason,
@@ -26,7 +26,7 @@ const MAX_FONT_SIZE: u16 = 96;
 
 /// Browser terminal command-line arguments.
 #[derive(Debug, Parser)]
-#[command(name = "presenterm")]
+#[command(name = "termstage")]
 #[command(about = "Run a loopback-only browser terminal for presentations")]
 #[command(
     long_about = "Run a loopback-only browser terminal for presentations. This is a local shell \
@@ -182,7 +182,7 @@ fn init_tracing() {
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_error| tracing_subscriber::EnvFilter::new("presenterm=info")),
+                .unwrap_or_else(|_error| tracing_subscriber::EnvFilter::new("termstage=info")),
         )
         .finish();
     let _result = tracing::subscriber::set_global_default(subscriber);
