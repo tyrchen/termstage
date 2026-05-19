@@ -12,15 +12,30 @@ use axum::{
     },
     response::IntoResponse,
 };
+use termstage_core::security::BasePath;
 
 const INDEX_HTML: &str = include_str!("../web/dist/index.html");
 const APP_JS: &[u8] = include_bytes!("../web/dist/assets/index.js");
 const APP_CSS: &str = include_str!("../web/dist/assets/index.css");
+const BASE_HREF_PLACEHOLDER: &str = "<!--TERMSTAGE_BASE_HREF-->";
 
 /// Serves the browser terminal HTML document.
+///
+/// When `base_path` is set, a `<base href="…/">` element is injected so the
+/// document's relative asset and WebSocket URLs resolve against the upstream
+/// reverse-proxy prefix instead of the proxied origin's root.
 #[must_use]
-pub fn index_response() -> Response<Body> {
-    response("text/html; charset=utf-8", Body::from(INDEX_HTML))
+pub fn index_response(base_path: Option<&BasePath>) -> Response<Body> {
+    let body: Body = match base_path {
+        Some(prefix) => INDEX_HTML
+            .replace(
+                BASE_HREF_PLACEHOLDER,
+                &format!("<base href=\"{}\">", html_escape_attribute(prefix.as_str())),
+            )
+            .into(),
+        None => Body::from(INDEX_HTML),
+    };
+    response("text/html; charset=utf-8", body)
 }
 
 /// Serves a bundled static asset.
@@ -31,6 +46,21 @@ pub fn asset_response(path: &str) -> Response<Body> {
         "index.css" => response("text/css; charset=utf-8", Body::from(APP_CSS)),
         _ => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+fn html_escape_attribute(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'&' => out.push_str("&amp;"),
+            b'<' => out.push_str("&lt;"),
+            b'>' => out.push_str("&gt;"),
+            b'"' => out.push_str("&quot;"),
+            b'\'' => out.push_str("&#39;"),
+            _ => out.push(byte as char),
+        }
+    }
+    out
 }
 
 fn response(content_type: &'static str, body: Body) -> Response<Body> {

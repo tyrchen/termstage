@@ -3,6 +3,16 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [Unreleased]
+
+### Features
+
+- Add `--base-path <path>` flag so termstage can run behind a path-based reverse
+  proxy. When set, all HTTP and WebSocket routes mount under the prefix, the
+  served HTML injects a matching `<base href>` tag, and the public/local launch
+  URL builders include the prefix. Default mode (no flag) is unchanged.
+
+---
 ## [termstage-v0.1.0] - 2026-05-19
 
 ### Miscellaneous Chores

@@ -32,6 +32,9 @@ pub enum SecurityError {
     /// The supplied token did not match the server token.
     #[error("forbidden")]
     InvalidToken,
+    /// The base path was not a single absolute path segment trail.
+    #[error("invalid base path")]
+    InvalidBasePath,
 }
 
 /// Request exposure policy selected at server startup.
@@ -140,7 +143,23 @@ impl PublicBaseUrl {
     /// Returns the public URL with token and presentation settings.
     #[must_use]
     pub fn launch_url(&self, token: &AccessToken, font_size: u16, theme: &str) -> String {
+        self.launch_url_with_base_path(token, font_size, theme, None)
+    }
+
+    /// Returns the public URL with token and presentation settings, mounted
+    /// under an optional reverse-proxy base path.
+    #[must_use]
+    pub fn launch_url_with_base_path(
+        &self,
+        token: &AccessToken,
+        font_size: u16,
+        theme: &str,
+        base_path: Option<&BasePath>,
+    ) -> String {
         let mut url = self.url.clone();
+        if let Some(prefix) = base_path {
+            url.set_path(prefix.as_str());
+        }
         url.query_pairs_mut()
             .append_pair("token", &token.to_url_token())
             .append_pair("fontSize", &font_size.to_string())
@@ -172,6 +191,91 @@ impl FromStr for PublicBaseUrl {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::parse(value)
     }
+}
+
+/// Validated reverse-proxy base path prefix.
+///
+/// Used when the server is mounted under a path prefix by an upstream reverse
+/// proxy (e.g. `/p/<sessionId>/`). The stored value always starts and ends with
+/// `/`, never contains `..`, never contains empty segments, and only uses
+/// RFC 3986 unreserved characters plus `-`, `_`, `.`, and `~`. The trailing
+/// slash is stripped for use as an axum nest prefix via [`Self::nest_prefix`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct BasePath {
+    value: String,
+}
+
+impl BasePath {
+    /// Maximum number of bytes the validated base path may occupy.
+    pub const MAX_BYTES: usize = 256;
+
+    /// Validates a base path string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecurityError::InvalidBasePath`] when the value is empty,
+    /// missing the leading or trailing slash, contains an empty segment, a
+    /// `..` segment, or characters outside the path-safe set.
+    pub fn parse(value: &str) -> Result<Self, SecurityError> {
+        if value.is_empty() || value.len() > Self::MAX_BYTES {
+            return Err(SecurityError::InvalidBasePath);
+        }
+        if !value.starts_with('/') || !value.ends_with('/') {
+            return Err(SecurityError::InvalidBasePath);
+        }
+        let trimmed = value.trim_start_matches('/').trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Err(SecurityError::InvalidBasePath);
+        }
+        for segment in trimmed.split('/') {
+            if segment.is_empty() || segment == "." || segment == ".." {
+                return Err(SecurityError::InvalidBasePath);
+            }
+            if !segment
+                .bytes()
+                .all(|byte| is_unreserved_path_byte(byte) || byte == b'%')
+            {
+                return Err(SecurityError::InvalidBasePath);
+            }
+        }
+        Ok(Self {
+            value: value.to_owned(),
+        })
+    }
+
+    /// Returns the base path including the leading and trailing slashes.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    /// Returns the base path with the trailing slash stripped, suitable for use
+    /// as an axum `Router::nest` prefix (which forbids the trailing slash).
+    #[must_use]
+    pub fn nest_prefix(&self) -> &str {
+        self.value.trim_end_matches('/')
+    }
+}
+
+impl Debug for BasePath {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("BasePath")
+            .field(&self.value)
+            .finish()
+    }
+}
+
+impl FromStr for BasePath {
+    type Err = SecurityError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+const fn is_unreserved_path_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/')
 }
 
 /// Validated HTTP Host header.
@@ -522,6 +626,51 @@ mod tests {
         let remote = SocketAddr::from(([192, 0, 2, 1], 5000));
         let peer = validate_peer_for_policy(remote, &policy)?;
         assert_eq!(peer.get(), remote);
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_parse_valid_base_path() -> anyhow::Result<()> {
+        let parsed = BasePath::parse("/p/abc123/")?;
+        assert_eq!(parsed.as_str(), "/p/abc123/");
+        assert_eq!(parsed.nest_prefix(), "/p/abc123");
+        let multi = BasePath::parse("/coder/p/abc-123_v2/")?;
+        assert_eq!(multi.as_str(), "/coder/p/abc-123_v2/");
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_invalid_base_path() {
+        for value in [
+            "",
+            "/",
+            "p/abc/",
+            "/p/abc",
+            "/p//abc/",
+            "/p/../abc/",
+            "/p/./abc/",
+            "/p/abc?x=1/",
+            "/p/abc with space/",
+        ] {
+            assert!(
+                matches!(BasePath::parse(value), Err(SecurityError::InvalidBasePath)),
+                "expected {value:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_render_public_launch_url_with_base_path() -> anyhow::Result<()> {
+        let url = PublicBaseUrl::parse("https://term.example.com/")?;
+        let token = AccessToken::from_bytes([1; 32]);
+        let base = BasePath::parse("/p/sess-1/")?;
+        let rendered = url.launch_url_with_base_path(&token, 24, "high-contrast", Some(&base));
+        assert!(
+            rendered.starts_with("https://term.example.com/p/sess-1/?"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("token="));
+        assert!(rendered.contains("fontSize=24"));
         Ok(())
     }
 
