@@ -1,0 +1,53 @@
+:root {
+  color-scheme: dark;
+  background: #080b0f;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  background: #fbfcfe;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#terminal-root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+}
+
+#terminal-root {
+  display: block;
+  padding: clamp(12px, 2.5vw, 28px);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0)),
+    #080b0f;
+}
+
+:root[data-theme='light'] #terminal-root {
+  background:
+    linear-gradient(180deg, rgba(0, 87, 184, 0.08), rgba(0, 87, 184, 0)),
+    #fbfcfe;
+}
+
+.xterm {
+  width: 100%;
+  height: 100%;
+}
+
+.xterm .xterm-viewport,
+.xterm .xterm-screen {
+  border-radius: 0;
+}
+
+.xterm .xterm-rows {
+  letter-spacing: 0;
+}

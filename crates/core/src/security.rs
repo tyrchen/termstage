@@ -114,7 +114,7 @@ impl AllowedOrigin {
     /// malformed, non-HTTP(S), or does not match host and port.
     pub fn validate(value: &str, bind: LoopbackBind) -> Result<Self, SecurityError> {
         let origin = Url::parse(value).map_err(|_error| SecurityError::InvalidOrigin)?;
-        if !matches!(origin.scheme(), "http" | "https") {
+        if origin.scheme() != "http" {
             return Err(SecurityError::InvalidOrigin);
         }
         if origin.path() != "/" || origin.query().is_some() || origin.fragment().is_some() {
@@ -244,6 +244,10 @@ mod tests {
         let bind = LoopbackBind::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49200)?;
         assert!(matches!(
             AllowedOrigin::validate("http://127.0.0.1:49201", bind),
+            Err(SecurityError::InvalidOrigin)
+        ));
+        assert!(matches!(
+            AllowedOrigin::validate("https://127.0.0.1:49200", bind),
             Err(SecurityError::InvalidOrigin)
         ));
         assert!(matches!(

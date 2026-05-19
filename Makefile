@@ -41,7 +41,21 @@ frontend-build:
 		echo "frontend assets are not present yet"; \
 	fi
 
-ci: build test-cargo fmt clippy clippy-pedantic doc audit deny
+frontend-typecheck:
+	@if [ -f apps/server/web/package.json ]; then \
+		npm run typecheck --prefix apps/server/web; \
+	else \
+		echo "frontend assets are not present yet"; \
+	fi
+
+frontend-test:
+	@if [ -f apps/server/web/package.json ]; then \
+		npm test --prefix apps/server/web; \
+	else \
+		echo "frontend assets are not present yet"; \
+	fi
+
+ci: build test-cargo fmt clippy clippy-pedantic doc audit deny frontend-typecheck frontend-build frontend-test
 
 check-agent-sync:
 	@cmp -s CLAUDE.md AGENTS.md || { \
@@ -69,4 +83,4 @@ release:
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: build test test-cargo fmt clippy clippy-pedantic doc audit deny frontend-install frontend-build ci check-agent-sync release update-submodule
+.PHONY: build test test-cargo fmt clippy clippy-pedantic doc audit deny frontend-install frontend-build frontend-typecheck frontend-test ci check-agent-sync release update-submodule

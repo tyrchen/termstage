@@ -1,3 +1,10 @@
 //! Server entry point for `presenterm`.
 
-fn main() {}
+mod assets;
+mod cli;
+mod web;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    cli::run().await
+}

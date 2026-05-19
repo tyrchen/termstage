@@ -40,6 +40,9 @@ pub enum ProtocolError {
     /// Random token generation failed.
     #[error("failed to generate access token")]
     TokenGenerationFailed,
+    /// A URL token was malformed.
+    #[error("invalid access token")]
+    InvalidAccessToken,
     /// A heartbeat sequence increment would overflow.
     #[error("heartbeat sequence overflow")]
     HeartbeatOverflow,
@@ -288,7 +291,9 @@ impl SafeMessage {
         &self.0
     }
 
-    pub(crate) fn from_static(value: &'static str) -> Self {
+    /// Creates a safe message from a trusted static string.
+    #[must_use]
+    pub fn from_static(value: &'static str) -> Self {
         Self(value.to_owned())
     }
 }
@@ -343,11 +348,41 @@ impl AccessToken {
     pub const fn as_bytes(&self) -> &[u8; ACCESS_TOKEN_BYTES] {
         &self.0
     }
+
+    /// Encodes the token for explicit browser launch URLs.
+    #[must_use]
+    pub fn to_url_token(&self) -> String {
+        let mut output = String::with_capacity(ACCESS_TOKEN_BYTES * 2);
+        for byte in self.0 {
+            push_hex_byte(byte, &mut output);
+        }
+        output
+    }
 }
 
 impl Debug for AccessToken {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str("AccessToken([REDACTED])")
+    }
+}
+
+impl FromStr for AccessToken {
+    type Err = ProtocolError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != ACCESS_TOKEN_BYTES * 2 {
+            return Err(ProtocolError::InvalidAccessToken);
+        }
+        let mut bytes = [0_u8; ACCESS_TOKEN_BYTES];
+        for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+            let high = decode_hex_nibble(*chunk.first().ok_or(ProtocolError::InvalidAccessToken)?)?;
+            let low = decode_hex_nibble(*chunk.get(1).ok_or(ProtocolError::InvalidAccessToken)?)?;
+            let Some(target) = bytes.get_mut(index) else {
+                return Err(ProtocolError::InvalidAccessToken);
+            };
+            *target = (high << 4) | low;
+        }
+        Ok(Self(bytes))
     }
 }
 
@@ -412,6 +447,27 @@ pub enum ServerControlMessage {
         /// Browser-visible safe message.
         message: SafeMessage,
     },
+}
+
+fn push_hex_byte(byte: u8, output: &mut String) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let high = usize::from(byte >> 4);
+    let low = usize::from(byte & 0x0f);
+    if let Some(value) = HEX.get(high) {
+        output.push(char::from(*value));
+    }
+    if let Some(value) = HEX.get(low) {
+        output.push(char::from(*value));
+    }
+}
+
+fn decode_hex_nibble(byte: u8) -> Result<u8, ProtocolError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(ProtocolError::InvalidAccessToken),
+    }
 }
 
 #[cfg(test)]
@@ -500,6 +556,20 @@ mod tests {
         let different = AccessToken::from_bytes([2; ACCESS_TOKEN_BYTES]);
         assert!(token.constant_time_eq(&same));
         assert!(!token.constant_time_eq(&different));
+    }
+
+    #[test]
+    fn test_should_encode_and_parse_url_token() -> anyhow::Result<()> {
+        let token = AccessToken::from_bytes([0xab; ACCESS_TOKEN_BYTES]);
+        let encoded = token.to_url_token();
+        assert_eq!(encoded.len(), ACCESS_TOKEN_BYTES * 2);
+        let parsed = AccessToken::from_str(&encoded)?;
+        assert!(token.constant_time_eq(&parsed));
+        assert!(matches!(
+            AccessToken::from_str("not-a-token"),
+            Err(ProtocolError::InvalidAccessToken)
+        ));
+        Ok(())
     }
 
     #[test]

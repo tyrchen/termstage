@@ -731,7 +731,10 @@ mod tests {
     async fn test_should_report_child_exit() -> anyhow::Result<()> {
         let shell = ShellCommand::new(
             "/bin/sh",
-            [OsString::from("-c"), OsString::from("printf done")],
+            [
+                OsString::from("-c"),
+                OsString::from("printf done; sleep 0.2"),
+            ],
         )?;
         let config = RuntimeConfig {
             mode: SessionMode::NewShell { shell },

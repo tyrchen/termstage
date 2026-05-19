@@ -1,2 +1,5 @@
 /target
 .vscode
+apps/server/web/node_modules
+apps/server/web/test-results
+apps/server/web/playwright-report
