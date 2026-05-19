@@ -52,7 +52,7 @@ async function startTermstageServer(): Promise<{
       '--mode',
       'shell',
       '--shell',
-      '/bin/zsh',
+      '/bin/bash',
       '--port',
       '0',
       '--font-size',

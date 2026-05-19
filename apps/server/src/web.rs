@@ -577,10 +577,21 @@ mod tests {
 
     use super::*;
 
+    fn test_shell_command() -> anyhow::Result<ShellCommand> {
+        ShellCommand::new(
+            "/bin/bash",
+            [
+                std::ffi::OsString::from("--noprofile"),
+                std::ffi::OsString::from("--norc"),
+            ],
+        )
+        .map_err(Into::into)
+    }
+
     fn test_config() -> anyhow::Result<(WebConfig, AccessToken)> {
         let token = AccessToken::from_bytes([9; 32]);
         let (commands, _rx) = mpsc::channel(8);
-        let shell = ShellCommand::new("/bin/sh", [])?;
+        let shell = test_shell_command()?;
         let runtime = RuntimeConfig {
             mode: SessionMode::NewShell { shell },
             initial_size: TerminalSize::new(80, 24)?,
@@ -699,7 +710,7 @@ mod tests {
         let token = AccessToken::from_bytes([5; 32]);
         let runtime = RuntimeConfig {
             mode: SessionMode::NewShell {
-                shell: ShellCommand::new("/bin/zsh", [std::ffi::OsString::from("-f")])?,
+                shell: test_shell_command()?,
             },
             initial_size: TerminalSize::new(80, 24)?,
             reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
@@ -757,7 +768,7 @@ mod tests {
         let token = AccessToken::from_bytes([7; 32]);
         let runtime = RuntimeConfig {
             mode: SessionMode::NewShell {
-                shell: ShellCommand::new("/bin/zsh", [std::ffi::OsString::from("-f")])?,
+                shell: test_shell_command()?,
             },
             initial_size: TerminalSize::new(80, 24)?,
             reconnect_policy: ReconnectPolicy::KeepAlive,
@@ -843,7 +854,7 @@ mod tests {
         let (commands, mut command_rx) = mpsc::channel(8);
         let runtime = RuntimeConfig {
             mode: SessionMode::NewShell {
-                shell: ShellCommand::new("/bin/sh", [])?,
+                shell: test_shell_command()?,
             },
             initial_size: TerminalSize::new(80, 24)?,
             reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
@@ -868,7 +879,7 @@ mod tests {
         let token = AccessToken::from_bytes([6; 32]);
         let runtime = RuntimeConfig {
             mode: SessionMode::NewShell {
-                shell: ShellCommand::new("/bin/zsh", [std::ffi::OsString::from("-f")])?,
+                shell: test_shell_command()?,
             },
             initial_size: TerminalSize::new(80, 24)?,
             reconnect_policy: ReconnectPolicy::TerminateOnShutdown,

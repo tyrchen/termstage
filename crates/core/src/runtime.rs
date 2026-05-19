@@ -687,8 +687,12 @@ mod tests {
         TerminalSize::new(80, 24).map_err(Into::into)
     }
 
-    fn zsh_command() -> anyhow::Result<ShellCommand> {
-        ShellCommand::new("/bin/zsh", [OsString::from("-f")]).map_err(Into::into)
+    fn test_shell_command() -> anyhow::Result<ShellCommand> {
+        ShellCommand::new(
+            "/bin/bash",
+            [OsString::from("--noprofile"), OsString::from("--norc")],
+        )
+        .map_err(Into::into)
     }
 
     async fn recv_until_contains(
@@ -721,7 +725,7 @@ mod tests {
     {
         let config = RuntimeConfig {
             mode: SessionMode::NewShell {
-                shell: zsh_command()?,
+                shell: test_shell_command()?,
             },
             initial_size: test_size()?,
             reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
@@ -838,7 +842,7 @@ mod tests {
     async fn test_should_allow_controller_reattach_after_detach() -> anyhow::Result<()> {
         let config = RuntimeConfig {
             mode: SessionMode::NewShell {
-                shell: zsh_command()?,
+                shell: test_shell_command()?,
             },
             initial_size: test_size()?,
             reconnect_policy: ReconnectPolicy::KeepAlive,
@@ -906,7 +910,7 @@ mod tests {
     async fn test_should_replay_recent_output_after_reattach() -> anyhow::Result<()> {
         let config = RuntimeConfig {
             mode: SessionMode::NewShell {
-                shell: zsh_command()?,
+                shell: test_shell_command()?,
             },
             initial_size: test_size()?,
             reconnect_policy: ReconnectPolicy::KeepAlive,
@@ -960,7 +964,7 @@ mod tests {
     async fn test_should_close_slow_client_without_stopping_session() -> anyhow::Result<()> {
         let config = RuntimeConfig {
             mode: SessionMode::NewShell {
-                shell: zsh_command()?,
+                shell: test_shell_command()?,
             },
             initial_size: test_size()?,
             reconnect_policy: ReconnectPolicy::KeepAlive,
