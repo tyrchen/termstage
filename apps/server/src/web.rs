@@ -396,8 +396,13 @@ async fn bridge_socket(state: AppState, socket: WebSocket) {
                     }
                 }
             }
-            Some(output) = output_rx.recv() => {
-                if send_client_output(&mut sender, output).await.is_err() {
+            output = output_rx.recv() => {
+                if let Some(output) = output {
+                    if send_client_output(&mut sender, output).await.is_err() {
+                        break;
+                    }
+                } else {
+                    let _result = sender.send(Message::Close(Some(backpressure_close()))).await;
                     break;
                 }
             }
@@ -460,6 +465,13 @@ fn protocol_close() -> CloseFrame {
     CloseFrame {
         code: close_code::PROTOCOL,
         reason: "invalid control frame".into(),
+    }
+}
+
+fn backpressure_close() -> CloseFrame {
+    CloseFrame {
+        code: close_code::POLICY,
+        reason: "browser client backpressure".into(),
     }
 }
 
@@ -741,6 +753,117 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_reattach_websocket_after_browser_refresh() -> anyhow::Result<()> {
+        let token = AccessToken::from_bytes([7; 32]);
+        let runtime = RuntimeConfig {
+            mode: SessionMode::NewShell {
+                shell: ShellCommand::new("/bin/zsh", [std::ffi::OsString::from("-f")])?,
+            },
+            initial_size: TerminalSize::new(80, 24)?,
+            reconnect_policy: ReconnectPolicy::KeepAlive,
+        };
+        let session = RuntimeSession::start(runtime.clone())?;
+        let config = WebConfig::local(token.clone(), session.command_sender(), runtime);
+        let server = serve(config).await?;
+
+        let mut first = connect_test_socket(server.address(), &token).await?;
+        first
+            .send(TungsteniteMessage::Binary(Bytes::from_static(
+                b"printf phase5-before-refresh\\n\n",
+            )))
+            .await?;
+        assert!(
+            read_socket_until(&mut first, b"phase5-before-refresh").await?,
+            "first websocket did not receive terminal output"
+        );
+        first.close(None).await?;
+
+        let mut second = connect_test_socket(server.address(), &token).await?;
+        assert!(
+            read_socket_until(&mut second, b"phase5-before-refresh").await?,
+            "second websocket did not receive replayed terminal state"
+        );
+        second
+            .send(TungsteniteMessage::Binary(Bytes::from_static(
+                b"printf phase5-after-refresh\\n\n",
+            )))
+            .await?;
+        assert!(
+            read_socket_until(&mut second, b"phase5-after-refresh").await?,
+            "second websocket did not receive terminal output"
+        );
+        server.shutdown().await?;
+        session.shutdown(ShutdownReason::Supervisor).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_replay_tmux_state_after_browser_refresh() -> anyhow::Result<()> {
+        let token = AccessToken::from_bytes([8; 32]);
+        let session_name = SessionName::new(format!("presenterm-phase5-{}", std::process::id()))?;
+        let runtime = RuntimeConfig {
+            mode: SessionMode::Tmux {
+                session: session_name.clone(),
+            },
+            initial_size: TerminalSize::new(80, 24)?,
+            reconnect_policy: ReconnectPolicy::KeepAlive,
+        };
+        let session = RuntimeSession::start(runtime.clone())?;
+        let config = WebConfig::local(token.clone(), session.command_sender(), runtime);
+        let server = serve(config).await?;
+
+        let mut first = connect_test_socket(server.address(), &token).await?;
+        first
+            .send(TungsteniteMessage::Binary(Bytes::from_static(
+                b"printf phase5-tmux-state\\n\n",
+            )))
+            .await?;
+        assert!(
+            read_socket_until(&mut first, b"phase5-tmux-state").await?,
+            "first websocket did not receive tmux output"
+        );
+        first.close(None).await?;
+
+        let mut second = connect_test_socket(server.address(), &token).await?;
+        assert!(
+            read_socket_until(&mut second, b"phase5-tmux-state").await?,
+            "second websocket did not receive replayed tmux state"
+        );
+        second
+            .send(TungsteniteMessage::Binary(Bytes::from_static(b"exit\n")))
+            .await?;
+        server.shutdown().await?;
+        session.shutdown(ShutdownReason::Supervisor).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_close_websocket_when_runtime_drops_client_mailbox() -> anyhow::Result<()> {
+        let token = AccessToken::from_bytes([10; 32]);
+        let (commands, mut command_rx) = mpsc::channel(8);
+        let runtime = RuntimeConfig {
+            mode: SessionMode::NewShell {
+                shell: ShellCommand::new("/bin/sh", [])?,
+            },
+            initial_size: TerminalSize::new(80, 24)?,
+            reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+        };
+        let server = serve(WebConfig::local(token.clone(), commands, runtime)).await?;
+        let runtime_task = tokio::spawn(async move {
+            if let Some(RuntimeCommand::AttachClient { output, .. }) = command_rx.recv().await {
+                drop(output);
+            }
+        });
+
+        let mut socket = connect_test_socket(server.address(), &token).await?;
+        let close = timeout(Duration::from_secs(5), socket.next()).await?;
+        assert!(matches!(close, Some(Ok(TungsteniteMessage::Close(_frame)))));
+        runtime_task.await.context("fake runtime task panicked")?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_close_oversized_websocket_frame() -> anyhow::Result<()> {
         let token = AccessToken::from_bytes([6; 32]);
         let runtime = RuntimeConfig {
@@ -801,5 +924,53 @@ mod tests {
         assert!(!format!("{server:?}").contains("0404"));
         let _session = SessionName::new("presentation")?;
         Ok(())
+    }
+
+    async fn connect_test_socket(
+        address: SocketAddr,
+        token: &AccessToken,
+    ) -> anyhow::Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    > {
+        let url = format!("ws://{address}/ws?token={}", token.to_url_token());
+        let mut request = url.into_client_request()?;
+        let origin = format!("http://{address}");
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, origin.parse()?);
+        let (socket, _response) = connect_async(request).await?;
+        Ok(socket)
+    }
+
+    async fn read_socket_until(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        needle: &[u8],
+    ) -> anyhow::Result<bool> {
+        let mut aggregate = Vec::new();
+        timeout(Duration::from_secs(5), async {
+            while let Some(message) = socket.next().await {
+                match message? {
+                    TungsteniteMessage::Binary(bytes) => {
+                        aggregate.extend_from_slice(&bytes);
+                        if aggregate
+                            .windows(needle.len())
+                            .any(|window| window == needle)
+                        {
+                            return anyhow::Ok(true);
+                        }
+                    }
+                    TungsteniteMessage::Text(_text) => {}
+                    TungsteniteMessage::Close(_frame) => return anyhow::Ok(false),
+                    TungsteniteMessage::Ping(_bytes) | TungsteniteMessage::Pong(_bytes) => {}
+                    TungsteniteMessage::Frame(_frame) => {}
+                }
+            }
+            anyhow::Ok(false)
+        })
+        .await?
     }
 }

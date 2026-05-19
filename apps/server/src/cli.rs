@@ -27,7 +27,12 @@ const MAX_FONT_SIZE: u16 = 96;
 /// Browser terminal command-line arguments.
 #[derive(Debug, Parser)]
 #[command(name = "presenterm")]
-#[command(about = "Run a local browser terminal for presentations")]
+#[command(about = "Run a loopback-only browser terminal for presentations")]
+#[command(
+    long_about = "Run a loopback-only browser terminal for presentations. This is a local shell \
+                  bridge, not a sandbox: browser input is sent to a real shell or tmux session \
+                  with the current OS user's privileges."
+)]
 pub struct CliArgs {
     /// Attach to or create this tmux session.
     #[arg(long, default_value = DEFAULT_SESSION)]
@@ -38,7 +43,7 @@ pub struct CliArgs {
     /// Shell executable for shell mode.
     #[arg(long)]
     shell: Option<PathBuf>,
-    /// Loopback bind address.
+    /// Loopback bind address. Non-loopback addresses are rejected.
     #[arg(long, default_value = "127.0.0.1")]
     host: IpAddr,
     /// TCP port. Use 0 for an OS-selected random port.
@@ -53,7 +58,7 @@ pub struct CliArgs {
     /// Browser terminal theme.
     #[arg(long, value_enum, default_value_t = CliTheme::HighContrast)]
     theme: CliTheme,
-    /// Session keepalive policy.
+    /// Session keepalive policy for browser refresh and shutdown.
     #[arg(long, value_enum, default_value_t = CliKeepalive::Session)]
     keepalive: CliKeepalive,
 }

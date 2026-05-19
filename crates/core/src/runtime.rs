@@ -4,7 +4,7 @@
 //! WebSocket layers interact with it through bounded channels only.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ffi::OsString,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -17,6 +17,7 @@ use bytes::Bytes;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use thiserror::Error;
 use tokio::sync::mpsc::{self as tokio_mpsc, error::TrySendError};
+use tracing::warn;
 
 use crate::protocol::{
     ErrorCode, ProtocolError, SafeMessage, ServerControlMessage, SessionName, TerminalSize,
@@ -26,6 +27,7 @@ use crate::protocol::{
 const COMMAND_MAILBOX_CAPACITY: usize = 128;
 const CLIENT_OUTPUT_CAPACITY: usize = 256;
 const PTY_READ_CHUNK_SIZE: usize = 8192;
+const REPLAY_BUFFER_BYTES: usize = 1024 * 1024;
 const ACTOR_IDLE_WAIT: Duration = Duration::from_millis(10);
 
 /// Runtime failure.
@@ -291,6 +293,8 @@ impl RuntimeSession {
                     reader,
                     clients: HashMap::new(),
                     controller: None,
+                    replay: VecDeque::new(),
+                    replay_bytes: 0,
                 };
                 actor.run()
             })
@@ -390,6 +394,8 @@ struct SessionActor {
     reader: JoinHandle<()>,
     clients: HashMap<ClientId, ClientOutputTx>,
     controller: Option<ClientId>,
+    replay: VecDeque<Bytes>,
+    replay_bytes: usize,
 }
 
 impl SessionActor {
@@ -397,9 +403,7 @@ impl SessionActor {
         let reason = self.run_loop();
         self.close_clients(&reason);
         drop(self.writer);
-        if self.config.reconnect_policy == ReconnectPolicy::TerminateOnShutdown {
-            let _result = self.child.kill();
-        }
+        let _result = self.child.kill();
         let _result = self.reader.join();
         ActorOutcome(Ok(()))
     }
@@ -478,6 +482,7 @@ impl SessionActor {
     fn handle_pty_event(&mut self, event: PtyEvent) -> Option<ShutdownReason> {
         match event {
             PtyEvent::Output(bytes) => {
+                self.record_replay(bytes.clone());
                 self.broadcast_bytes(&bytes);
                 None
             }
@@ -510,12 +515,17 @@ impl SessionActor {
                 message: safe_fallback_message(error),
             }),
         };
-        match output.try_send(ready) {
-            Ok(()) => {
-                self.clients.insert(client_id, output);
-            }
-            Err(_error) => {}
+        if output.try_send(ready).is_err() {
+            self.controller = None;
+            return;
         }
+        for bytes in &self.replay {
+            if output.try_send(ClientOutput::Bytes(bytes.clone())).is_err() {
+                self.controller = None;
+                return;
+            }
+        }
+        self.clients.insert(client_id, output);
     }
 
     fn detach_client(&mut self, client_id: ClientId) {
@@ -536,10 +546,27 @@ impl SessionActor {
             }
         }
         for client_id in closed {
-            self.clients.remove(&client_id);
-            if self.controller == Some(client_id) {
-                self.controller = None;
+            self.close_backpressured_client(client_id);
+        }
+    }
+
+    fn close_backpressured_client(&mut self, client_id: ClientId) {
+        if let Some(output) = self.clients.remove(&client_id) {
+            warn!(
+                client_id = client_id.get(),
+                "closing slow browser terminal client after output mailbox backpressure"
+            );
+            if let Some(message) = safe_message("browser client could not keep up") {
+                let _result =
+                    output.try_send(ClientOutput::Control(ServerControlMessage::Warning {
+                        code: WarningCode::ClientBackpressure,
+                        message,
+                    }));
             }
+            let _result = output.try_send(ClientOutput::Closed(ShutdownReason::ClientDisconnect));
+        }
+        if self.controller == Some(client_id) {
+            self.controller = None;
         }
     }
 
@@ -549,6 +576,19 @@ impl SessionActor {
         }
         self.clients.clear();
         self.controller = None;
+    }
+
+    fn record_replay(&mut self, bytes: Bytes) {
+        self.replay_bytes = self.replay_bytes.saturating_add(bytes.len());
+        self.replay.push_back(bytes);
+        while self.replay_bytes > REPLAY_BUFFER_BYTES {
+            if let Some(removed) = self.replay.pop_front() {
+                self.replay_bytes = self.replay_bytes.saturating_sub(removed.len());
+            } else {
+                self.replay_bytes = 0;
+                break;
+            }
+        }
     }
 }
 
@@ -791,6 +831,195 @@ mod tests {
         assert!(output.windows(14).any(|window| window == b"phase2-tmux-ok"));
         session.shutdown(ShutdownReason::Supervisor).await?;
         sleep(Duration::from_millis(50)).await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_allow_controller_reattach_after_detach() -> anyhow::Result<()> {
+        let config = RuntimeConfig {
+            mode: SessionMode::NewShell {
+                shell: zsh_command()?,
+            },
+            initial_size: test_size()?,
+            reconnect_policy: ReconnectPolicy::KeepAlive,
+        };
+        let session = RuntimeSession::start(config)?;
+        let (first_tx, mut first_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(1),
+                output: first_tx,
+            })
+            .await?;
+        let first_ready = first_rx.recv().await.context("first ready output")?;
+        assert!(matches!(
+            first_ready,
+            ClientOutput::Control(ServerControlMessage::Ready { .. })
+        ));
+        session
+            .send(RuntimeCommand::Input {
+                client_id: ClientId::new(1),
+                bytes: Bytes::from_static(b"printf phase5-before-detach\\n\n"),
+            })
+            .await?;
+        let first_output = recv_until_contains(&mut first_rx, b"phase5-before-detach").await?;
+        assert!(
+            first_output
+                .windows(b"phase5-before-detach".len())
+                .any(|window| window == b"phase5-before-detach")
+        );
+        session
+            .send(RuntimeCommand::DetachClient {
+                client_id: ClientId::new(1),
+            })
+            .await?;
+
+        let (second_tx, mut second_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(2),
+                output: second_tx,
+            })
+            .await?;
+        let second_ready = second_rx.recv().await.context("second ready output")?;
+        assert!(matches!(
+            second_ready,
+            ClientOutput::Control(ServerControlMessage::Ready { .. })
+        ));
+        session
+            .send(RuntimeCommand::Input {
+                client_id: ClientId::new(2),
+                bytes: Bytes::from_static(b"printf phase5-after-reattach\\n\n"),
+            })
+            .await?;
+        let second_output = recv_until_contains(&mut second_rx, b"phase5-after-reattach").await?;
+        assert!(
+            second_output
+                .windows(b"phase5-after-reattach".len())
+                .any(|window| window == b"phase5-after-reattach")
+        );
+        session.shutdown(ShutdownReason::Supervisor).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_replay_recent_output_after_reattach() -> anyhow::Result<()> {
+        let config = RuntimeConfig {
+            mode: SessionMode::NewShell {
+                shell: zsh_command()?,
+            },
+            initial_size: test_size()?,
+            reconnect_policy: ReconnectPolicy::KeepAlive,
+        };
+        let session = RuntimeSession::start(config)?;
+        let (first_tx, mut first_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(1),
+                output: first_tx,
+            })
+            .await?;
+        let _ready = first_rx.recv().await.context("first ready output")?;
+        session
+            .send(RuntimeCommand::Input {
+                client_id: ClientId::new(1),
+                bytes: Bytes::from_static(b"printf phase5-replay-state\\n\n"),
+            })
+            .await?;
+        let first_output = recv_until_contains(&mut first_rx, b"phase5-replay-state").await?;
+        assert!(
+            first_output
+                .windows(b"phase5-replay-state".len())
+                .any(|window| window == b"phase5-replay-state")
+        );
+        session
+            .send(RuntimeCommand::DetachClient {
+                client_id: ClientId::new(1),
+            })
+            .await?;
+
+        let (second_tx, mut second_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(2),
+                output: second_tx,
+            })
+            .await?;
+        let _ready = second_rx.recv().await.context("second ready output")?;
+        let replayed = recv_until_contains(&mut second_rx, b"phase5-replay-state").await?;
+        assert!(
+            replayed
+                .windows(b"phase5-replay-state".len())
+                .any(|window| window == b"phase5-replay-state")
+        );
+        session.shutdown(ShutdownReason::Supervisor).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_close_slow_client_without_stopping_session() -> anyhow::Result<()> {
+        let config = RuntimeConfig {
+            mode: SessionMode::NewShell {
+                shell: zsh_command()?,
+            },
+            initial_size: test_size()?,
+            reconnect_policy: ReconnectPolicy::KeepAlive,
+        };
+        let session = RuntimeSession::start(config)?;
+        let (slow_tx, mut slow_rx) = tokio_mpsc::channel(1);
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(1),
+                output: slow_tx,
+            })
+            .await?;
+        session
+            .send(RuntimeCommand::Input {
+                client_id: ClientId::new(1),
+                bytes: Bytes::from_static(b"printf 'phase5-backpressure-%s\\n' {1..300}\n"),
+            })
+            .await?;
+        sleep(Duration::from_millis(500)).await;
+        let ready = slow_rx.recv().await.context("slow client ready output")?;
+        assert!(matches!(
+            ready,
+            ClientOutput::Control(ServerControlMessage::Ready { .. })
+        ));
+        assert!(
+            timeout(Duration::from_secs(2), slow_rx.recv())
+                .await?
+                .is_none()
+        );
+
+        let (recovered_tx, mut recovered_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(2),
+                output: recovered_tx,
+            })
+            .await?;
+        let recovered_ready = recovered_rx
+            .recv()
+            .await
+            .context("recovered ready output")?;
+        assert!(matches!(
+            recovered_ready,
+            ClientOutput::Control(ServerControlMessage::Ready { .. })
+        ));
+        session
+            .send(RuntimeCommand::Input {
+                client_id: ClientId::new(2),
+                bytes: Bytes::from_static(b"printf phase5-session-alive\\n\n"),
+            })
+            .await?;
+        let recovered_output =
+            recv_until_contains(&mut recovered_rx, b"phase5-session-alive").await?;
+        assert!(
+            recovered_output
+                .windows(b"phase5-session-alive".len())
+                .any(|window| window == b"phase5-session-alive")
+        );
+        session.shutdown(ShutdownReason::Supervisor).await?;
         Ok(())
     }
 }

@@ -16,6 +16,12 @@ clippy:
 clippy-pedantic:
 	@cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic
 
+clippy-boundary:
+	@cargo clippy --workspace --all-targets -- \
+		-D warnings -W clippy::pedantic \
+		-W clippy::unwrap_used -W clippy::expect_used \
+		-W clippy::indexing_slicing -W clippy::panic
+
 doc:
 	@RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
@@ -55,7 +61,9 @@ frontend-test:
 		echo "frontend assets are not present yet"; \
 	fi
 
-ci: build test-cargo fmt clippy clippy-pedantic doc audit deny frontend-typecheck frontend-build frontend-test
+frontend-ci: frontend-install frontend-typecheck frontend-build frontend-test
+
+ci: build test-cargo fmt clippy clippy-pedantic clippy-boundary doc audit deny frontend-ci
 
 check-agent-sync:
 	@cmp -s CLAUDE.md AGENTS.md || { \
@@ -83,4 +91,4 @@ release:
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: build test test-cargo fmt clippy clippy-pedantic doc audit deny frontend-install frontend-build frontend-typecheck frontend-test ci check-agent-sync release update-submodule
+.PHONY: build test test-cargo fmt clippy clippy-pedantic clippy-boundary doc audit deny frontend-install frontend-build frontend-typecheck frontend-test frontend-ci ci check-agent-sync release update-submodule

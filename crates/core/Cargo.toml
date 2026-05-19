@@ -23,6 +23,7 @@ serde_json.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 url.workspace = true
 which.workspace = true
 

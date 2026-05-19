@@ -839,6 +839,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "url",
  "which",
 ]

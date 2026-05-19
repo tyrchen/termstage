@@ -2,13 +2,28 @@
 
 # presenterm
 
-description of the crate
+`presenterm` provides a local browser terminal presentation mode. It starts a
+loopback-only web server, opens a tokenized browser URL, and bridges the page to a
+real local shell or tmux session.
 
-## How to use it
+## Browser Terminal
 
 ```bash
-$ cargo generate --git https://github.com/tyrchen/rust-lib-template
+cargo run -p presenterm-server --bin presenterm -- --session presentation --open
 ```
+
+The browser terminal is a local shell bridge, not a sandbox. It only binds to a
+loopback address, requires the per-start token in the browser URL, checks same-origin
+WebSocket requests, and runs commands with the current OS user's privileges. Do not
+expose it through LAN binding, tunnels, or reverse proxies without a separate remote
+sharing design.
+
+Useful options:
+
+- `--mode tmux|shell`: use a shared tmux session or a fresh shell.
+- `--keepalive session|exit`: keep the session available across browser refreshes or
+  terminate it during shutdown.
+- `--font-size <px>` and `--theme high-contrast|light`: tune presentation readability.
 
 ## Agent support
 
