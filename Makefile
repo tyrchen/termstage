@@ -1,8 +1,47 @@
 build:
-	@cargo build
+	@cargo build --workspace --all-targets
 
 test:
 	@cargo nextest run --all-features
+
+test-cargo:
+	@cargo test --workspace --all-targets
+
+fmt:
+	@cargo +nightly fmt --all -- --check
+
+clippy:
+	@cargo clippy --workspace --all-targets -- -D warnings
+
+clippy-pedantic:
+	@cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic
+
+doc:
+	@RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+audit:
+	@cargo audit
+
+deny:
+	@cargo deny check
+
+frontend-install:
+	@if [ -f apps/server/web/package-lock.json ]; then \
+		npm ci --prefix apps/server/web; \
+	elif [ -f apps/server/web/package.json ]; then \
+		npm install --prefix apps/server/web; \
+	else \
+		echo "frontend assets are not present yet"; \
+	fi
+
+frontend-build:
+	@if [ -f apps/server/web/package.json ]; then \
+		npm run build --prefix apps/server/web; \
+	else \
+		echo "frontend assets are not present yet"; \
+	fi
+
+ci: build test-cargo fmt clippy clippy-pedantic doc audit deny
 
 check-agent-sync:
 	@cmp -s CLAUDE.md AGENTS.md || { \
@@ -30,4 +69,4 @@ release:
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: build test check-agent-sync release update-submodule
+.PHONY: build test test-cargo fmt clippy clippy-pedantic doc audit deny frontend-install frontend-build ci check-agent-sync release update-submodule

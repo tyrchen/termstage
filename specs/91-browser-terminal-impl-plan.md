@@ -29,6 +29,9 @@ frontend asset bundling, tmux portability, or CI security tooling requires itera
 
 ## 3. Phase 0 - Risk Retirement
 
+Status: complete. Validation evidence is recorded in
+[../docs/research/browser-terminal-phase-0-validation.md](../docs/research/browser-terminal-phase-0-validation.md).
+
 | # | Deliverable | Lands in | Effort |
 | --- | --- | --- | --- |
 | 0.1 | Validate `portable-pty` spawn, read, write, resize on macOS with zsh and tmux. | Research memo or implementation note | 0.5 day |

@@ -1,3 +1,3 @@
-fn main() {
-    println!("Hello, world!");
-}
+//! Server entry point for `presenterm`.
+
+fn main() {}

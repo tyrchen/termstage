@@ -42,7 +42,8 @@ code that depends on Axum, browser asset tooling, and process spawning.
 
 ## 3. Dependency Baseline
 
-Versions verified on 2026-05-19:
+Versions verified on 2026-05-19. Phase 0 validation evidence is in
+[../docs/research/browser-terminal-phase-0-validation.md](../docs/research/browser-terminal-phase-0-validation.md).
 
 | Dependency | Version | Owner | Feature notes |
 | --- | --- | --- | --- |
@@ -61,6 +62,32 @@ Versions verified on 2026-05-19:
 | `@xterm/addon-web-links` | `0.12.0` | frontend | Link detection. |
 | `@xterm/addon-webgl` | `0.19.0` | frontend optional | Optional renderer feature, not required for M0. |
 
+### 3.1 Validated API Shapes
+
+`portable-pty`:
+
+- Use `native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })`.
+- Spawn commands with `CommandBuilder` and argv arguments only.
+- Use `try_clone_reader()` for PTY output and `take_writer()` for PTY input.
+- Apply resize through the PTY master handle.
+- Launch managed tmux commands through `/usr/bin/env -u TMUX tmux ...` so an inherited
+  tmux environment cannot redirect the command to the presenter's outer session.
+
+`@xterm/xterm`:
+
+- Import from scoped packages: `@xterm/xterm`, `@xterm/addon-fit`,
+  `@xterm/addon-web-links`, and optional `@xterm/addon-webgl`.
+- Load addons with `terminal.loadAddon(new FitAddon())` style APIs.
+- Include Vite client types for xterm CSS side-effect imports.
+
+`axum`:
+
+- Use `axum = { version = "0.8.9", default-features = false, features = ["ws", "http1"] }`
+  for the first HTTP server phase.
+- Configure `WebSocketUpgrade::max_frame_size` and `max_message_size` before
+  `on_upgrade`.
+- Use `futures-util` stream/sink traits for split send/receive halves.
+
 ## 4. Feature Policy
 
 - Cargo dependencies live in `[workspace.dependencies]` when shared by more than one
@@ -68,7 +95,11 @@ Versions verified on 2026-05-19:
 - Optional features are explicit and minimal. Do not enable `tokio = "full"` unless a
   phase proves each feature is needed.
 - Frontend packages are pinned in lockfiles. No CDN scripts in production.
-- Add Makefile targets for frontend build and browser tests when they land.
+- Build frontend assets with Vite under `apps/server/web`, commit `package-lock.json`,
+  and enable manifest output for hashed asset lookup.
+- Makefile targets for frontend install/build exist before the frontend lands and are
+  no-ops until `apps/server/web/package.json` is present.
+- Add browser test targets when Playwright lands.
 - Security tooling follows `AGENTS.md`: `cargo audit` and `cargo-deny` are required
   quality gates before release.
 

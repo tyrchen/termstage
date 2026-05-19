@@ -81,9 +81,10 @@ to map that order to user-visible milestones.
 
 ## Source Context
 
-No committed `docs/research/` or `vendors/` prior-art memo exists yet. Phase 0 in
-[91-browser-terminal-impl-plan.md](./91-browser-terminal-impl-plan.md) requires validating
-the PTY, xterm.js, and tmux assumptions before production code.
+Phase 0 validation is recorded in
+[../docs/research/browser-terminal-phase-0-validation.md](../docs/research/browser-terminal-phase-0-validation.md).
+No committed `vendors/` prior-art source exists yet because Phase 0 only required
+local API probes for PTY, xterm.js, Axum WebSockets, and asset bundling.
 
 Project engineering norms are binding through `AGENTS.md`: Rust 2024, no `unsafe`,
 no `unwrap()` or `expect()` in production code, structured errors, actor-style runtime
