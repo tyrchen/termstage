@@ -220,11 +220,13 @@ impl BasePath {
         if value.is_empty() || value.len() > Self::MAX_BYTES {
             return Err(SecurityError::InvalidBasePath);
         }
-        if !value.starts_with('/') || !value.ends_with('/') {
+        let Some(trimmed) = value
+            .strip_prefix('/')
+            .and_then(|without_prefix| without_prefix.strip_suffix('/'))
+        else {
             return Err(SecurityError::InvalidBasePath);
-        }
-        let trimmed = value.trim_start_matches('/').trim_end_matches('/');
-        if trimmed.is_empty() {
+        };
+        if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.ends_with('/') {
             return Err(SecurityError::InvalidBasePath);
         }
         for segment in trimmed.split('/') {
@@ -253,7 +255,7 @@ impl BasePath {
     /// as an axum `Router::nest` prefix (which forbids the trailing slash).
     #[must_use]
     pub fn nest_prefix(&self) -> &str {
-        self.value.trim_end_matches('/')
+        self.value.strip_suffix('/').unwrap_or(&self.value)
     }
 }
 
@@ -646,6 +648,9 @@ mod tests {
             "/",
             "p/abc/",
             "/p/abc",
+            "//p/abc/",
+            "/p/abc//",
+            "/p//",
             "/p//abc/",
             "/p/../abc/",
             "/p/./abc/",
