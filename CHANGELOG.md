@@ -3,14 +3,48 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
-## [Unreleased]
+## [termstage-v0.2.0](https://github.com/compare/termstage-v0.1.0..termstage-v0.2.0) - 2026-05-20
 
 ### Features
 
-- Add `--base-path <path>` flag so termstage can run behind a path-based reverse
-  proxy. When set, all HTTP and WebSocket routes mount under the prefix, the
-  served HTML injects a matching `<base href>` tag, and the public/local launch
-  URL builders include the prefix. Default mode (no flag) is unchanged.
+- **(coder)** add reverse-proxy base path mounting (#2) - ([754bf24](https://github.com/commit/754bf24b14e85f81f69ed06f6156abeea31519bc)) - Tyr Chen
+
+### Miscellaneous Chores
+
+- update README.md - ([402e34b](https://github.com/commit/402e34bbb38da90f9eebb4a5943e413035cb7b3f)) - Tyr Chen
+- bump version - ([a2da817](https://github.com/commit/a2da81717722c301241ac199e828998bbb58adee)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([1350e08](https://github.com/commit/1350e083b8a786da86c19a96a44ce74376dea357)) - Tyr Chen
+- Fix CI shell portability - ([951f33e](https://github.com/commit/951f33e9badf941a692a23edd2a66fde6eeca829)) - Tyr Chen
+- Add explicit public pod exposure mode (#1)
+
+## Summary
+
+- add M4/Phase 6 specs for explicit public pod exposure using
+`--expose-public`, `--public-url`, and `--token-env`
+- implement typed exposure policy, HTTPS public URL validation, public
+Host/Origin checks, and public launch URL construction
+- keep default local mode loopback-only with generated per-run tokens,
+and document public pod usage in README/user guides
+
+## Verification
+
+- `make build`
+- `make test-cargo`
+- `make fmt`
+- `make clippy`
+- `make clippy-pedantic`
+- `make clippy-boundary`
+- `make doc`
+- `make audit`
+- `make deny`
+- pre-commit: `cargo fmt`, `cargo deny check`, `cargo check`, `cargo
+clippy`, `cargo test`
+
+Note: `cargo deny check` exits successfully with existing
+duplicate/license warnings. - ([4c7787b](https://github.com/commit/4c7787bbc5035701dd42bbe0129ed0693acacdab)) - Tyr Chen
 
 ---
 ## [termstage-v0.1.0] - 2026-05-19
