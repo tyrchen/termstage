@@ -24,8 +24,10 @@ const RECONNECT_DELAYS_MS = [250, 500, 1000, 2000] as const;
 
 export function connectTerminalSocket(terminal: Terminal): TerminalSocket {
   const token = new URLSearchParams(window.location.search).get('token') ?? '';
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const socketUrl = `${protocol}//${window.location.host}/ws?token=${token}`;
+  const baseUrl = new URL('ws', document.baseURI);
+  baseUrl.protocol = baseUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+  baseUrl.search = `?token=${token}`;
+  const socketUrl = baseUrl.toString();
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   let heartbeatSequence = 0;

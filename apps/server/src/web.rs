@@ -30,7 +30,7 @@ use termstage_core::{
     },
     runtime::{ClientId, ClientOutput, RuntimeCommand, RuntimeConfig, RuntimeSession},
     security::{
-        AllowedHost, AllowedOrigin, ExposurePolicy, PublicBaseUrl, SecurityError,
+        AllowedHost, AllowedOrigin, BasePath, ExposurePolicy, PublicBaseUrl, SecurityError,
         validate_access_token, validate_peer_for_policy,
     },
 };
@@ -102,6 +102,8 @@ pub struct WebConfig {
     pub runtime: RuntimeConfig,
     /// Browser presentation settings.
     pub presentation: PresentationSettings,
+    /// Optional reverse-proxy base path. When set, all routes mount under it.
+    pub base_path: Option<BasePath>,
 }
 
 impl WebConfig {
@@ -120,6 +122,7 @@ impl WebConfig {
             commands,
             runtime,
             presentation: PresentationSettings::default(),
+            base_path: None,
         }
     }
 }
@@ -142,6 +145,7 @@ pub struct RunningServer {
     token: AccessToken,
     presentation: PresentationSettings,
     exposure: WebExposure,
+    base_path: Option<BasePath>,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<anyhow::Result<()>>,
 }
@@ -154,6 +158,7 @@ impl Debug for RunningServer {
             .field("token", &self.token)
             .field("presentation", &self.presentation)
             .field("exposure", &self.exposure)
+            .field("base_path", &self.base_path)
             .finish_non_exhaustive()
     }
 }
@@ -170,18 +175,21 @@ impl RunningServer {
     pub fn launch_url(&self) -> String {
         match &self.exposure {
             WebExposure::Local => {
+                let prefix = self.base_path.as_ref().map_or("/", BasePath::as_str);
                 format!(
-                    "http://{}/?token={}&fontSize={}&theme={}",
+                    "http://{}{}?token={}&fontSize={}&theme={}",
                     self.address,
+                    prefix,
                     self.token.to_url_token(),
                     self.presentation.font_size,
                     self.presentation.theme.as_str()
                 )
             }
-            WebExposure::Public { public_url } => public_url.launch_url(
+            WebExposure::Public { public_url } => public_url.launch_url_with_base_path(
                 &self.token,
                 self.presentation.font_size,
                 self.presentation.theme.as_str(),
+                self.base_path.as_ref(),
             ),
         }
     }
@@ -214,6 +222,7 @@ impl RunningServer {
             token,
             presentation,
             exposure: WebExposure::Local,
+            base_path: None,
             shutdown: Some(shutdown),
             task,
         }
@@ -231,6 +240,7 @@ struct AppStateInner {
     commands: mpsc::Sender<RuntimeCommand>,
     runtime: RuntimeConfig,
     presentation: PresentationSettings,
+    base_path: Option<BasePath>,
     next_client_id: AtomicU64,
 }
 
@@ -242,6 +252,7 @@ impl Debug for AppState {
             .field("token", &self.inner.token)
             .field("runtime", &self.inner.runtime)
             .field("presentation", &self.inner.presentation)
+            .field("base_path", &self.inner.base_path)
             .finish_non_exhaustive()
     }
 }
@@ -259,6 +270,7 @@ impl AppState {
                 commands: config.commands,
                 runtime: config.runtime,
                 presentation: config.presentation,
+                base_path: config.base_path,
                 next_client_id: AtomicU64::new(1),
             }),
         })
@@ -276,13 +288,18 @@ impl AppState {
 ///
 /// Returns [`SecurityError`] if the configured exposure policy is invalid.
 pub fn router(config: WebConfig) -> Result<Router, SecurityError> {
+    let base_path = config.base_path.clone();
     let state = AppState::new(config)?;
-    Ok(Router::new()
-        .route("/", get(index))
-        .route("/assets/{*path}", get(asset))
-        .route("/ws", get(ws))
-        .route("/healthz", get(healthz))
-        .with_state(state))
+    let prefix = base_path.as_ref().map_or("", BasePath::nest_prefix);
+    let mut router = Router::new()
+        .route(&format!("{prefix}/"), get(index))
+        .route(&format!("{prefix}/assets/{{*path}}"), get(asset))
+        .route(&format!("{prefix}/ws"), get(ws))
+        .route(&format!("{prefix}/healthz"), get(healthz));
+    if !prefix.is_empty() {
+        router = router.route(prefix, get(index));
+    }
+    Ok(router.with_state(state))
 }
 
 /// Starts the Axum server.
@@ -300,6 +317,7 @@ pub async fn serve(config: WebConfig) -> anyhow::Result<RunningServer> {
     let token = config.token.clone();
     let presentation = config.presentation;
     let exposure = config.exposure.clone();
+    let base_path = config.base_path.clone();
     let app = router(WebConfig {
         port: address.port(),
         ..config
@@ -322,6 +340,7 @@ pub async fn serve(config: WebConfig) -> anyhow::Result<RunningServer> {
         token,
         presentation,
         exposure,
+        base_path,
         shutdown: Some(shutdown_tx),
         task,
     })
@@ -340,7 +359,7 @@ async fn index(
     Query(query): Query<TokenQuery>,
 ) -> Result<Response, WebError> {
     validate_http_request(&state, peer, &headers, &query, false)?;
-    Ok(index_response())
+    Ok(index_response(state.inner.base_path.as_ref()))
 }
 
 async fn asset(
@@ -799,6 +818,7 @@ mod tests {
             exposure: WebExposure::Public {
                 public_url: PublicBaseUrl::parse("https://term.example.com/")?,
             },
+            base_path: None,
             shutdown: None,
             task: tokio::spawn(async { Ok(()) }),
         };
@@ -1053,6 +1073,82 @@ mod tests {
         assert!(closed.is_some());
         server.shutdown().await?;
         session.shutdown(ShutdownReason::Supervisor).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_mount_routes_under_base_path() -> anyhow::Result<()> {
+        let (mut config, token) = test_config()?;
+        config.base_path = Some(BasePath::parse("/p/sess-1/")?);
+        let token_value = token.to_url_token();
+        let app = router(config.clone())?;
+        let prefixed = format!("/p/sess-1/?token={token_value}");
+        let prefixed_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&prefixed)
+                    .header(header::HOST, "127.0.0.1:49152")
+                    .extension(ConnectInfo(SocketAddr::from((Ipv4Addr::LOCALHOST, 50000))))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(prefixed_response.status(), StatusCode::OK);
+        let body_bytes = prefixed_response.into_body().collect().await?.to_bytes();
+        let body = std::str::from_utf8(&body_bytes)?;
+        assert!(
+            body.contains("<base href=\"/p/sess-1/\">"),
+            "expected base href tag, got: {body}"
+        );
+
+        let root_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/?token={token_value}"))
+                    .header(header::HOST, "127.0.0.1:49152")
+                    .extension(ConnectInfo(SocketAddr::from((Ipv4Addr::LOCALHOST, 50000))))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(root_response.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_render_default_index_without_base_href() -> anyhow::Result<()> {
+        let (config, token) = test_config()?;
+        let app = router(config)?;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/?token={}", token.to_url_token()))
+                    .header(header::HOST, "127.0.0.1:49152")
+                    .extension(ConnectInfo(SocketAddr::from((Ipv4Addr::LOCALHOST, 50000))))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = response.into_body().collect().await?.to_bytes();
+        let body = std::str::from_utf8(&body_bytes)?;
+        assert!(!body.contains("<base href"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_build_local_launch_url_with_base_path() -> anyhow::Result<()> {
+        let token = AccessToken::from_bytes([4; 32]);
+        let server = RunningServer {
+            address: SocketAddr::from((Ipv4Addr::LOCALHOST, 8080)),
+            token: token.clone(),
+            presentation: PresentationSettings::default(),
+            exposure: WebExposure::Local,
+            base_path: Some(BasePath::parse("/p/sess-2/")?),
+            shutdown: None,
+            task: tokio::spawn(async { Ok(()) }),
+        };
+        let url = server.launch_url();
+        assert!(url.starts_with("http://127.0.0.1:8080/p/sess-2/?"), "{url}");
+        assert!(url.contains("token="));
         Ok(())
     }
 

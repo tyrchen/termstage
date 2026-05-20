@@ -15,7 +15,7 @@ use termstage_core::{
     runtime::{
         ReconnectPolicy, RuntimeConfig, RuntimeSession, SessionMode, ShellCommand, ShutdownReason,
     },
-    security::PublicBaseUrl,
+    security::{BasePath, PublicBaseUrl},
 };
 use tracing::info;
 
@@ -74,6 +74,10 @@ pub struct CliArgs {
     /// Environment variable containing the 64-hex-character access token.
     #[arg(long)]
     token_env: Option<String>,
+    /// Reverse-proxy base path under which to mount all routes
+    /// (e.g. `/p/<sessionId>/`). Must start and end with `/`.
+    #[arg(long)]
+    base_path: Option<String>,
 }
 
 /// Validated CLI configuration.
@@ -93,6 +97,8 @@ pub struct ValidatedCliConfig {
     pub exposure: WebExposure,
     /// Access token for this server run.
     pub token: AccessToken,
+    /// Optional reverse-proxy base path.
+    pub base_path: Option<BasePath>,
 }
 
 impl TryFrom<CliArgs> for ValidatedCliConfig {
@@ -102,6 +108,10 @@ impl TryFrom<CliArgs> for ValidatedCliConfig {
         if !(MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(&args.font_size) {
             bail!("font size must be in {MIN_FONT_SIZE}..={MAX_FONT_SIZE}");
         }
+        let base_path = match args.base_path.as_deref() {
+            Some(value) => Some(BasePath::from_str(value).context("invalid --base-path")?),
+            None => None,
+        };
         let (exposure, token) = exposure_and_token(&args)?;
         let initial_size = TerminalSize::new(80, 24).context("default terminal size is invalid")?;
         let mode = match args.mode {
@@ -128,6 +138,7 @@ impl TryFrom<CliArgs> for ValidatedCliConfig {
             },
             exposure,
             token,
+            base_path,
         })
     }
 }
@@ -159,6 +170,7 @@ pub async fn run_with_config(config: ValidatedCliConfig) -> anyhow::Result<()> {
     web_config.port = config.port;
     web_config.presentation = config.presentation;
     web_config.exposure = config.exposure;
+    web_config.base_path = config.base_path;
 
     let server = serve(web_config)
         .await
@@ -329,6 +341,7 @@ impl Default for CliArgs {
             expose_public: false,
             public_url: None,
             token_env: None,
+            base_path: None,
         }
     }
 }
@@ -433,6 +446,29 @@ mod tests {
     fn test_should_reject_invalid_font_size() {
         let args = CliArgs {
             font_size: MAX_FONT_SIZE.saturating_add(1),
+            ..CliArgs::default()
+        };
+        assert!(ValidatedCliConfig::try_from(args).is_err());
+    }
+
+    #[test]
+    fn test_should_validate_base_path_argument() -> anyhow::Result<()> {
+        let args = CliArgs {
+            base_path: Some("/p/sess-1/".to_owned()),
+            ..CliArgs::default()
+        };
+        let config = ValidatedCliConfig::try_from(args)?;
+        assert_eq!(
+            config.base_path.as_ref().map(BasePath::as_str),
+            Some("/p/sess-1/")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_invalid_base_path_argument() {
+        let args = CliArgs {
+            base_path: Some("p/missing-leading-slash/".to_owned()),
             ..CliArgs::default()
         };
         assert!(ValidatedCliConfig::try_from(args).is_err());
