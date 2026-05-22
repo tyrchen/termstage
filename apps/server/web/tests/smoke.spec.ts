@@ -122,7 +122,7 @@ test('terminal app stops reconnecting when another browser takes over', async ({
   }
 });
 
-test('terminal app shows session-ended status when shell exits', async ({ page }, testInfo) => {
+test('terminal app holds the session when shell exits', async ({ page }, testInfo) => {
   const server = await startTermstageServer();
   try {
     testInfo.attach('launch-url-redacted', {
@@ -133,7 +133,7 @@ test('terminal app shows session-ended status when shell exits', async ({ page }
     await expect(page.locator('.xterm')).toBeVisible();
     await page.keyboard.type('exit');
     await page.keyboard.press('Enter');
-    await expect(page.getByRole('dialog')).toContainText('Session ended');
+    await expect(page.getByRole('dialog')).toContainText('Process exited');
     await expect(page.getByRole('dialog')).toContainText('The terminal process exited.');
   } finally {
     await server.stop();

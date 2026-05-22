@@ -177,6 +177,15 @@ pub enum ReconnectPolicy {
     TerminateOnShutdown,
 }
 
+/// Behavior after the terminal child exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitPolicy {
+    /// Keep the browser session open and report the exited process.
+    Hold,
+    /// Close the browser session when the terminal child exits.
+    End,
+}
+
 /// Runtime configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
@@ -186,6 +195,8 @@ pub struct RuntimeConfig {
     pub initial_size: TerminalSize,
     /// Reconnect behavior.
     pub reconnect_policy: ReconnectPolicy,
+    /// Child process exit behavior.
+    pub exit_policy: ExitPolicy,
 }
 
 /// Reason for runtime shutdown.
@@ -300,6 +311,7 @@ impl RuntimeSession {
                     reader,
                     clients: HashMap::new(),
                     controller: None,
+                    child_exited: false,
                     replay: VecDeque::new(),
                     replay_bytes: 0,
                 };
@@ -401,6 +413,7 @@ struct SessionActor {
     reader: JoinHandle<()>,
     clients: HashMap<ClientId, ClientOutputTx>,
     controller: Option<ClientId>,
+    child_exited: bool,
     replay: VecDeque<Bytes>,
     replay_bytes: usize,
 }
@@ -422,9 +435,11 @@ impl SessionActor {
                 Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {}
             }
 
-            while let Ok(event) = self.pty_rx.try_recv() {
-                if let Some(reason) = self.handle_pty_event(event) {
-                    return reason;
+            if !self.child_exited {
+                while let Ok(event) = self.pty_rx.try_recv() {
+                    if let Some(reason) = self.handle_pty_event(event) {
+                        return reason;
+                    }
                 }
             }
 
@@ -441,14 +456,55 @@ impl SessionActor {
                 }
             }
 
-            match self.pty_rx.recv_timeout(ACTOR_IDLE_WAIT) {
-                Ok(event) => {
-                    if let Some(reason) = self.handle_pty_event(event) {
-                        return reason;
+            if self.child_exited {
+                thread::sleep(ACTOR_IDLE_WAIT);
+            } else {
+                match self.pty_rx.recv_timeout(ACTOR_IDLE_WAIT) {
+                    Ok(event) => {
+                        if let Some(reason) = self.handle_pty_event(event) {
+                            return reason;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        if let Some(reason) = self.handle_child_exit() {
+                            return reason;
+                        }
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return ShutdownReason::ChildExit,
+            }
+        }
+    }
+
+    fn handle_child_exit(&mut self) -> Option<ShutdownReason> {
+        if self.child_exited {
+            return None;
+        }
+
+        match self.config.exit_policy {
+            ExitPolicy::End => Some(ShutdownReason::ChildExit),
+            ExitPolicy::Hold => {
+                self.child_exited = true;
+                self.notify_process_exited();
+                None
+            }
+        }
+    }
+
+    fn notify_process_exited(&mut self) {
+        let message = ClientOutput::Control(ServerControlMessage::ProcessExited {
+            message: SafeMessage::from_static("The terminal process exited."),
+        });
+        let mut closed = Vec::new();
+        for (client_id, output) in &self.clients {
+            if output.try_send(message.clone()).is_err() {
+                closed.push(*client_id);
+            }
+        }
+        for client_id in closed {
+            self.clients.remove(&client_id);
+            if self.controller == Some(client_id) {
+                self.controller = None;
             }
         }
     }
@@ -464,7 +520,7 @@ impl SessionActor {
                 None
             }
             RuntimeCommand::Input { client_id, bytes } => {
-                if self.controller == Some(client_id) {
+                if self.controller == Some(client_id) && !self.child_exited {
                     match self
                         .writer
                         .write_all(&bytes)
@@ -494,7 +550,7 @@ impl SessionActor {
                 None
             }
             PtyEvent::ReaderError(error) => Some(ShutdownReason::RuntimeError(error)),
-            PtyEvent::Eof => Some(ShutdownReason::ChildExit),
+            PtyEvent::Eof => self.handle_child_exit(),
         }
     }
 
@@ -526,6 +582,16 @@ impl SessionActor {
                 self.controller = None;
                 return;
             }
+        }
+        if self.child_exited
+            && output
+                .try_send(ClientOutput::Control(ServerControlMessage::ProcessExited {
+                    message: SafeMessage::from_static("The terminal process exited."),
+                }))
+                .is_err()
+        {
+            self.controller = None;
+            return;
         }
         self.clients.insert(client_id, output);
     }
@@ -926,6 +992,24 @@ mod tests {
         anyhow::bail!("runtime output did not close with requested reason");
     }
 
+    async fn recv_until_process_exited(output: &mut ClientOutputRx) -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let message = timeout(remaining, output.recv())
+                .await
+                .context("test runtime output timed out")?
+                .context("client output channel closed")?;
+            if matches!(
+                message,
+                ClientOutput::Control(ServerControlMessage::ProcessExited { .. })
+            ) {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("runtime output did not report process exit");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_start_shell_attach_input_resize_detach_and_shutdown() -> anyhow::Result<()>
     {
@@ -935,6 +1019,7 @@ mod tests {
             },
             initial_size: test_size()?,
             reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::Hold,
         };
         let session = RuntimeSession::start(config)?;
         let (output_tx, mut output_rx) = RuntimeSession::client_mailbox();
@@ -981,15 +1066,13 @@ mod tests {
     async fn test_should_report_child_exit() -> anyhow::Result<()> {
         let shell = ShellCommand::new(
             "/bin/sh",
-            [
-                OsString::from("-c"),
-                OsString::from("printf done; sleep 0.2"),
-            ],
+            [OsString::from("-c"), OsString::from("printf done")],
         )?;
         let config = RuntimeConfig {
             mode: SessionMode::NewShell { shell },
             initial_size: test_size()?,
             reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::End,
         };
         let session = RuntimeSession::start(config)?;
         let (output_tx, mut output_rx) = RuntimeSession::client_mailbox();
@@ -1002,6 +1085,45 @@ mod tests {
         let _ready = output_rx.recv().await.context("ready output")?;
         let output = recv_until_contains(&mut output_rx, b"done").await?;
         assert!(output.windows(4).any(|window| window == b"done"));
+        recv_until_closed(&mut output_rx, ShutdownReason::ChildExit).await?;
+        drop(session);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_hold_session_after_child_exit() -> anyhow::Result<()> {
+        let shell = ShellCommand::new(
+            "/bin/sh",
+            [OsString::from("-c"), OsString::from("printf done")],
+        )?;
+        let config = RuntimeConfig {
+            mode: SessionMode::NewShell { shell },
+            initial_size: test_size()?,
+            reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::Hold,
+        };
+        let session = RuntimeSession::start(config)?;
+        let (output_tx, mut output_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(1),
+                output: output_tx,
+            })
+            .await?;
+        let _ready = output_rx.recv().await.context("ready output")?;
+        let output = recv_until_contains(&mut output_rx, b"done").await?;
+        assert!(output.windows(4).any(|window| window == b"done"));
+        recv_until_process_exited(&mut output_rx).await?;
+
+        let (reattach_tx, mut reattach_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(2),
+                output: reattach_tx,
+            })
+            .await?;
+        let _ready = reattach_rx.recv().await.context("reattach ready output")?;
+        recv_until_process_exited(&mut reattach_rx).await?;
         session.shutdown(ShutdownReason::Supervisor).await?;
         Ok(())
     }
@@ -1015,6 +1137,7 @@ mod tests {
             },
             initial_size: test_size()?,
             reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::Hold,
         };
         let session = RuntimeSession::start(config)?;
         let (output_tx, mut output_rx) = RuntimeSession::client_mailbox();
@@ -1145,6 +1268,7 @@ mod tests {
             },
             initial_size: test_size()?,
             reconnect_policy: ReconnectPolicy::KeepAlive,
+            exit_policy: ExitPolicy::Hold,
         };
         let session = RuntimeSession::start(config)?;
         let (first_tx, mut first_rx) = RuntimeSession::client_mailbox();
@@ -1213,6 +1337,7 @@ mod tests {
             },
             initial_size: test_size()?,
             reconnect_policy: ReconnectPolicy::KeepAlive,
+            exit_policy: ExitPolicy::Hold,
         };
         let session = RuntimeSession::start(config)?;
         let (first_tx, mut first_rx) = RuntimeSession::client_mailbox();
@@ -1411,6 +1536,7 @@ mod tests {
             },
             initial_size: test_size()?,
             reconnect_policy: ReconnectPolicy::KeepAlive,
+            exit_policy: ExitPolicy::Hold,
         };
         let session = RuntimeSession::start(config)?;
         let (first_tx, mut first_rx) = RuntimeSession::client_mailbox();
@@ -1465,6 +1591,7 @@ mod tests {
             },
             initial_size: test_size()?,
             reconnect_policy: ReconnectPolicy::KeepAlive,
+            exit_policy: ExitPolicy::Hold,
         };
         let session = RuntimeSession::start(config)?;
         let (slow_tx, mut slow_rx) = tokio_mpsc::channel(1);

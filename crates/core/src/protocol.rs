@@ -433,6 +433,11 @@ pub enum ServerControlMessage {
         /// Active session name.
         session: SessionName,
     },
+    /// The terminal process exited while the server kept the session open.
+    ProcessExited {
+        /// Browser-visible safe message.
+        message: SafeMessage,
+    },
     /// Non-fatal server warning.
     Warning {
         /// Stable warning code.
@@ -537,6 +542,21 @@ mod tests {
         let json = serde_json::to_string(&message)?;
         assert_eq!(json, r#"{"type":"resize","cols":100,"rows":30}"#);
         let decoded: ClientControlMessage = serde_json::from_str(&json)?;
+        assert_eq!(decoded, message);
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_round_trip_process_exited_message_as_camel_case() -> anyhow::Result<()> {
+        let message = ServerControlMessage::ProcessExited {
+            message: SafeMessage::from_static("terminal process exited"),
+        };
+        let json = serde_json::to_string(&message)?;
+        assert_eq!(
+            json,
+            r#"{"type":"processExited","message":"terminal process exited"}"#
+        );
+        let decoded: ServerControlMessage = serde_json::from_str(&json)?;
         assert_eq!(decoded, message);
         Ok(())
     }

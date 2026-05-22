@@ -694,7 +694,9 @@ mod tests {
     use http_body_util::BodyExt;
     use termstage_core::{
         protocol::{AccessToken, SessionName, TerminalSize},
-        runtime::{ReconnectPolicy, RuntimeSession, SessionMode, ShellCommand, ShutdownReason},
+        runtime::{
+            ExitPolicy, ReconnectPolicy, RuntimeSession, SessionMode, ShellCommand, ShutdownReason,
+        },
     };
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::{
@@ -724,6 +726,7 @@ mod tests {
             mode: SessionMode::NewShell { shell },
             initial_size: TerminalSize::new(80, 24)?,
             reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::Hold,
         };
         let mut config = WebConfig::local(token.clone(), commands, runtime);
         config.port = 49152;
@@ -954,6 +957,7 @@ mod tests {
             },
             initial_size: TerminalSize::new(80, 24)?,
             reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::Hold,
         };
         let session = RuntimeSession::start(runtime.clone())?;
         let mut config = WebConfig::local(token.clone(), session.command_sender(), runtime);
@@ -1012,6 +1016,7 @@ mod tests {
             },
             initial_size: TerminalSize::new(80, 24)?,
             reconnect_policy: ReconnectPolicy::KeepAlive,
+            exit_policy: ExitPolicy::Hold,
         };
         let session = RuntimeSession::start(runtime.clone())?;
         let config = WebConfig::local(token.clone(), session.command_sender(), runtime);
@@ -1057,6 +1062,7 @@ mod tests {
             },
             initial_size: TerminalSize::new(80, 24)?,
             reconnect_policy: ReconnectPolicy::KeepAlive,
+            exit_policy: ExitPolicy::Hold,
         };
         let session = RuntimeSession::start(runtime.clone())?;
         let config = WebConfig::local(token.clone(), session.command_sender(), runtime);
@@ -1100,6 +1106,7 @@ mod tests {
             },
             initial_size: TerminalSize::new(80, 24)?,
             reconnect_policy: ReconnectPolicy::KeepAlive,
+            exit_policy: ExitPolicy::Hold,
         };
         let session = RuntimeSession::start(runtime.clone())?;
         let config = WebConfig::local(token.clone(), session.command_sender(), runtime);
@@ -1140,6 +1147,7 @@ mod tests {
             },
             initial_size: TerminalSize::new(80, 24)?,
             reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::Hold,
         };
         let server = serve(WebConfig::local(token.clone(), commands, runtime)).await?;
         let runtime_task = tokio::spawn(async move {
@@ -1168,6 +1176,7 @@ mod tests {
             },
             initial_size: TerminalSize::new(80, 24)?,
             reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::Hold,
         };
         let server = serve(WebConfig::local(token.clone(), commands, runtime)).await?;
 
@@ -1188,6 +1197,7 @@ mod tests {
             },
             initial_size: TerminalSize::new(80, 24)?,
             reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::Hold,
         };
         let server = serve(WebConfig::local(token.clone(), commands, runtime)).await?;
         let runtime_task = tokio::spawn(async move {
@@ -1216,6 +1226,7 @@ mod tests {
             },
             initial_size: TerminalSize::new(80, 24)?,
             reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::Hold,
         };
         let session = RuntimeSession::start(runtime.clone())?;
         let config = WebConfig::local(token.clone(), session.command_sender(), runtime);

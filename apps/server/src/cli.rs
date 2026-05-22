@@ -13,7 +13,8 @@ use clap::{Parser, ValueEnum};
 use termstage_core::{
     protocol::{AccessToken, SessionName, TerminalSize},
     runtime::{
-        ReconnectPolicy, RuntimeConfig, RuntimeSession, SessionMode, ShellCommand, ShutdownReason,
+        ExitPolicy, ReconnectPolicy, RuntimeConfig, RuntimeSession, SessionMode, ShellCommand,
+        ShutdownReason,
     },
     security::{BasePath, PublicBaseUrl},
 };
@@ -65,6 +66,9 @@ pub struct CliArgs {
     /// Session keepalive policy for browser refresh and shutdown.
     #[arg(long, value_enum, default_value_t = CliKeepalive::Session)]
     keepalive: CliKeepalive,
+    /// Child process exit handling policy.
+    #[arg(long, value_enum, default_value_t = CliExitPolicy::Hold)]
+    exit_policy: CliExitPolicy,
     /// Enable internet-facing pod mode behind an HTTPS ingress.
     #[arg(long, default_value_t = false)]
     expose_public: bool,
@@ -128,6 +132,7 @@ impl TryFrom<CliArgs> for ValidatedCliConfig {
                 mode,
                 initial_size,
                 reconnect_policy: args.keepalive.into(),
+                exit_policy: args.exit_policy.into(),
             },
             host: args.host,
             port: args.port,
@@ -326,6 +331,21 @@ impl From<CliKeepalive> for ReconnectPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliExitPolicy {
+    Hold,
+    End,
+}
+
+impl From<CliExitPolicy> for ExitPolicy {
+    fn from(value: CliExitPolicy) -> Self {
+        match value {
+            CliExitPolicy::Hold => Self::Hold,
+            CliExitPolicy::End => Self::End,
+        }
+    }
+}
+
 impl Default for CliArgs {
     fn default() -> Self {
         Self {
@@ -338,6 +358,7 @@ impl Default for CliArgs {
             font_size: DEFAULT_FONT_SIZE,
             theme: CliTheme::HighContrast,
             keepalive: CliKeepalive::Session,
+            exit_policy: CliExitPolicy::Hold,
             expose_public: false,
             public_url: None,
             token_env: None,
@@ -358,6 +379,7 @@ mod tests {
         assert_eq!(config.presentation.font_size, DEFAULT_FONT_SIZE);
         assert!(matches!(config.exposure, WebExposure::Local));
         assert!(matches!(config.runtime.mode, SessionMode::Tmux { .. }));
+        assert_eq!(config.runtime.exit_policy, ExitPolicy::Hold);
         Ok(())
     }
 

@@ -91,7 +91,7 @@ export function connectTerminalSocket(
         terminal.write(decoder.decode(event.data, { stream: true }));
         return;
       }
-      handleControlMessage(terminal, event.data);
+      handleControlMessage(terminal, event.data, emitStatus);
     });
     nextSocket.addEventListener('close', (event: CloseEvent) => {
       window.clearInterval(heartbeatId);
@@ -136,9 +136,21 @@ function sendControl(socket: WebSocket, message: ClientControlMessage): void {
   }
 }
 
-function handleControlMessage(terminal: Terminal, data: string): void {
+function handleControlMessage(
+  terminal: Terminal,
+  data: string,
+  emitStatus: (status: ConnectionStatus) => void
+): void {
   try {
     const message = JSON.parse(data) as { type?: string; message?: string };
+    if (message.type === 'processExited') {
+      emitStatus({
+        state: 'ended',
+        title: 'Process exited',
+        message: message.message ?? 'The terminal process exited.'
+      });
+      return;
+    }
     if (message.type === 'error' && typeof message.message === 'string') {
       terminal.writeln(`\r\n${message.message}`);
     }
