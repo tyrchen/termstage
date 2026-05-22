@@ -32,6 +32,8 @@ const SERVER_SHUTDOWN_REASON = 'server shutting down';
 const RUNTIME_ERROR_REASON = 'runtime error';
 const CLIENT_DISCONNECTED_REASON = 'client disconnected';
 const CONTROLLER_REPLACED_REASON = 'controller replaced';
+const BROWSER_BACKPRESSURE_REASON = 'browser client backpressure';
+const NORMAL_CLOSE_CODE = 1000;
 
 export function connectTerminalSocket(
   terminal: Terminal,
@@ -146,6 +148,14 @@ function handleControlMessage(terminal: Terminal, data: string): void {
 }
 
 function terminalEndStatus(event: CloseEvent): ConnectionStatus | undefined {
+  if (event.code === NORMAL_CLOSE_CODE && event.reason === '') {
+    return {
+      state: 'ended',
+      title: 'Connection closed',
+      message: 'The server closed this browser connection.'
+    };
+  }
+
   switch (event.reason) {
     case SESSION_ENDED_REASON:
       return {
@@ -172,6 +182,7 @@ function terminalEndStatus(event: CloseEvent): ConnectionStatus | undefined {
         message: 'A newer browser connection took over this session.'
       };
     case CLIENT_DISCONNECTED_REASON:
+    case BROWSER_BACKPRESSURE_REASON:
       return {
         state: 'ended',
         title: 'Connection closed',
