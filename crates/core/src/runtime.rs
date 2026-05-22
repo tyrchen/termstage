@@ -15,7 +15,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, SlavePty, native_pty_system};
 use thiserror::Error;
 use tokio::sync::mpsc::{self as tokio_mpsc, error::TrySendError};
 use tracing::warn;
@@ -296,22 +296,26 @@ impl RuntimeSession {
         let (command_tx, command_rx) = tokio_mpsc::channel(COMMAND_MAILBOX_CAPACITY);
         let (pty_tx, pty_rx) = mpsc::sync_channel(COMMAND_MAILBOX_CAPACITY);
         let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
-        let reader = spawn_reader(reader, pty_tx)?;
+        let reader = spawn_reader(reader, pty_tx.clone())?;
+        let initial_size = config.initial_size;
         let actor = thread::Builder::new()
             .name("termstage-pty-actor".to_owned())
             .spawn(move || {
                 let actor = SessionActor {
                     config,
+                    slave: pair.slave,
                     master: pair.master,
                     writer,
                     child,
                     command_rx,
                     shutdown_rx,
                     pty_rx,
-                    reader,
+                    pty_tx,
+                    reader: Some(reader),
                     clients: HashMap::new(),
                     controller: None,
                     child_exited: false,
+                    current_size: initial_size,
                     replay: VecDeque::new(),
                     replay_bytes: 0,
                 };
@@ -404,16 +408,19 @@ impl ActorOutcome {
 
 struct SessionActor {
     config: RuntimeConfig,
+    slave: Box<dyn SlavePty + Send>,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
     command_rx: tokio_mpsc::Receiver<RuntimeCommand>,
     shutdown_rx: mpsc::Receiver<ShutdownReason>,
     pty_rx: mpsc::Receiver<PtyEvent>,
-    reader: JoinHandle<()>,
+    pty_tx: mpsc::SyncSender<PtyEvent>,
+    reader: Option<JoinHandle<()>>,
     clients: HashMap<ClientId, ClientOutputTx>,
     controller: Option<ClientId>,
     child_exited: bool,
+    current_size: TerminalSize,
     replay: VecDeque<Bytes>,
     replay_bytes: usize,
 }
@@ -422,9 +429,9 @@ impl SessionActor {
     fn run(mut self) -> ActorOutcome {
         let reason = self.run_loop();
         self.close_clients(&reason);
-        drop(self.writer);
         let _result = self.child.kill();
-        let _result = self.reader.join();
+        self.join_reader();
+        drop(self.writer);
         ActorOutcome(Ok(()))
     }
 
@@ -485,9 +492,49 @@ impl SessionActor {
             ExitPolicy::End => Some(ShutdownReason::ChildExit),
             ExitPolicy::Hold => {
                 self.child_exited = true;
+                self.join_reader();
                 self.notify_process_exited();
                 None
             }
+        }
+    }
+
+    fn handle_reader_error(&mut self, error: String) -> Option<ShutdownReason> {
+        match self.child.try_wait() {
+            Ok(Some(_status)) => self.handle_child_exit(),
+            Ok(None) | Err(_) => Some(ShutdownReason::RuntimeError(error)),
+        }
+    }
+
+    fn restart_child(&mut self) -> Result<(), RuntimeError> {
+        self.join_reader();
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(to_pty_size(self.current_size))
+            .map_err(RuntimeError::OpenPty)?;
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(RuntimeError::CloneReader)?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(RuntimeError::TakeWriter)?;
+        let child = spawn_child(&*pair.slave, &self.config.mode)?;
+        self.slave = pair.slave;
+        self.master = pair.master;
+        self.writer = writer;
+        self.child = child;
+        self.reader = Some(spawn_reader(reader, self.pty_tx.clone())?);
+        self.child_exited = false;
+        self.replay.clear();
+        self.replay_bytes = 0;
+        Ok(())
+    }
+
+    fn join_reader(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            let _result = reader.join();
         }
     }
 
@@ -512,8 +559,7 @@ impl SessionActor {
     fn handle_command(&mut self, command: RuntimeCommand) -> Option<ShutdownReason> {
         match command {
             RuntimeCommand::AttachClient { client_id, output } => {
-                self.attach_client(client_id, output);
-                None
+                self.attach_client(client_id, output)
             }
             RuntimeCommand::DetachClient { client_id } => {
                 self.detach_client(client_id);
@@ -533,11 +579,17 @@ impl SessionActor {
                     None
                 }
             }
-            RuntimeCommand::Resize { size } => self
-                .master
-                .resize(to_pty_size(size))
-                .err()
-                .map(|error| ShutdownReason::RuntimeError(error.to_string())),
+            RuntimeCommand::Resize { size } => {
+                self.current_size = size;
+                if self.child_exited {
+                    None
+                } else {
+                    self.master
+                        .resize(to_pty_size(size))
+                        .err()
+                        .map(|error| ShutdownReason::RuntimeError(error.to_string()))
+                }
+            }
             RuntimeCommand::Shutdown { reason } => Some(reason),
         }
     }
@@ -549,12 +601,24 @@ impl SessionActor {
                 self.broadcast_bytes(&bytes);
                 None
             }
-            PtyEvent::ReaderError(error) => Some(ShutdownReason::RuntimeError(error)),
+            PtyEvent::ReaderError(error) => self.handle_reader_error(error),
             PtyEvent::Eof => self.handle_child_exit(),
         }
     }
 
-    fn attach_client(&mut self, client_id: ClientId, output: ClientOutputTx) {
+    fn attach_client(
+        &mut self,
+        client_id: ClientId,
+        output: ClientOutputTx,
+    ) -> Option<ShutdownReason> {
+        if self.child_exited
+            && let Err(error) = self.restart_child()
+        {
+            let reason = ShutdownReason::RuntimeError(error.to_string());
+            let _result = output.try_send(ClientOutput::Closed(reason.clone()));
+            return Some(reason);
+        }
+
         match self.controller {
             Some(controller) if controller != client_id => {
                 if let Some(previous) = self.clients.remove(&controller) {
@@ -575,25 +639,16 @@ impl SessionActor {
         };
         if output.try_send(ready).is_err() {
             self.controller = None;
-            return;
+            return None;
         }
         for bytes in &self.replay {
             if output.try_send(ClientOutput::Bytes(bytes.clone())).is_err() {
                 self.controller = None;
-                return;
+                return None;
             }
         }
-        if self.child_exited
-            && output
-                .try_send(ClientOutput::Control(ServerControlMessage::ProcessExited {
-                    message: SafeMessage::from_static("The terminal process exited."),
-                }))
-                .is_err()
-        {
-            self.controller = None;
-            return;
-        }
         self.clients.insert(client_id, output);
+        None
     }
 
     fn detach_client(&mut self, client_id: ClientId) {
@@ -1092,10 +1147,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_hold_session_after_child_exit() -> anyhow::Result<()> {
-        let shell = ShellCommand::new(
-            "/bin/sh",
-            [OsString::from("-c"), OsString::from("printf done")],
-        )?;
+        let shell = test_shell_command()?;
         let config = RuntimeConfig {
             mode: SessionMode::NewShell { shell },
             initial_size: test_size()?,
@@ -1111,9 +1163,15 @@ mod tests {
             })
             .await?;
         let _ready = output_rx.recv().await.context("ready output")?;
-        let output = recv_until_contains(&mut output_rx, b"done").await?;
-        assert!(output.windows(4).any(|window| window == b"done"));
-        recv_until_process_exited(&mut output_rx).await?;
+        session
+            .send(RuntimeCommand::Input {
+                client_id: ClientId::new(1),
+                bytes: Bytes::from_static(b"exit\n"),
+            })
+            .await?;
+        recv_until_process_exited(&mut output_rx)
+            .await
+            .context("initial process exit notice")?;
 
         let (reattach_tx, mut reattach_rx) = RuntimeSession::client_mailbox();
         session
@@ -1122,8 +1180,28 @@ mod tests {
                 output: reattach_tx,
             })
             .await?;
-        let _ready = reattach_rx.recv().await.context("reattach ready output")?;
-        recv_until_process_exited(&mut reattach_rx).await?;
+        let ready = reattach_rx.recv().await.context("reattach ready output")?;
+        assert!(
+            matches!(
+                ready,
+                ClientOutput::Control(ServerControlMessage::Ready { .. })
+            ),
+            "{ready:?}"
+        );
+        session
+            .send(RuntimeCommand::Input {
+                client_id: ClientId::new(2),
+                bytes: Bytes::from_static(b"printf restarted-after-exit\\n\n"),
+            })
+            .await?;
+        let output = recv_until_contains(&mut reattach_rx, b"restarted-after-exit")
+            .await
+            .context("restart output")?;
+        assert!(
+            output
+                .windows(b"restarted-after-exit".len())
+                .any(|window| window == b"restarted-after-exit")
+        );
         session.shutdown(ShutdownReason::Supervisor).await?;
         Ok(())
     }

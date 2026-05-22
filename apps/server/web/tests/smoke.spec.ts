@@ -135,6 +135,12 @@ test('terminal app holds the session when shell exits', async ({ page }, testInf
     await page.keyboard.press('Enter');
     await expect(page.getByRole('dialog')).toContainText('Process exited');
     await expect(page.getByRole('dialog')).toContainText('The terminal process exited.');
+    await page.reload();
+    await expect(page.locator('.xterm')).toBeVisible();
+    await expect(page.getByRole('dialog')).toBeHidden();
+    await page.keyboard.type('printf after-refresh-restart');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('.xterm-rows')).toContainText('after-refresh-restart');
   } finally {
     await server.stop();
   }
