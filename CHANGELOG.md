@@ -3,6 +3,99 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [termstage-v0.3.0](https://github.com/compare/termstage-v0.2.2..termstage-v0.3.0) - 2026-05-22
+
+### Miscellaneous Chores
+
+- bump version - ([14a70b2](https://github.com/commit/14a70b2eb17a42bc2400bb2dd0a4dee221efdd2d)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([0331b73](https://github.com/commit/0331b73b6ca0ecce34f416ea4f15e7895c08b27f)) - Tyr Chen
+- Improve terminal disconnect and font handling (#5)
+
+## Summary
+- show an accessible mono-styled terminal status modal for reconnecting,
+ended sessions, and lost connectivity
+- add `ExitPolicy` and default the CLI to `--exit-policy hold`, so
+accidental `exit` keeps the current browser session open and shows a
+`Process exited` modal instead of tearing down/reconnecting
+- restart a held/exited PTY on the next browser attach, so refreshing
+after accidental `exit` opens a fresh usable terminal instead of
+replaying the exited modal
+- tag PTY reader events by generation and ignore stale events after
+restart, preventing late EOF/error events from the old PTY from marking
+the newly restarted child as exited
+- avoid blocking on the old PTY reader before dropping/replacing old PTY
+handles, preventing Linux CI from hanging in `cargo nextest` after a
+held process exit
+- drop PTY handles before joining the reader during actor shutdown, so
+end-policy shutdown paths do not hang Linux CI either
+- poll child process status instead of relying on PTY EOF, which is not
+delivered reliably on Linux while the actor still owns a slave handle
+- serialize tmux integration tests that mutate the default tmux server
+environment, avoiding parallel nextest races
+- keep `--exit-policy end` available for the previous behavior where
+child exit closes the browser session
+- send WebSocket close reasons for runtime shutdown/session exit and
+stop retrying after connectivity is declared lost
+- close browser sockets as `session ended` when the runtime has already
+stopped, including attach failures, input/resize sends after shutdown,
+dropped output mailboxes, and normal closes whose reason was stripped by
+a proxy
+- use server-neutral status copy, including "The server shut down." for
+ended sessions
+- replace stale/live controller WebSockets when a newer browser
+connection attaches, closing the displaced browser with a non-retrying
+"controller replaced" reason
+- add server-side WebSocket heartbeat expiry so silent proxy-held
+browser connections cannot pin the controller indefinitely
+- classify controller replacement and server-side client disconnect as
+terminal browser states instead of reconnecting forever
+- tune the high-contrast web palette and modal styling toward the native
+terminal session colors
+- advertise truecolor terminal capability to child PTY processes with
+TERM=xterm-256color, COLORTERM=truecolor, CLICOLOR=1, and tmux
+RGB/256-color support
+- scrub NO_COLOR / ANSI_COLORS_DISABLED from spawned terminal sessions,
+tmux global environment, and existing tmux session environments before
+attaching
+- pass color env into newly created tmux sessions; existing
+already-running panes may need a new shell/pane because process env
+cannot be rewritten externally
+- embed all Vite asset files with rust-embed 8.11.0, including browser
+terminal font files, so CSS font URLs do not 404
+- replace Fontsource JetBrains Mono with a single embedded
+JetBrainsMonoNL Nerd Font Mono regular/bold pair for stable terminal
+metrics and prompt glyph coverage
+- include the bundled font SIL OFL license and a source/version notice
+beside the vendored font files
+- add Playwright coverage for missing asset failures, Unicode glyph
+output, color capability env, controller takeover, process-exited hold
+plus refresh restart, and lost-connectivity states
+- add Rust coverage for serving embedded font assets, rejecting unknown
+asset paths, terminal color env setup, tmux global/session env cleanup,
+controller replacement, runtime-unavailable WebSocket close paths, and
+hold/end child-exit policies
+
+## Verification
+- cargo nextest run --all-features
+- npm run typecheck --prefix apps/server/web
+- npm run build --prefix apps/server/web
+- npm test --prefix apps/server/web
+- make build
+- make test
+- make test-cargo
+- make fmt
+- make clippy
+- make clippy-pedantic
+- make clippy-boundary
+- make audit
+- make deny
+- commit hooks: cargo check, cargo clippy, cargo test, cargo deny check,
+cargo fmt, typos - ([b36189c](https://github.com/commit/b36189ccca45fb6962c8daf0fe642d774178047a)) - Tyr Chen
+
+---
 ## [termstage-v0.2.2](https://github.com/compare/termstage-v0.2.1..termstage-v0.2.2) - 2026-05-22
 
 ### Miscellaneous Chores
