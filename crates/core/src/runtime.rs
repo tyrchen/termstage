@@ -461,6 +461,9 @@ impl SessionActor {
                         return reason;
                     }
                 }
+                if let Some(reason) = self.poll_child_exit() {
+                    return reason;
+                }
             }
 
             match self.command_rx.try_recv() {
@@ -508,6 +511,14 @@ impl SessionActor {
                 self.notify_process_exited();
                 None
             }
+        }
+    }
+
+    fn poll_child_exit(&mut self) -> Option<ShutdownReason> {
+        match self.child.try_wait() {
+            Ok(Some(_status)) => self.handle_child_exit(),
+            Ok(None) => None,
+            Err(error) => Some(ShutdownReason::RuntimeError(error.to_string())),
         }
     }
 
@@ -980,7 +991,12 @@ mod tests {
     use std::{ffi::OsStr, process::Command, time::Instant};
 
     use anyhow::Context;
-    use tokio::time::{sleep, timeout};
+    use tokio::{
+        sync::Mutex,
+        time::{sleep, timeout},
+    };
+
+    static TMUX_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     use super::*;
 
@@ -1218,6 +1234,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_start_tmux_mode() -> anyhow::Result<()> {
+        let _tmux_guard = TMUX_TEST_LOCK.lock().await;
         let session_name = SessionName::new(format!("termstage-test-{}", std::process::id()))?;
         let config = RuntimeConfig {
             mode: SessionMode::Tmux {
@@ -1255,8 +1272,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_should_prepare_existing_tmux_session_color_environment() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_should_prepare_existing_tmux_session_color_environment() -> anyhow::Result<()> {
+        let _tmux_guard = TMUX_TEST_LOCK.lock().await;
         let tmux = which::which("tmux").context("tmux unavailable")?;
         let session_name = SessionName::new(format!("termstage-env-test-{}", std::process::id()))?;
         let _cleanup = TmuxSessionCleanup::new(tmux.clone(), session_name.clone());
@@ -1297,8 +1315,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_should_prepare_tmux_server_color_environment() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_should_prepare_tmux_server_color_environment() -> anyhow::Result<()> {
+        let _tmux_guard = TMUX_TEST_LOCK.lock().await;
         let tmux = which::which("tmux").context("tmux unavailable")?;
         let session_name =
             SessionName::new(format!("termstage-global-env-test-{}", std::process::id()))?;
