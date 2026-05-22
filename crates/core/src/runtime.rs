@@ -429,9 +429,22 @@ impl SessionActor {
     fn run(mut self) -> ActorOutcome {
         let reason = self.run_loop();
         self.close_clients(&reason);
-        let _result = self.child.kill();
-        self.join_reader();
-        drop(self.writer);
+        let Self {
+            slave,
+            master,
+            writer,
+            mut child,
+            reader,
+            ..
+        } = self;
+        let _result = child.kill();
+        drop(child);
+        drop(writer);
+        drop(master);
+        drop(slave);
+        if let Some(reader) = reader {
+            let _result = reader.join();
+        }
         ActorOutcome(Ok(()))
     }
 
@@ -533,12 +546,6 @@ impl SessionActor {
         self.replay.clear();
         self.replay_bytes = 0;
         Ok(())
-    }
-
-    fn join_reader(&mut self) {
-        if let Some(reader) = self.reader.take() {
-            let _result = reader.join();
-        }
     }
 
     fn notify_process_exited(&mut self) {
