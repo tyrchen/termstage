@@ -21,6 +21,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use termstage_core::{
@@ -29,7 +30,8 @@ use termstage_core::{
         TerminalSize,
     },
     runtime::{
-        ClientId, ClientOutput, RuntimeCommand, RuntimeConfig, RuntimeSession, ShutdownReason,
+        ClientId, ClientOutput, ClientOutputTx, RuntimeCommand, RuntimeConfig, RuntimeSession,
+        ShutdownReason,
     },
     security::{
         AllowedHost, AllowedOrigin, BasePath, ExposurePolicy, PublicBaseUrl, SecurityError,
@@ -51,6 +53,8 @@ const MAX_FRAME_SIZE: usize = 16 * 1024;
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 const CLIENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 const CLIENT_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+const SERVER_PING_INTERVAL: Duration = Duration::from_secs(25);
+const SERVER_PING_PAYLOAD: &[u8] = b"termstage";
 const CLOSE_REASON_SESSION_ENDED: &str = "session ended";
 const CLOSE_REASON_SERVER_SHUTDOWN: &str = "server shutting down";
 const CLOSE_REASON_CLIENT_DISCONNECTED: &str = "client disconnected";
@@ -405,15 +409,9 @@ async fn bridge_socket(state: AppState, socket: WebSocket) {
     let client_id = state.client_id();
     let (output_tx, output_rx) = RuntimeSession::client_mailbox();
     let mut socket = socket;
-    if send_runtime(
-        &state.inner.commands,
-        RuntimeCommand::AttachClient {
-            client_id,
-            output: output_tx,
-        },
-    )
-    .await
-    .is_err()
+    if attach_runtime_client(&state, client_id, output_tx)
+        .await
+        .is_err()
     {
         let _result = socket
             .send(Message::Close(Some(runtime_unavailable_close())))
@@ -425,6 +423,7 @@ async fn bridge_socket(state: AppState, socket: WebSocket) {
     let mut output_rx = output_rx;
     let mut last_client_message = Instant::now();
     let mut heartbeat_check = time::interval(CLIENT_HEARTBEAT_CHECK_INTERVAL);
+    let mut server_ping = time::interval(SERVER_PING_INTERVAL);
     loop {
         tokio::select! {
             Some(message) = receiver.next() => {
@@ -486,6 +485,11 @@ async fn bridge_socket(state: AppState, socket: WebSocket) {
                 if last_client_message.elapsed() >= CLIENT_HEARTBEAT_TIMEOUT {
                     debug!(client_id = client_id.get(), "closing stale browser terminal websocket");
                     let _result = sender.send(Message::Close(Some(client_timeout_close()))).await;
+                    break;
+                }
+            }
+            _ = server_ping.tick() => {
+                if send_server_ping(&mut sender).await.is_err() {
                     break;
                 }
             }
@@ -582,6 +586,14 @@ async fn send_control_error(
     sender.send(Message::Text(text.into())).await
 }
 
+async fn send_server_ping(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+) -> Result<(), axum::Error> {
+    sender
+        .send(Message::Ping(Bytes::from_static(SERVER_PING_PAYLOAD)))
+        .await
+}
+
 fn protocol_error_message() -> SafeMessage {
     match SafeMessage::new("invalid control frame") {
         Ok(message) => message,
@@ -629,6 +641,18 @@ async fn send_runtime(
     command: RuntimeCommand,
 ) -> Result<(), ()> {
     commands.send(command).await.map_err(|_error| ())
+}
+
+async fn attach_runtime_client(
+    state: &AppState,
+    client_id: ClientId,
+    output: ClientOutputTx,
+) -> Result<(), ()> {
+    send_runtime(
+        &state.inner.commands,
+        RuntimeCommand::AttachClient { client_id, output },
+    )
+    .await
 }
 
 fn validate_http_request(

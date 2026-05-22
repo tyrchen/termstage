@@ -29,6 +29,7 @@ const COMMAND_MAILBOX_CAPACITY: usize = 128;
 const CLIENT_OUTPUT_CAPACITY: usize = 256;
 const PTY_READ_CHUNK_SIZE: usize = 8192;
 const REPLAY_BUFFER_BYTES: usize = 1024 * 1024;
+const REPLAY_BUFFER_CHUNKS: usize = CLIENT_OUTPUT_CAPACITY / 2;
 const ACTOR_IDLE_WAIT: Duration = Duration::from_millis(10);
 const TERMINAL_TERM: &str = "xterm-256color";
 const TERMINAL_COLOR_MODE: &str = "truecolor";
@@ -737,15 +738,19 @@ impl SessionActor {
     }
 
     fn record_replay(&mut self, bytes: Bytes) {
-        self.replay_bytes = self.replay_bytes.saturating_add(bytes.len());
-        self.replay.push_back(bytes);
-        while self.replay_bytes > REPLAY_BUFFER_BYTES {
-            if let Some(removed) = self.replay.pop_front() {
-                self.replay_bytes = self.replay_bytes.saturating_sub(removed.len());
-            } else {
-                self.replay_bytes = 0;
-                break;
-            }
+        record_replay_chunk(&mut self.replay, &mut self.replay_bytes, bytes);
+    }
+}
+
+fn record_replay_chunk(replay: &mut VecDeque<Bytes>, replay_bytes: &mut usize, bytes: Bytes) {
+    *replay_bytes = replay_bytes.saturating_add(bytes.len());
+    replay.push_back(bytes);
+    while *replay_bytes > REPLAY_BUFFER_BYTES || replay.len() > REPLAY_BUFFER_CHUNKS {
+        if let Some(removed) = replay.pop_front() {
+            *replay_bytes = replay_bytes.saturating_sub(removed.len());
+        } else {
+            *replay_bytes = 0;
+            break;
         }
     }
 }
@@ -1014,7 +1019,7 @@ fn safe_fallback_message(_error: ProtocolError) -> SafeMessage {
     reason = "runtime tests use blocking subprocess probes to validate tmux integration"
 )]
 mod tests {
-    use std::{ffi::OsStr, process::Command, time::Instant};
+    use std::{collections::VecDeque, ffi::OsStr, process::Command, time::Instant};
 
     use anyhow::Context;
     use tokio::{
@@ -1714,6 +1719,36 @@ mod tests {
         );
         session.shutdown(ShutdownReason::Supervisor).await?;
         Ok(())
+    }
+
+    #[test]
+    fn test_should_bound_replay_by_chunks_with_mailbox_headroom() {
+        let total_chunks = CLIENT_OUTPUT_CAPACITY + 25;
+        let mut replay = VecDeque::new();
+        let mut replay_bytes = 0;
+
+        for index in 0..total_chunks {
+            record_replay_chunk(
+                &mut replay,
+                &mut replay_bytes,
+                Bytes::from(format!("chunk-{index:03}")),
+            );
+        }
+
+        assert_eq!(replay.len(), REPLAY_BUFFER_CHUNKS);
+        assert!(replay.len() + 1 < CLIENT_OUTPUT_CAPACITY);
+        assert_eq!(replay_bytes, replay.iter().map(Bytes::len).sum::<usize>());
+        assert_eq!(
+            replay.front(),
+            Some(&Bytes::from(format!(
+                "chunk-{:03}",
+                total_chunks - REPLAY_BUFFER_CHUNKS
+            )))
+        );
+        assert_eq!(
+            replay.back(),
+            Some(&Bytes::from(format!("chunk-{:03}", total_chunks - 1)))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
