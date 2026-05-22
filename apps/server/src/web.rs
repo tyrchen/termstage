@@ -536,12 +536,33 @@ async fn send_client_output(
             };
             SendClientOutputResult::Continue(sender.send(Message::Text(text.into())).await)
         }
-        ClientOutput::Closed(reason) => SendClientOutputResult::Closed(
-            sender
-                .send(Message::Close(Some(close_frame_for_shutdown(reason))))
-                .await,
-        ),
+        ClientOutput::Closed(reason) => {
+            if reason == ShutdownReason::ChildExit {
+                let _result = send_process_exited(sender).await;
+            }
+            SendClientOutputResult::Closed(
+                sender
+                    .send(Message::Close(Some(close_frame_for_shutdown(reason))))
+                    .await,
+            )
+        }
     }
+}
+
+async fn send_process_exited(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+) -> Result<(), axum::Error> {
+    let message = ServerControlMessage::ProcessExited {
+        message: SafeMessage::from_static("The terminal process exited."),
+    };
+    let text = match serde_json::to_string(&message) {
+        Ok(text) => text,
+        Err(error) => {
+            debug!(%error, "failed to serialize process-exited control frame");
+            return Ok(());
+        }
+    };
+    sender.send(Message::Text(text.into())).await
 }
 
 async fn send_control_error(
@@ -683,7 +704,10 @@ impl IntoResponse for WebError {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::{
+        ffi::OsString,
+        net::{IpAddr, Ipv4Addr},
+    };
 
     use anyhow::Context;
     use axum::{
@@ -710,10 +734,7 @@ mod tests {
     fn test_shell_command() -> anyhow::Result<ShellCommand> {
         ShellCommand::new(
             "/bin/bash",
-            [
-                std::ffi::OsString::from("--noprofile"),
-                std::ffi::OsString::from("--norc"),
-            ],
+            [OsString::from("--noprofile"), OsString::from("--norc")],
         )
         .map_err(Into::into)
     }
@@ -1050,6 +1071,37 @@ mod tests {
         );
         server.shutdown().await?;
         session.shutdown(ShutdownReason::Supervisor).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_send_process_exited_control_before_child_exit_close() -> anyhow::Result<()>
+    {
+        let token = AccessToken::from_bytes([14; 32]);
+        let runtime = RuntimeConfig {
+            mode: SessionMode::NewShell {
+                shell: test_shell_command()?,
+            },
+            initial_size: TerminalSize::new(80, 24)?,
+            reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::End,
+        };
+        let session = RuntimeSession::start(runtime.clone())?;
+        let config = WebConfig::local(token.clone(), session.command_sender(), runtime);
+        let server = serve(config).await?;
+
+        let mut socket = connect_test_socket(server.address(), &token).await?;
+        socket
+            .send(TungsteniteMessage::Binary(Bytes::from_static(b"exit\n")))
+            .await?;
+        assert!(
+            read_socket_text_until(&mut socket, "\"type\":\"processExited\"").await?,
+            "websocket did not receive process-exited control before close"
+        );
+        let close_reason = read_socket_close_reason(&mut socket).await?;
+        assert_eq!(close_reason.as_deref(), Some(CLOSE_REASON_SESSION_ENDED));
+        server.shutdown().await?;
+        drop(session);
         Ok(())
     }
 
@@ -1397,6 +1449,32 @@ mod tests {
                     TungsteniteMessage::Text(_text) => {}
                     TungsteniteMessage::Close(_frame) => return anyhow::Ok(false),
                     TungsteniteMessage::Ping(_bytes) | TungsteniteMessage::Pong(_bytes) => {}
+                    TungsteniteMessage::Frame(_frame) => {}
+                }
+            }
+            anyhow::Ok(false)
+        })
+        .await?
+    }
+
+    async fn read_socket_text_until(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        needle: &str,
+    ) -> anyhow::Result<bool> {
+        timeout(Duration::from_secs(5), async {
+            while let Some(message) = socket.next().await {
+                match message? {
+                    TungsteniteMessage::Text(text) => {
+                        if text.contains(needle) {
+                            return anyhow::Ok(true);
+                        }
+                    }
+                    TungsteniteMessage::Close(_frame) => return anyhow::Ok(false),
+                    TungsteniteMessage::Binary(_bytes) => {}
+                    TungsteniteMessage::Ping(_bytes) => {}
+                    TungsteniteMessage::Pong(_bytes) => {}
                     TungsteniteMessage::Frame(_frame) => {}
                 }
             }

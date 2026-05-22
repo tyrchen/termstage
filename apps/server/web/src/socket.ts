@@ -33,7 +33,6 @@ const RUNTIME_ERROR_REASON = 'runtime error';
 const CLIENT_DISCONNECTED_REASON = 'client disconnected';
 const CONTROLLER_REPLACED_REASON = 'controller replaced';
 const BROWSER_BACKPRESSURE_REASON = 'browser client backpressure';
-const NORMAL_CLOSE_CODE = 1000;
 
 export function connectTerminalSocket(
   terminal: Terminal,
@@ -51,6 +50,7 @@ export function connectTerminalSocket(
   let reconnectId: number | undefined;
   let reconnectAttempt = 0;
   let closedByClient = false;
+  let terminalEnded = false;
   let lastSize: TerminalSize = { cols: terminal.cols, rows: terminal.rows };
   let socket = openSocket();
 
@@ -91,11 +91,11 @@ export function connectTerminalSocket(
         terminal.write(decoder.decode(event.data, { stream: true }));
         return;
       }
-      handleControlMessage(terminal, event.data, emitStatus);
+      terminalEnded = handleControlMessage(terminal, event.data, emitStatus) || terminalEnded;
     });
     nextSocket.addEventListener('close', (event: CloseEvent) => {
       window.clearInterval(heartbeatId);
-      if (closedByClient) {
+      if (closedByClient || terminalEnded) {
         return;
       }
 
@@ -140,7 +140,7 @@ function handleControlMessage(
   terminal: Terminal,
   data: string,
   emitStatus: (status: ConnectionStatus) => void
-): void {
+): boolean {
   try {
     const message = JSON.parse(data) as { type?: string; message?: string };
     if (message.type === 'processExited') {
@@ -149,7 +149,7 @@ function handleControlMessage(
         title: 'Process exited',
         message: message.message ?? 'The terminal process exited.'
       });
-      return;
+      return true;
     }
     if (message.type === 'error' && typeof message.message === 'string') {
       terminal.writeln(`\r\n${message.message}`);
@@ -157,24 +157,15 @@ function handleControlMessage(
   } catch {
     terminal.writeln('\r\nprotocol error');
   }
+  return false;
 }
 
 function terminalEndStatus(event: CloseEvent): ConnectionStatus | undefined {
-  if (event.code === NORMAL_CLOSE_CODE && event.reason === '') {
-    return {
-      state: 'ended',
-      title: 'Connection closed',
-      message: 'The server closed this browser connection.'
-    };
-  }
-
   switch (event.reason) {
     case SESSION_ENDED_REASON:
-      return {
-        state: 'ended',
-        title: 'Session ended',
-        message: 'The terminal process exited.'
-      };
+    case CLIENT_DISCONNECTED_REASON:
+    case BROWSER_BACKPRESSURE_REASON:
+      return undefined;
     case SERVER_SHUTDOWN_REASON:
       return {
         state: 'ended',
@@ -192,13 +183,6 @@ function terminalEndStatus(event: CloseEvent): ConnectionStatus | undefined {
         state: 'ended',
         title: 'Session attached elsewhere',
         message: 'A newer browser connection took over this session.'
-      };
-    case CLIENT_DISCONNECTED_REASON:
-    case BROWSER_BACKPRESSURE_REASON:
-      return {
-        state: 'ended',
-        title: 'Connection closed',
-        message: 'The server closed this browser connection.'
       };
     default:
       return undefined;
