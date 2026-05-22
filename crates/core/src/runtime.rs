@@ -296,7 +296,7 @@ impl RuntimeSession {
         let (command_tx, command_rx) = tokio_mpsc::channel(COMMAND_MAILBOX_CAPACITY);
         let (pty_tx, pty_rx) = mpsc::sync_channel(COMMAND_MAILBOX_CAPACITY);
         let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
-        let reader = spawn_reader(reader, pty_tx.clone())?;
+        let reader = spawn_reader(reader, pty_tx.clone(), 0)?;
         let initial_size = config.initial_size;
         let actor = thread::Builder::new()
             .name("termstage-pty-actor".to_owned())
@@ -312,6 +312,7 @@ impl RuntimeSession {
                     pty_rx,
                     pty_tx,
                     reader: Some(reader),
+                    reader_generation: 0,
                     clients: HashMap::new(),
                     controller: None,
                     child_exited: false,
@@ -391,7 +392,13 @@ impl Drop for RuntimeSession {
 }
 
 #[derive(Debug)]
-enum PtyEvent {
+struct PtyEvent {
+    generation: u64,
+    kind: PtyEventKind,
+}
+
+#[derive(Debug)]
+enum PtyEventKind {
     Output(Bytes),
     ReaderError(String),
     Eof,
@@ -417,6 +424,7 @@ struct SessionActor {
     pty_rx: mpsc::Receiver<PtyEvent>,
     pty_tx: mpsc::SyncSender<PtyEvent>,
     reader: Option<JoinHandle<()>>,
+    reader_generation: u64,
     clients: HashMap<ClientId, ClientOutputTx>,
     controller: Option<ClientId>,
     child_exited: bool,
@@ -543,9 +551,11 @@ impl SessionActor {
             .take_writer()
             .map_err(RuntimeError::TakeWriter)?;
         let child = spawn_child(&*pair.slave, &self.config.mode)?;
-        let old_reader = self
-            .reader
-            .replace(spawn_reader(reader, self.pty_tx.clone())?);
+        let next_generation = self.reader_generation.saturating_add(1);
+        let old_reader =
+            self.reader
+                .replace(spawn_reader(reader, self.pty_tx.clone(), next_generation)?);
+        self.reader_generation = next_generation;
         self.slave = pair.slave;
         self.master = pair.master;
         self.writer = writer;
@@ -616,14 +626,18 @@ impl SessionActor {
     }
 
     fn handle_pty_event(&mut self, event: PtyEvent) -> Option<ShutdownReason> {
-        match event {
-            PtyEvent::Output(bytes) => {
+        if event.generation != self.reader_generation {
+            return None;
+        }
+
+        match event.kind {
+            PtyEventKind::Output(bytes) => {
                 self.record_replay(bytes.clone());
                 self.broadcast_bytes(&bytes);
                 None
             }
-            PtyEvent::ReaderError(error) => self.handle_reader_error(error),
-            PtyEvent::Eof => self.handle_child_exit(),
+            PtyEventKind::ReaderError(error) => self.handle_reader_error(error),
+            PtyEventKind::Eof => self.handle_child_exit(),
         }
     }
 
@@ -924,6 +938,7 @@ fn run_tmux_environment_command<const N: usize>(
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     pty_tx: mpsc::SyncSender<PtyEvent>,
+    generation: u64,
 ) -> Result<JoinHandle<()>, RuntimeError> {
     thread::Builder::new()
         .name("termstage-pty-reader".to_owned())
@@ -932,24 +947,35 @@ fn spawn_reader(
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => {
-                        let _result = pty_tx.send(PtyEvent::Eof);
+                        let _result = pty_tx.send(PtyEvent {
+                            generation,
+                            kind: PtyEventKind::Eof,
+                        });
                         break;
                     }
                     Ok(read) => {
                         let Some(chunk) = buffer.get(..read) else {
-                            let _result =
-                                pty_tx.send(PtyEvent::ReaderError("invalid pty read size".into()));
+                            let _result = pty_tx.send(PtyEvent {
+                                generation,
+                                kind: PtyEventKind::ReaderError("invalid pty read size".into()),
+                            });
                             break;
                         };
                         if pty_tx
-                            .send(PtyEvent::Output(Bytes::copy_from_slice(chunk)))
+                            .send(PtyEvent {
+                                generation,
+                                kind: PtyEventKind::Output(Bytes::copy_from_slice(chunk)),
+                            })
                             .is_err()
                         {
                             break;
                         }
                     }
                     Err(error) => {
-                        let _result = pty_tx.send(PtyEvent::ReaderError(error.to_string()));
+                        let _result = pty_tx.send(PtyEvent {
+                            generation,
+                            kind: PtyEventKind::ReaderError(error.to_string()),
+                        });
                         break;
                     }
                 }
