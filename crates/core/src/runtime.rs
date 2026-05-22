@@ -8,6 +8,7 @@ use std::{
     ffi::OsString,
     io::{Read, Write},
     path::{Path, PathBuf},
+    process::Stdio,
     sync::mpsc::{self, RecvTimeoutError},
     thread::{self, JoinHandle},
     time::Duration,
@@ -29,6 +30,9 @@ const CLIENT_OUTPUT_CAPACITY: usize = 256;
 const PTY_READ_CHUNK_SIZE: usize = 8192;
 const REPLAY_BUFFER_BYTES: usize = 1024 * 1024;
 const ACTOR_IDLE_WAIT: Duration = Duration::from_millis(10);
+const TERMINAL_TERM: &str = "xterm-256color";
+const TERMINAL_COLOR_MODE: &str = "truecolor";
+const TERMINAL_PROGRAM: &str = "termstage";
 
 /// Runtime failure.
 #[derive(Debug, Error)]
@@ -190,6 +194,8 @@ pub enum ShutdownReason {
     Supervisor,
     /// The browser/client disconnected.
     ClientDisconnect,
+    /// A newer browser/client took over the controller role.
+    ControllerReplaced,
     /// The child process exited or the PTY reached EOF.
     ChildExit,
     /// Runtime error.
@@ -492,19 +498,14 @@ impl SessionActor {
     }
 
     fn attach_client(&mut self, client_id: ClientId, output: ClientOutputTx) {
-        if self
-            .controller
-            .is_some_and(|controller| controller != client_id)
-        {
-            if let Some(message) = safe_message("another controller is already attached") {
-                let warning = ClientOutput::Control(ServerControlMessage::Warning {
-                    code: WarningCode::ClientBackpressure,
-                    message,
-                });
-                let _result = output.try_send(warning);
+        match self.controller {
+            Some(controller) if controller != client_id => {
+                if let Some(previous) = self.clients.remove(&controller) {
+                    let _result =
+                        previous.try_send(ClientOutput::Closed(ShutdownReason::ControllerReplaced));
+                }
             }
-            let _result = output.try_send(ClientOutput::Closed(ShutdownReason::ClientDisconnect));
-            return;
+            Some(_) | None => {}
         }
 
         self.controller = Some(client_id);
@@ -600,17 +601,142 @@ fn spawn_child(
         SessionMode::NewShell { shell } => shell.command_builder(),
         SessionMode::Tmux { session } => {
             let tmux = which::which("tmux").map_err(|_error| RuntimeError::TmuxUnavailable)?;
+            prepare_tmux_session_environment(&tmux, session)?;
             let mut command = CommandBuilder::new(tmux);
             command.env_remove("TMUX");
+            command.arg("-2");
+            command.arg("-T");
+            command.arg("RGB");
             command.arg("new-session");
             command.arg("-A");
+            command.arg("-e");
+            command.arg(format!("COLORTERM={TERMINAL_COLOR_MODE}"));
+            command.arg("-e");
+            command.arg("CLICOLOR=1");
+            command.arg("-e");
+            command.arg(format!("TERM_PROGRAM={TERMINAL_PROGRAM}"));
+            command.arg("-e");
+            command.arg(format!(
+                "TERM_PROGRAM_VERSION={}",
+                env!("CARGO_PKG_VERSION")
+            ));
             command.arg("-s");
             command.arg(session.as_str());
             command
         }
     };
-    command.env("TERM", "xterm-256color");
+    apply_terminal_environment(&mut command);
     slave.spawn_command(command).map_err(RuntimeError::Spawn)
+}
+
+fn apply_terminal_environment(command: &mut CommandBuilder) {
+    command.env("TERM", TERMINAL_TERM);
+    command.env("COLORTERM", TERMINAL_COLOR_MODE);
+    command.env("CLICOLOR", "1");
+    command.env("TERM_PROGRAM", TERMINAL_PROGRAM);
+    command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    command.env_remove("NO_COLOR");
+    command.env_remove("ANSI_COLORS_DISABLED");
+}
+
+fn prepare_tmux_session_environment(
+    tmux: &Path,
+    session: &SessionName,
+) -> Result<(), RuntimeError> {
+    if !tmux_session_exists(tmux, session)? {
+        return Ok(());
+    }
+
+    run_tmux_environment_command(
+        tmux,
+        ["set-environment", "-t", session.as_str(), "-u", "NO_COLOR"],
+    )?;
+    run_tmux_environment_command(
+        tmux,
+        [
+            "set-environment",
+            "-t",
+            session.as_str(),
+            "-u",
+            "ANSI_COLORS_DISABLED",
+        ],
+    )?;
+    run_tmux_environment_command(
+        tmux,
+        [
+            "set-environment",
+            "-t",
+            session.as_str(),
+            "COLORTERM",
+            TERMINAL_COLOR_MODE,
+        ],
+    )?;
+    run_tmux_environment_command(
+        tmux,
+        ["set-environment", "-t", session.as_str(), "CLICOLOR", "1"],
+    )?;
+    run_tmux_environment_command(
+        tmux,
+        [
+            "set-environment",
+            "-t",
+            session.as_str(),
+            "TERM_PROGRAM",
+            TERMINAL_PROGRAM,
+        ],
+    )?;
+    run_tmux_environment_command(
+        tmux,
+        [
+            "set-environment",
+            "-t",
+            session.as_str(),
+            "TERM_PROGRAM_VERSION",
+            env!("CARGO_PKG_VERSION"),
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(
+    clippy::disallowed_types,
+    reason = "tmux probes run on the runtime actor's dedicated blocking thread before spawning \
+              tmux"
+)]
+fn tmux_session_exists(tmux: &Path, session: &SessionName) -> Result<bool, RuntimeError> {
+    let status = std::process::Command::new(tmux)
+        .env_remove("TMUX")
+        .arg("has-session")
+        .arg("-t")
+        .arg(session.as_str())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| RuntimeError::Spawn(error.into()))?;
+    Ok(status.success())
+}
+
+#[allow(
+    clippy::disallowed_types,
+    reason = "tmux environment setup runs on the runtime actor's dedicated blocking thread before \
+              spawning tmux"
+)]
+fn run_tmux_environment_command<const N: usize>(
+    tmux: &Path,
+    args: [&str; N],
+) -> Result<(), RuntimeError> {
+    let status = std::process::Command::new(tmux)
+        .env_remove("TMUX")
+        .args(args)
+        .status()
+        .map_err(|error| RuntimeError::Spawn(error.into()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(RuntimeError::Spawn(anyhow::anyhow!(
+            "tmux environment command exited with {status}"
+        )))
+    }
 }
 
 fn spawn_reader(
@@ -675,8 +801,12 @@ fn safe_fallback_message(_error: ProtocolError) -> SafeMessage {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_types,
+    reason = "runtime tests use blocking subprocess probes to validate tmux integration"
+)]
 mod tests {
-    use std::time::Instant;
+    use std::{ffi::OsStr, process::Command, time::Instant};
 
     use anyhow::Context;
     use tokio::time::{sleep, timeout};
@@ -693,6 +823,24 @@ mod tests {
             [OsString::from("--noprofile"), OsString::from("--norc")],
         )
         .map_err(Into::into)
+    }
+
+    #[test]
+    fn test_should_advertise_truecolor_terminal_environment() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.env("NO_COLOR", "1");
+        command.env("ANSI_COLORS_DISABLED", "1");
+        apply_terminal_environment(&mut command);
+
+        assert_eq!(command.get_env("TERM"), Some(OsStr::new("xterm-256color")));
+        assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
+        assert_eq!(command.get_env("CLICOLOR"), Some(OsStr::new("1")));
+        assert_eq!(
+            command.get_env("TERM_PROGRAM"),
+            Some(OsStr::new("termstage"))
+        );
+        assert_eq!(command.get_env("NO_COLOR"), None);
+        assert_eq!(command.get_env("ANSI_COLORS_DISABLED"), None);
     }
 
     async fn recv_until_contains(
@@ -718,6 +866,24 @@ mod tests {
             }
         }
         anyhow::bail!("runtime output did not contain requested marker");
+    }
+
+    async fn recv_until_closed(
+        output: &mut ClientOutputRx,
+        reason: ShutdownReason,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let message = timeout(remaining, output.recv())
+                .await
+                .context("test runtime output timed out")?
+                .context("client output channel closed")?;
+            if message == ClientOutput::Closed(reason.clone()) {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("runtime output did not close with requested reason");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -838,6 +1004,48 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_should_prepare_existing_tmux_session_color_environment() -> anyhow::Result<()> {
+        let tmux = which::which("tmux").context("tmux unavailable")?;
+        let session_name = SessionName::new(format!("termstage-env-test-{}", std::process::id()))?;
+        let _cleanup = TmuxSessionCleanup::new(tmux.clone(), session_name.clone());
+        let status = Command::new(&tmux)
+            .env_remove("TMUX")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                session_name.as_str(),
+                "sleep",
+                "30",
+            ])
+            .status()
+            .context("failed to create tmux test session")?;
+        assert!(status.success());
+        set_tmux_test_environment(&tmux, &session_name, "NO_COLOR", "1")?;
+        set_tmux_test_environment(&tmux, &session_name, "ANSI_COLORS_DISABLED", "1")?;
+
+        prepare_tmux_session_environment(&tmux, &session_name)?;
+
+        assert_eq!(
+            tmux_environment_value(&tmux, &session_name, "NO_COLOR")?,
+            None
+        );
+        assert_eq!(
+            tmux_environment_value(&tmux, &session_name, "ANSI_COLORS_DISABLED")?,
+            None
+        );
+        assert_eq!(
+            tmux_environment_value(&tmux, &session_name, "COLORTERM")?,
+            Some(TERMINAL_COLOR_MODE.to_owned())
+        );
+        assert_eq!(
+            tmux_environment_value(&tmux, &session_name, "CLICOLOR")?,
+            Some("1".to_owned())
+        );
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_allow_controller_reattach_after_detach() -> anyhow::Result<()> {
         let config = RuntimeConfig {
@@ -904,6 +1112,127 @@ mod tests {
         );
         session.shutdown(ShutdownReason::Supervisor).await?;
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_replace_existing_controller_on_new_attach() -> anyhow::Result<()> {
+        let config = RuntimeConfig {
+            mode: SessionMode::NewShell {
+                shell: test_shell_command()?,
+            },
+            initial_size: test_size()?,
+            reconnect_policy: ReconnectPolicy::KeepAlive,
+        };
+        let session = RuntimeSession::start(config)?;
+        let (first_tx, mut first_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(1),
+                output: first_tx,
+            })
+            .await?;
+        let first_ready = first_rx.recv().await.context("first ready output")?;
+        assert!(matches!(
+            first_ready,
+            ClientOutput::Control(ServerControlMessage::Ready { .. })
+        ));
+
+        let (second_tx, mut second_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(2),
+                output: second_tx,
+            })
+            .await?;
+
+        recv_until_closed(&mut first_rx, ShutdownReason::ControllerReplaced).await?;
+        let second_ready = second_rx.recv().await.context("second ready output")?;
+        assert!(matches!(
+            second_ready,
+            ClientOutput::Control(ServerControlMessage::Ready { .. })
+        ));
+        session
+            .send(RuntimeCommand::Input {
+                client_id: ClientId::new(1),
+                bytes: Bytes::from_static(b"printf should-not-run\\n\n"),
+            })
+            .await?;
+        session
+            .send(RuntimeCommand::Input {
+                client_id: ClientId::new(2),
+                bytes: Bytes::from_static(b"printf replacement-controller-ok\\n\n"),
+            })
+            .await?;
+        let second_output =
+            recv_until_contains(&mut second_rx, b"replacement-controller-ok").await?;
+        assert!(
+            second_output
+                .windows(b"replacement-controller-ok".len())
+                .any(|window| window == b"replacement-controller-ok")
+        );
+        session.shutdown(ShutdownReason::Supervisor).await?;
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct TmuxSessionCleanup {
+        tmux: PathBuf,
+        session: SessionName,
+    }
+
+    impl TmuxSessionCleanup {
+        fn new(tmux: PathBuf, session: SessionName) -> Self {
+            Self { tmux, session }
+        }
+    }
+
+    impl Drop for TmuxSessionCleanup {
+        fn drop(&mut self) {
+            let _result = Command::new(&self.tmux)
+                .env_remove("TMUX")
+                .args(["kill-session", "-t", self.session.as_str()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+
+    fn set_tmux_test_environment(
+        tmux: &Path,
+        session: &SessionName,
+        name: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
+        let status = Command::new(tmux)
+            .env_remove("TMUX")
+            .args(["set-environment", "-t", session.as_str(), name, value])
+            .status()
+            .with_context(|| format!("failed to set tmux env {name}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!("tmux set-environment {name} exited with {status}");
+        }
+    }
+
+    fn tmux_environment_value(
+        tmux: &Path,
+        session: &SessionName,
+        name: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let output = Command::new(tmux)
+            .env_remove("TMUX")
+            .args(["show-environment", "-t", session.as_str(), name])
+            .output()
+            .with_context(|| format!("failed to read tmux env {name}"))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let line = String::from_utf8(output.stdout).context("tmux env output was not utf-8")?;
+        Ok(line
+            .trim()
+            .strip_prefix(&format!("{name}="))
+            .map(ToOwned::to_owned))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

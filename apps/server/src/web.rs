@@ -28,7 +28,9 @@ use termstage_core::{
         AccessToken, ClientControlMessage, ErrorCode, SafeMessage, ServerControlMessage,
         TerminalSize,
     },
-    runtime::{ClientId, ClientOutput, RuntimeCommand, RuntimeConfig, RuntimeSession},
+    runtime::{
+        ClientId, ClientOutput, RuntimeCommand, RuntimeConfig, RuntimeSession, ShutdownReason,
+    },
     security::{
         AllowedHost, AllowedOrigin, BasePath, ExposurePolicy, PublicBaseUrl, SecurityError,
         validate_access_token, validate_peer_for_policy,
@@ -38,6 +40,7 @@ use tokio::{
     net::TcpListener,
     sync::{mpsc, oneshot},
     task::JoinHandle,
+    time::{self, Duration, Instant},
 };
 use tracing::debug;
 
@@ -46,6 +49,8 @@ use crate::assets::{asset_response, index_response};
 const DEFAULT_BIND_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const MAX_FRAME_SIZE: usize = 16 * 1024;
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
+const CLIENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
+const CLIENT_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Presentation theme sent to the frontend through the HTML document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,16 +414,20 @@ async fn bridge_socket(state: AppState, socket: WebSocket) {
 
     let (mut sender, mut receiver) = socket.split();
     let mut output_rx = output_rx;
+    let mut last_client_message = Instant::now();
+    let mut heartbeat_check = time::interval(CLIENT_HEARTBEAT_CHECK_INTERVAL);
     loop {
         tokio::select! {
             Some(message) = receiver.next() => {
                 match message {
                     Ok(Message::Binary(bytes)) => {
+                        last_client_message = Instant::now();
                         if send_runtime(&state.inner.commands, RuntimeCommand::Input { client_id, bytes }).await.is_err() {
                             break;
                         }
                     }
                     Ok(Message::Text(text)) => {
+                        last_client_message = Instant::now();
                         match serde_json::from_str::<ClientControlMessage>(&text) {
                             Ok(ClientControlMessage::Resize { cols, rows }) => {
                                 let size = TerminalSize { cols, rows };
@@ -437,11 +446,14 @@ async fn bridge_socket(state: AppState, socket: WebSocket) {
                     }
                     Ok(Message::Close(_frame)) => break,
                     Ok(Message::Ping(bytes)) => {
+                        last_client_message = Instant::now();
                         if sender.send(Message::Pong(bytes)).await.is_err() {
                             break;
                         }
                     }
-                    Ok(Message::Pong(_bytes)) => {}
+                    Ok(Message::Pong(_bytes)) => {
+                        last_client_message = Instant::now();
+                    }
                     Err(error) => {
                         debug!(%error, "websocket receive error");
                         break;
@@ -455,6 +467,13 @@ async fn bridge_socket(state: AppState, socket: WebSocket) {
                     }
                 } else {
                     let _result = sender.send(Message::Close(Some(backpressure_close()))).await;
+                    break;
+                }
+            }
+            _ = heartbeat_check.tick() => {
+                if last_client_message.elapsed() >= CLIENT_HEARTBEAT_TIMEOUT {
+                    debug!(client_id = client_id.get(), "closing stale browser terminal websocket");
+                    let _result = sender.send(Message::Close(Some(client_timeout_close()))).await;
                     break;
                 }
             }
@@ -485,7 +504,11 @@ async fn send_client_output(
             };
             sender.send(Message::Text(text.into())).await
         }
-        ClientOutput::Closed(_reason) => sender.send(Message::Close(None)).await,
+        ClientOutput::Closed(reason) => {
+            sender
+                .send(Message::Close(Some(close_frame_for_shutdown(reason))))
+                .await
+        }
     }
 }
 
@@ -524,6 +547,27 @@ fn backpressure_close() -> CloseFrame {
     CloseFrame {
         code: close_code::POLICY,
         reason: "browser client backpressure".into(),
+    }
+}
+
+fn client_timeout_close() -> CloseFrame {
+    CloseFrame {
+        code: close_code::NORMAL,
+        reason: "client heartbeat timeout".into(),
+    }
+}
+
+fn close_frame_for_shutdown(reason: ShutdownReason) -> CloseFrame {
+    let reason = match reason {
+        ShutdownReason::Supervisor => "server shutting down",
+        ShutdownReason::ClientDisconnect => "client disconnected",
+        ShutdownReason::ControllerReplaced => "controller replaced",
+        ShutdownReason::ChildExit => "session ended",
+        ShutdownReason::RuntimeError(_error) => "runtime error",
+    };
+    CloseFrame {
+        code: close_code::NORMAL,
+        reason: reason.into(),
     }
 }
 
@@ -973,6 +1017,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_replace_live_websocket_controller() -> anyhow::Result<()> {
+        let token = AccessToken::from_bytes([11; 32]);
+        let runtime = RuntimeConfig {
+            mode: SessionMode::NewShell {
+                shell: test_shell_command()?,
+            },
+            initial_size: TerminalSize::new(80, 24)?,
+            reconnect_policy: ReconnectPolicy::KeepAlive,
+        };
+        let session = RuntimeSession::start(runtime.clone())?;
+        let config = WebConfig::local(token.clone(), session.command_sender(), runtime);
+        let server = serve(config).await?;
+
+        let mut first = connect_test_socket(server.address(), &token).await?;
+        first
+            .send(TungsteniteMessage::Binary(Bytes::from_static(
+                b"printf controller-before-replace\\n\n",
+            )))
+            .await?;
+        assert!(
+            read_socket_until(&mut first, b"controller-before-replace").await?,
+            "first websocket did not receive terminal output"
+        );
+
+        let mut second = connect_test_socket(server.address(), &token).await?;
+        let first_close_reason = read_socket_close_reason(&mut first).await?;
+        assert_eq!(first_close_reason.as_deref(), Some("controller replaced"));
+        second
+            .send(TungsteniteMessage::Binary(Bytes::from_static(
+                b"printf controller-after-replace\\n\n",
+            )))
+            .await?;
+        assert!(
+            read_socket_until(&mut second, b"controller-after-replace").await?,
+            "second websocket did not receive terminal output"
+        );
+        server.shutdown().await?;
+        session.shutdown(ShutdownReason::Supervisor).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_replay_tmux_state_after_browser_refresh() -> anyhow::Result<()> {
         let token = AccessToken::from_bytes([8; 32]);
         let session_name = SessionName::new(format!("termstage-phase5-{}", std::process::id()))?;
@@ -1221,6 +1307,29 @@ mod tests {
                 }
             }
             anyhow::Ok(false)
+        })
+        .await?
+    }
+
+    async fn read_socket_close_reason(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> anyhow::Result<Option<String>> {
+        timeout(Duration::from_secs(5), async {
+            while let Some(message) = socket.next().await {
+                match message? {
+                    TungsteniteMessage::Close(frame) => {
+                        return anyhow::Ok(frame.map(|frame| frame.reason.to_string()));
+                    }
+                    TungsteniteMessage::Binary(_)
+                    | TungsteniteMessage::Text(_)
+                    | TungsteniteMessage::Ping(_)
+                    | TungsteniteMessage::Pong(_)
+                    | TungsteniteMessage::Frame(_) => {}
+                }
+            }
+            anyhow::Ok(None)
         })
         .await?
     }

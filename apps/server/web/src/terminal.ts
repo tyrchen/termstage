@@ -15,31 +15,19 @@ const WHEEL_PIXEL_LINE_HEIGHT = 40;
 const MAX_WHEEL_LINES = 24;
 const TERMINAL_FONT_FAMILY =
   '"JetBrains Mono", "SFMono-Regular", "Cascadia Code", "Liberation Mono", ' +
-  '"DejaVu Sans Mono", "Noto Sans Mono", "Noto Sans Symbols 2", "Apple Symbols", ' +
-  '"Segoe UI Symbol", monospace';
+  '"DejaVu Sans Mono", "Noto Sans Mono", "Noto Sans Symbols 2", "Noto Sans Symbols", ' +
+  '"Apple Symbols", "Segoe UI Symbol", monospace';
 
 export async function createTerminalSurface(
   root: HTMLElement,
   settings: PresentationSettings
 ): Promise<TerminalSurface> {
-  // xterm.js measures cell dimensions once at `open()` from the resolved
-  // computed font. If the bundled JetBrains Mono webfont hasn't loaded
-  // yet, that measurement uses the platform monospace fallback (Menlo /
-  // Consolas / DejaVu) which has different metrics — every subsequent
-  // glyph then renders off the cell grid and box-drawing chars look
-  // broken. Wait for the document's font set first.
-  if (typeof document !== 'undefined' && 'fonts' in document) {
-    try {
-      await document.fonts.load(`500 ${settings.fontSize}px "JetBrains Mono"`);
-      await document.fonts.ready;
-    } catch {
-      // Fall through — xterm will still render with the platform fallback.
-    }
-  }
+  await waitForTerminalFonts(settings.fontSize);
 
   const terminal = new Terminal({
     allowProposedApi: true,
     convertEol: true,
+    customGlyphs: true,
     cursorBlink: true,
     cursorStyle: 'block',
     disableStdin: false,
@@ -48,6 +36,7 @@ export async function createTerminalSurface(
     fontWeight: '500',
     lineHeight: 1.12,
     macOptionIsMeta: true,
+    rescaleOverlappingGlyphs: true,
     scrollback: 4000,
     theme: themePalette(settings.theme)
   });
@@ -61,6 +50,19 @@ export async function createTerminalSurface(
   fitAddon.fit();
   terminal.focus();
   return { terminal, fitAddon };
+}
+
+async function waitForTerminalFonts(fontSize: number): Promise<void> {
+  if (typeof document === 'undefined' || !('fonts' in document)) {
+    return;
+  }
+
+  try {
+    await document.fonts.load(`500 ${fontSize}px "JetBrains Mono"`);
+    await document.fonts.ready;
+  } catch {
+    return;
+  }
 }
 
 function attachScrollbackWheelHandler(terminal: Terminal): void {

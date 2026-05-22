@@ -1,5 +1,6 @@
 import { Terminal } from '@xterm/xterm';
 
+import { ConnectionStatus } from './connection-status';
 import { TerminalSize } from './resize';
 
 interface ResizeControlMessage {
@@ -20,9 +21,22 @@ export interface TerminalSocket {
   close: () => void;
 }
 
-const RECONNECT_DELAYS_MS = [250, 500, 1000, 2000] as const;
+export interface TerminalSocketOptions {
+  onStatusChange?: (status: ConnectionStatus) => void;
+}
 
-export function connectTerminalSocket(terminal: Terminal): TerminalSocket {
+const RECONNECT_DELAYS_MS = [250, 500, 1000, 2000] as const;
+const LOST_AFTER_RECONNECT_ATTEMPTS = RECONNECT_DELAYS_MS.length;
+const SESSION_ENDED_REASON = 'session ended';
+const SERVER_SHUTDOWN_REASON = 'server shutting down';
+const RUNTIME_ERROR_REASON = 'runtime error';
+const CLIENT_DISCONNECTED_REASON = 'client disconnected';
+const CONTROLLER_REPLACED_REASON = 'controller replaced';
+
+export function connectTerminalSocket(
+  terminal: Terminal,
+  options: TerminalSocketOptions = {}
+): TerminalSocket {
   const token = new URLSearchParams(window.location.search).get('token') ?? '';
   const baseUrl = new URL('ws', document.baseURI);
   baseUrl.protocol = baseUrl.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -63,6 +77,7 @@ export function connectTerminalSocket(terminal: Terminal): TerminalSocket {
     nextSocket.binaryType = 'arraybuffer';
     nextSocket.addEventListener('open', () => {
       reconnectAttempt = 0;
+      emitStatus({ state: 'connected' });
       sendControl(nextSocket, { type: 'resize', cols: lastSize.cols, rows: lastSize.rows });
       heartbeatId = window.setInterval(() => {
         heartbeatSequence += 1;
@@ -76,22 +91,40 @@ export function connectTerminalSocket(terminal: Terminal): TerminalSocket {
       }
       handleControlMessage(terminal, event.data);
     });
-    nextSocket.addEventListener('close', () => {
+    nextSocket.addEventListener('close', (event: CloseEvent) => {
       window.clearInterval(heartbeatId);
-      if (!closedByClient) {
-        scheduleReconnect();
+      if (closedByClient) {
+        return;
       }
+
+      const terminalEnd = terminalEndStatus(event);
+      if (terminalEnd !== undefined) {
+        emitStatus(terminalEnd);
+        return;
+      }
+
+      scheduleReconnect();
     });
     return nextSocket;
   }
 
   function scheduleReconnect(): void {
+    if (reconnectAttempt >= LOST_AFTER_RECONNECT_ATTEMPTS) {
+      emitStatus({ state: 'lost' });
+      return;
+    }
+
+    emitStatus({ state: 'reconnecting' });
     const delay =
       RECONNECT_DELAYS_MS[Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)];
     reconnectAttempt += 1;
     reconnectId = window.setTimeout(() => {
       socket = openSocket();
     }, delay);
+  }
+
+  function emitStatus(status: ConnectionStatus): void {
+    options.onStatusChange?.(status);
   }
 }
 
@@ -109,5 +142,42 @@ function handleControlMessage(terminal: Terminal, data: string): void {
     }
   } catch {
     terminal.writeln('\r\nprotocol error');
+  }
+}
+
+function terminalEndStatus(event: CloseEvent): ConnectionStatus | undefined {
+  switch (event.reason) {
+    case SESSION_ENDED_REASON:
+      return {
+        state: 'ended',
+        title: 'Session ended',
+        message: 'The terminal process exited.'
+      };
+    case SERVER_SHUTDOWN_REASON:
+      return {
+        state: 'ended',
+        title: 'Session ended',
+        message: 'The server shut down.'
+      };
+    case RUNTIME_ERROR_REASON:
+      return {
+        state: 'ended',
+        title: 'Session ended',
+        message: 'The terminal runtime stopped after an error.'
+      };
+    case CONTROLLER_REPLACED_REASON:
+      return {
+        state: 'ended',
+        title: 'Session attached elsewhere',
+        message: 'A newer browser connection took over this session.'
+      };
+    case CLIENT_DISCONNECTED_REASON:
+      return {
+        state: 'ended',
+        title: 'Connection closed',
+        message: 'The server closed this browser connection.'
+      };
+    default:
+      return undefined;
   }
 }

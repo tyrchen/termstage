@@ -7,18 +7,28 @@ test('terminal app renders and round-trips through the Rust PTY bridge', async (
   page
 }, testInfo) => {
   const server = await startTermstageServer();
+  const failedAssets: string[] = [];
+  page.on('response', response => {
+    if (response.status() >= 400 && response.url().includes('/assets/')) {
+      failedAssets.push(`${response.status()} ${response.url()}`);
+    }
+  });
   try {
     testInfo.attach('launch-url-redacted', {
       body: server.url.replace(/token=[^&]+/, 'token=[REDACTED]'),
       contentType: 'text/plain'
     });
     await page.goto(server.url);
+    expect(failedAssets).toEqual([]);
     const root = page.locator('#terminal-root');
     await expect(root).toBeVisible();
     await expect(page.locator('.xterm')).toBeVisible();
     await page.keyboard.type('printf phase4-output');
     await page.keyboard.press('Enter');
     await expect(page.locator('.xterm-rows')).toContainText('phase4-output');
+    await page.keyboard.type('printf "$TERM|$COLORTERM|$CLICOLOR"');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('.xterm-rows')).toContainText('xterm-256color|truecolor|1');
     const desktop = await page.screenshot({
       path: testInfo.outputPath('desktop-terminal.png')
     });
@@ -29,6 +39,27 @@ test('terminal app renders and round-trips through the Rust PTY bridge', async (
       path: testInfo.outputPath('narrow-terminal.png')
     });
     expect(narrow.byteLength).toBeGreaterThan(1000);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('terminal app renders common Unicode terminal glyphs', async ({ page }, testInfo) => {
+  const server = await startTermstageServer();
+  try {
+    testInfo.attach('launch-url-redacted', {
+      body: server.url.replace(/token=[^&]+/, 'token=[REDACTED]'),
+      contentType: 'text/plain'
+    });
+    await page.goto(server.url);
+    await expect(page.locator('.xterm')).toBeVisible();
+    await page.keyboard.type("printf '─│╭╮█⠀'");
+    await page.keyboard.press('Enter');
+    await expect(page.locator('.xterm-rows')).toContainText('─│╭╮█⠀');
+    const screenshot = await page.screenshot({
+      path: testInfo.outputPath('unicode-terminal.png')
+    });
+    expect(screenshot.byteLength).toBeGreaterThan(1000);
   } finally {
     await server.stop();
   }
@@ -62,9 +93,78 @@ test('terminal app scrolls through browser wheel input', async ({ page }, testIn
   }
 });
 
+test('terminal app stops reconnecting when another browser takes over', async ({
+  page,
+  context
+}, testInfo) => {
+  const server = await startTermstageServer();
+  const secondPage = await context.newPage();
+  try {
+    testInfo.attach('launch-url-redacted', {
+      body: server.url.replace(/token=[^&]+/, 'token=[REDACTED]'),
+      contentType: 'text/plain'
+    });
+    await page.goto(server.url);
+    await expect(page.locator('.xterm')).toBeVisible();
+    await page.keyboard.type('printf controller-before-replace');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('.xterm-rows')).toContainText('controller-before-replace');
+
+    await secondPage.goto(server.url);
+    await expect(secondPage.locator('.xterm')).toBeVisible();
+    await expect(page.getByRole('dialog')).toContainText('Session attached elsewhere');
+    await secondPage.keyboard.type('printf controller-after-replace');
+    await secondPage.keyboard.press('Enter');
+    await expect(secondPage.locator('.xterm-rows')).toContainText('controller-after-replace');
+  } finally {
+    await secondPage.close();
+    await server.stop();
+  }
+});
+
+test('terminal app shows session-ended status when shell exits', async ({ page }, testInfo) => {
+  const server = await startTermstageServer();
+  try {
+    testInfo.attach('launch-url-redacted', {
+      body: server.url.replace(/token=[^&]+/, 'token=[REDACTED]'),
+      contentType: 'text/plain'
+    });
+    await page.goto(server.url);
+    await expect(page.locator('.xterm')).toBeVisible();
+    await page.keyboard.type('exit');
+    await page.keyboard.press('Enter');
+    await expect(page.getByRole('dialog')).toContainText('Session ended');
+    await expect(page.getByRole('dialog')).toContainText('The terminal process exited.');
+  } finally {
+    await server.stop();
+  }
+});
+
+test('terminal app shows lost-connectivity status when server disappears', async ({
+  page
+}, testInfo) => {
+  const server = await startTermstageServer();
+  let stopped = false;
+  try {
+    testInfo.attach('launch-url-redacted', {
+      body: server.url.replace(/token=[^&]+/, 'token=[REDACTED]'),
+      contentType: 'text/plain'
+    });
+    await page.goto(server.url);
+    await expect(page.locator('.xterm')).toBeVisible();
+    await server.stop('SIGKILL');
+    stopped = true;
+    await expect(page.getByRole('dialog')).toContainText('Lost connectivity');
+  } finally {
+    if (!stopped) {
+      await server.stop();
+    }
+  }
+});
+
 async function startTermstageServer(): Promise<{
   url: string;
-  stop: () => Promise<void>;
+  stop: (signal?: NodeJS.Signals) => Promise<void>;
 }> {
   const testDir = path.dirname(fileURLToPath(import.meta.url));
   const repoRoot = path.resolve(testDir, '../../../..');
@@ -99,8 +199,8 @@ async function startTermstageServer(): Promise<{
   const url = await readLaunchUrl(child);
   return {
     url,
-    stop: async () => {
-      child.kill('SIGINT');
+    stop: async (signal: NodeJS.Signals = 'SIGINT') => {
+      child.kill(signal);
       await waitForExit(child);
     }
   };
