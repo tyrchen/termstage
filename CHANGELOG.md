@@ -3,6 +3,42 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [termstage-v0.3.1](https://github.com/compare/termstage-v0.3.0..termstage-v0.3.1) - 2026-05-22
+
+### Miscellaneous Chores
+
+- bump version - ([688d09a](https://github.com/commit/688d09a27277134d0adf7bc18ca4c980fde86012)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([c0276d9](https://github.com/commit/c0276d99d4e08f9e327d31e489d8c6fffed4edce)) - Tyr Chen
+- Fix reconnect on ambiguous websocket close (#6)
+
+## Summary
+- reconnect after ambiguous transport/proxy WebSocket closes instead of
+showing a terminal-ended modal
+- require an explicit processExited control frame before suppressing
+reconnect for real child exits
+- add Rust and Playwright regression coverage for child-exit close
+ordering and ambiguous session-ended close behavior
+
+## Verification
+- make build
+- make test-cargo
+- make test
+- make fmt
+- make clippy
+- make clippy-pedantic
+- make clippy-boundary
+- make audit
+- make deny
+- make frontend-typecheck
+- make frontend-build
+- make frontend-test
+- commit hooks: cargo fmt, cargo deny check, typos, cargo check, cargo
+clippy, cargo test - ([02981e0](https://github.com/commit/02981e0c6f1127f7760be8e16e1c87288040d6d5)) - Tyr Chen
+
+---
 ## [termstage-v0.3.0](https://github.com/compare/termstage-v0.2.2..termstage-v0.3.0) - 2026-05-22
 
 ### Miscellaneous Chores
