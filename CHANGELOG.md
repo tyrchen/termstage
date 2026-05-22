@@ -3,6 +3,37 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [termstage-v0.2.2](https://github.com/compare/termstage-v0.2.1..termstage-v0.2.2) - 2026-05-22
+
+### Miscellaneous Chores
+
+- bump version - ([41e80e0](https://github.com/commit/41e80e04ec6c7e4d439fd82f2dd1d9e8c2e564d6)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([cdb1d93](https://github.com/commit/cdb1d93b0b92a00514c897040674e4ab7037d04a)) - Tyr Chen
+- Fix browser terminal wheel scrolling (#4)
+
+## Summary
+- intercept terminal wheel events before xterm's custom scrollbar path
+swallows them
+- normalize wheel deltas and scroll xterm scrollback directly when mouse
+tracking is inactive
+- add a Playwright regression covering wheel-up scrollback behavior
+
+## Verification
+- npm run typecheck --prefix apps/server/web
+- npm run build --prefix apps/server/web
+- npm test --prefix apps/server/web
+- cargo build --workspace --all-targets
+- cargo test --workspace --all-targets
+- cargo +nightly fmt --all -- --check
+- cargo clippy --workspace --all-targets -- -D warnings -W
+clippy::pedantic
+- cargo audit
+- cargo deny check - ([349222e](https://github.com/commit/349222eecfbef310e0d404b98ad75c723ac2e6f4)) - Tyr Chen
+
+---
 ## [termstage-v0.2.1](https://github.com/compare/termstage-v0.2.0..termstage-v0.2.1) - 2026-05-22
 
 ### Bug Fixes
