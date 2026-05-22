@@ -34,6 +34,34 @@ test('terminal app renders and round-trips through the Rust PTY bridge', async (
   }
 });
 
+test('terminal app scrolls through browser wheel input', async ({ page }, testInfo) => {
+  const server = await startTermstageServer();
+  try {
+    testInfo.attach('launch-url-redacted', {
+      body: server.url.replace(/token=[^&]+/, 'token=[REDACTED]'),
+      contentType: 'text/plain'
+    });
+    await page.goto(server.url);
+    const root = page.locator('#terminal-root');
+    await expect(root).toBeVisible();
+    await expect(page.locator('.xterm')).toBeVisible();
+    await page.keyboard.type('seq 1 120');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('.xterm-rows')).toContainText('120');
+    await expect(page.locator('.xterm-rows')).not.toContainText('\n80');
+    const box = await root.boundingBox();
+    expect(box).not.toBeNull();
+    if (box === null) {
+      throw new Error('terminal root bounding box was not available');
+    }
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.wheel(0, -800);
+    await expect(page.locator('.xterm-rows')).toContainText('80');
+  } finally {
+    await server.stop();
+  }
+});
+
 async function startTermstageServer(): Promise<{
   url: string;
   stop: () => Promise<void>;
