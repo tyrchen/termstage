@@ -492,7 +492,6 @@ impl SessionActor {
             ExitPolicy::End => Some(ShutdownReason::ChildExit),
             ExitPolicy::Hold => {
                 self.child_exited = true;
-                self.join_reader();
                 self.notify_process_exited();
                 None
             }
@@ -507,7 +506,6 @@ impl SessionActor {
     }
 
     fn restart_child(&mut self) -> Result<(), RuntimeError> {
-        self.join_reader();
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(to_pty_size(self.current_size))
@@ -521,11 +519,16 @@ impl SessionActor {
             .take_writer()
             .map_err(RuntimeError::TakeWriter)?;
         let child = spawn_child(&*pair.slave, &self.config.mode)?;
+        let old_reader = self
+            .reader
+            .replace(spawn_reader(reader, self.pty_tx.clone())?);
         self.slave = pair.slave;
         self.master = pair.master;
         self.writer = writer;
         self.child = child;
-        self.reader = Some(spawn_reader(reader, self.pty_tx.clone())?);
+        if let Some(reader) = old_reader {
+            let _result = reader.join();
+        }
         self.child_exited = false;
         self.replay.clear();
         self.replay_bytes = 0;
