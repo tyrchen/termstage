@@ -3,6 +3,21 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [termstage-v0.2.1](https://github.com/compare/termstage-v0.2.0..termstage-v0.2.1) - 2026-05-22
+
+### Bug Fixes
+
+- **(web)** bundle JetBrains Mono so xterm renders consistently in browsers (#3) - ([72e4b85](https://github.com/commit/72e4b85d6fd070d5b42e9f170c4acdaf458bb7be)) - Tyr Chen
+
+### Miscellaneous Chores
+
+- bump version - ([7d732be](https://github.com/commit/7d732be73bf24af2d43fb363753f49d3e29b5216)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([57b4e70](https://github.com/commit/57b4e706ad4e6e3fb27f78166e609e2cd0a93eac)) - Tyr Chen
+
+---
 ## [termstage-v0.2.0](https://github.com/compare/termstage-v0.1.0..termstage-v0.2.0) - 2026-05-20
 
 ### Features
