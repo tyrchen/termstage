@@ -87,7 +87,7 @@ test('terminal app scrolls through browser wheel input', async ({ page }, testIn
     }
     await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
     await page.mouse.wheel(0, -800);
-    await expect(page.locator('.xterm-rows')).toContainText('80');
+    await expect(page.locator('.xterm-rows')).toContainText('81');
   } finally {
     await server.stop();
   }

@@ -61,6 +61,7 @@ fn content_type_for_path(path: &str) -> &'static str {
     match extension {
         "css" => "text/css; charset=utf-8",
         "js" => "text/javascript; charset=utf-8",
+        "ttf" => "font/ttf",
         "woff" => "font/woff",
         "woff2" => "font/woff2",
         _ => "application/octet-stream",
@@ -95,8 +96,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_should_serve_embedded_font_asset() {
-        let response = asset_response("jetbrains-mono-latin-500-normal.woff2");
+    fn test_should_serve_embedded_font_asset() -> anyhow::Result<()> {
+        let font_path = EmbeddedAssets::iter()
+            .find(|path| path.ends_with(".ttf"))
+            .ok_or_else(|| anyhow::anyhow!("embedded nerd font asset"))?;
+        let response = asset_response(font_path.as_ref());
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -104,8 +108,9 @@ mod tests {
                 .headers()
                 .get(CONTENT_TYPE)
                 .map(HeaderValue::as_bytes),
-            Some(b"font/woff2".as_slice()),
+            Some(b"font/ttf".as_slice()),
         );
+        Ok(())
     }
 
     #[test]

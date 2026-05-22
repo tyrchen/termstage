@@ -13,10 +13,7 @@ export interface TerminalSurface {
 
 const WHEEL_PIXEL_LINE_HEIGHT = 40;
 const MAX_WHEEL_LINES = 24;
-const TERMINAL_FONT_FAMILY =
-  '"JetBrains Mono", "SFMono-Regular", "Cascadia Code", "Liberation Mono", ' +
-  '"DejaVu Sans Mono", "Noto Sans Mono", "Noto Sans Symbols 2", "Noto Sans Symbols", ' +
-  '"Apple Symbols", "Segoe UI Symbol", monospace';
+const TERMINAL_FONT_FAMILY = '"Termstage Nerd Font", monospace';
 
 export async function createTerminalSurface(
   root: HTMLElement,
@@ -33,8 +30,9 @@ export async function createTerminalSurface(
     disableStdin: false,
     fontFamily: TERMINAL_FONT_FAMILY,
     fontSize: settings.fontSize,
-    fontWeight: '500',
-    lineHeight: 1.12,
+    fontWeight: '400',
+    fontWeightBold: '700',
+    lineHeight: 1.08,
     macOptionIsMeta: true,
     rescaleOverlappingGlyphs: true,
     scrollback: 4000,
@@ -58,7 +56,7 @@ async function waitForTerminalFonts(fontSize: number): Promise<void> {
   }
 
   try {
-    await document.fonts.load(`500 ${fontSize}px "JetBrains Mono"`);
+    await document.fonts.load(`400 ${fontSize}px "Termstage Nerd Font"`);
     await document.fonts.ready;
   } catch {
     return;
