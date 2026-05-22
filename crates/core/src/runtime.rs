@@ -33,6 +33,7 @@ const ACTOR_IDLE_WAIT: Duration = Duration::from_millis(10);
 const TERMINAL_TERM: &str = "xterm-256color";
 const TERMINAL_COLOR_MODE: &str = "truecolor";
 const TERMINAL_PROGRAM: &str = "termstage";
+const DISABLE_COLOR_ENV: [&str; 2] = ["NO_COLOR", "ANSI_COLORS_DISABLED"];
 
 /// Runtime failure.
 #[derive(Debug, Error)]
@@ -601,6 +602,7 @@ fn spawn_child(
         SessionMode::NewShell { shell } => shell.command_builder(),
         SessionMode::Tmux { session } => {
             let tmux = which::which("tmux").map_err(|_error| RuntimeError::TmuxUnavailable)?;
+            prepare_tmux_server_environment(&tmux)?;
             prepare_tmux_session_environment(&tmux, session)?;
             let mut command = CommandBuilder::new(tmux);
             command.env_remove("TMUX");
@@ -635,8 +637,38 @@ fn apply_terminal_environment(command: &mut CommandBuilder) {
     command.env("CLICOLOR", "1");
     command.env("TERM_PROGRAM", TERMINAL_PROGRAM);
     command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-    command.env_remove("NO_COLOR");
-    command.env_remove("ANSI_COLORS_DISABLED");
+    for name in DISABLE_COLOR_ENV {
+        command.env_remove(name);
+    }
+}
+
+fn prepare_tmux_server_environment(tmux: &Path) -> Result<(), RuntimeError> {
+    if !tmux_server_exists(tmux)? {
+        return Ok(());
+    }
+
+    for name in DISABLE_COLOR_ENV {
+        run_tmux_environment_command(tmux, ["set-environment", "-g", "-u", name])?;
+    }
+    run_tmux_environment_command(
+        tmux,
+        ["set-environment", "-g", "COLORTERM", TERMINAL_COLOR_MODE],
+    )?;
+    run_tmux_environment_command(tmux, ["set-environment", "-g", "CLICOLOR", "1"])?;
+    run_tmux_environment_command(
+        tmux,
+        ["set-environment", "-g", "TERM_PROGRAM", TERMINAL_PROGRAM],
+    )?;
+    run_tmux_environment_command(
+        tmux,
+        [
+            "set-environment",
+            "-g",
+            "TERM_PROGRAM_VERSION",
+            env!("CARGO_PKG_VERSION"),
+        ],
+    )?;
+    Ok(())
 }
 
 fn prepare_tmux_session_environment(
@@ -647,20 +679,12 @@ fn prepare_tmux_session_environment(
         return Ok(());
     }
 
-    run_tmux_environment_command(
-        tmux,
-        ["set-environment", "-t", session.as_str(), "-u", "NO_COLOR"],
-    )?;
-    run_tmux_environment_command(
-        tmux,
-        [
-            "set-environment",
-            "-t",
-            session.as_str(),
-            "-u",
-            "ANSI_COLORS_DISABLED",
-        ],
-    )?;
+    for name in DISABLE_COLOR_ENV {
+        run_tmux_environment_command(
+            tmux,
+            ["set-environment", "-t", session.as_str(), "-u", name],
+        )?;
+    }
     run_tmux_environment_command(
         tmux,
         [
@@ -696,6 +720,22 @@ fn prepare_tmux_session_environment(
         ],
     )?;
     Ok(())
+}
+
+#[allow(
+    clippy::disallowed_types,
+    reason = "tmux probes run on the runtime actor's dedicated blocking thread before spawning \
+              tmux"
+)]
+fn tmux_server_exists(tmux: &Path) -> Result<bool, RuntimeError> {
+    let status = std::process::Command::new(tmux)
+        .env_remove("TMUX")
+        .arg("list-sessions")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| RuntimeError::Spawn(error.into()))?;
+    Ok(status.success())
 }
 
 #[allow(
@@ -1046,6 +1086,57 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_should_prepare_tmux_server_color_environment() -> anyhow::Result<()> {
+        let tmux = which::which("tmux").context("tmux unavailable")?;
+        let session_name =
+            SessionName::new(format!("termstage-global-env-test-{}", std::process::id()))?;
+        let _session_cleanup = TmuxSessionCleanup::new(tmux.clone(), session_name.clone());
+        let _environment_cleanup = TmuxGlobalEnvironmentCleanup::capture(
+            tmux.clone(),
+            [
+                "NO_COLOR",
+                "ANSI_COLORS_DISABLED",
+                "COLORTERM",
+                "CLICOLOR",
+                "TERM_PROGRAM",
+                "TERM_PROGRAM_VERSION",
+            ],
+        )?;
+        let status = Command::new(&tmux)
+            .env_remove("TMUX")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                session_name.as_str(),
+                "sleep",
+                "30",
+            ])
+            .status()
+            .context("failed to create tmux test session")?;
+        assert!(status.success());
+        set_tmux_global_test_environment(&tmux, "NO_COLOR", "1")?;
+        set_tmux_global_test_environment(&tmux, "ANSI_COLORS_DISABLED", "1")?;
+
+        prepare_tmux_server_environment(&tmux)?;
+
+        assert_eq!(tmux_global_environment_value(&tmux, "NO_COLOR")?, None);
+        assert_eq!(
+            tmux_global_environment_value(&tmux, "ANSI_COLORS_DISABLED")?,
+            None
+        );
+        assert_eq!(
+            tmux_global_environment_value(&tmux, "COLORTERM")?,
+            Some(TERMINAL_COLOR_MODE.to_owned())
+        );
+        assert_eq!(
+            tmux_global_environment_value(&tmux, "CLICOLOR")?,
+            Some("1".to_owned())
+        );
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_allow_controller_reattach_after_detach() -> anyhow::Result<()> {
         let config = RuntimeConfig {
@@ -1186,6 +1277,50 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct TmuxGlobalEnvironmentCleanup {
+        tmux: PathBuf,
+        values: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl TmuxGlobalEnvironmentCleanup {
+        fn capture<const N: usize>(
+            tmux: PathBuf,
+            names: [&'static str; N],
+        ) -> anyhow::Result<Self> {
+            let mut values = Vec::with_capacity(names.len());
+            for name in names {
+                values.push((name, tmux_global_environment_value(&tmux, name)?));
+            }
+            Ok(Self { tmux, values })
+        }
+    }
+
+    impl Drop for TmuxGlobalEnvironmentCleanup {
+        fn drop(&mut self) {
+            for (name, value) in &self.values {
+                match value {
+                    Some(value) => {
+                        let _result = Command::new(&self.tmux)
+                            .env_remove("TMUX")
+                            .args(["set-environment", "-g", name, value])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status();
+                    }
+                    None => {
+                        let _result = Command::new(&self.tmux)
+                            .env_remove("TMUX")
+                            .args(["set-environment", "-g", "-u", name])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status();
+                    }
+                }
+            }
+        }
+    }
+
     impl Drop for TmuxSessionCleanup {
         fn drop(&mut self) {
             let _result = Command::new(&self.tmux)
@@ -1215,6 +1350,23 @@ mod tests {
         }
     }
 
+    fn set_tmux_global_test_environment(
+        tmux: &Path,
+        name: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
+        let status = Command::new(tmux)
+            .env_remove("TMUX")
+            .args(["set-environment", "-g", name, value])
+            .status()
+            .with_context(|| format!("failed to set global tmux env {name}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!("tmux set-environment -g {name} exited with {status}");
+        }
+    }
+
     fn tmux_environment_value(
         tmux: &Path,
         session: &SessionName,
@@ -1225,6 +1377,22 @@ mod tests {
             .args(["show-environment", "-t", session.as_str(), name])
             .output()
             .with_context(|| format!("failed to read tmux env {name}"))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let line = String::from_utf8(output.stdout).context("tmux env output was not utf-8")?;
+        Ok(line
+            .trim()
+            .strip_prefix(&format!("{name}="))
+            .map(ToOwned::to_owned))
+    }
+
+    fn tmux_global_environment_value(tmux: &Path, name: &str) -> anyhow::Result<Option<String>> {
+        let output = Command::new(tmux)
+            .env_remove("TMUX")
+            .args(["show-environment", "-g", name])
+            .output()
+            .with_context(|| format!("failed to read global tmux env {name}"))?;
         if !output.status.success() {
             return Ok(None);
         }
