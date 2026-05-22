@@ -1,4 +1,5 @@
 import { FitAddon } from '@xterm/addon-fit';
+import { Unicode11Addon } from '@xterm/addon-unicode11';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { Terminal } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
@@ -12,6 +13,10 @@ export interface TerminalSurface {
 
 const WHEEL_PIXEL_LINE_HEIGHT = 40;
 const MAX_WHEEL_LINES = 24;
+const TERMINAL_FONT_FAMILY =
+  '"JetBrains Mono", "SFMono-Regular", "Cascadia Code", "Liberation Mono", ' +
+  '"DejaVu Sans Mono", "Noto Sans Mono", "Noto Sans Symbols 2", "Apple Symbols", ' +
+  '"Segoe UI Symbol", monospace';
 
 export async function createTerminalSurface(
   root: HTMLElement,
@@ -33,13 +38,12 @@ export async function createTerminalSurface(
   }
 
   const terminal = new Terminal({
-    allowProposedApi: false,
+    allowProposedApi: true,
     convertEol: true,
     cursorBlink: true,
     cursorStyle: 'block',
     disableStdin: false,
-    fontFamily:
-      '"JetBrains Mono", "SFMono-Regular", "Cascadia Code", "Liberation Mono", monospace',
+    fontFamily: TERMINAL_FONT_FAMILY,
     fontSize: settings.fontSize,
     fontWeight: '500',
     lineHeight: 1.12,
@@ -49,6 +53,8 @@ export async function createTerminalSurface(
   });
   const fitAddon = new FitAddon();
   terminal.loadAddon(fitAddon);
+  terminal.loadAddon(new Unicode11Addon());
+  terminal.unicode.activeVersion = '11';
   terminal.loadAddon(new WebLinksAddon());
   terminal.open(root);
   attachScrollbackWheelHandler(terminal);
