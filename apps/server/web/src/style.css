@@ -1,6 +1,27 @@
+@font-face {
+  font-family: 'Termstage Nerd Font';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url('./assets/fonts/JetBrainsMonoNLNerdFontMono-Regular.ttf') format('truetype');
+}
+
+@font-face {
+  font-family: 'Termstage Nerd Font';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 700;
+  src: url('./assets/fonts/JetBrainsMonoNLNerdFontMono-Bold.ttf') format('truetype');
+}
+
 :root {
   color-scheme: dark;
-  background: #080b0f;
+  --terminal-background: #0c2f38;
+  --terminal-foreground: #d5dee1;
+  --terminal-cursor: #f4d35e;
+  --terminal-selection-background: #225866;
+  --terminal-font-family: 'Termstage Nerd Font', monospace;
+  background: var(--terminal-background);
 }
 
 :root[data-theme='light'] {
@@ -26,10 +47,9 @@ body {
 
 #terminal-root {
   display: block;
+  position: relative;
   padding: clamp(12px, 2.5vw, 28px);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0)),
-    #080b0f;
+  background: var(--terminal-background);
 }
 
 :root[data-theme='light'] #terminal-root {
@@ -50,4 +70,78 @@ body {
 
 .xterm .xterm-rows {
   letter-spacing: 0;
+}
+
+.connection-status {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--terminal-background) 76%, transparent);
+  backdrop-filter: blur(2px);
+}
+
+.connection-status[hidden] {
+  display: none;
+}
+
+.connection-status__panel {
+  width: min(420px, 100%);
+  border: 1px solid color-mix(in srgb, var(--terminal-foreground) 18%, transparent);
+  border-radius: 8px;
+  padding: 24px 24px 22px;
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--terminal-background) 86%, #ffffff 14%),
+      color-mix(in srgb, var(--terminal-background) 94%, #000000 6%)
+    );
+  box-shadow:
+    0 26px 80px rgba(0, 0, 0, 0.42),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  color: var(--terminal-foreground);
+  font-family: var(--terminal-font-family);
+}
+
+.connection-status__panel::before {
+  display: block;
+  width: 42px;
+  height: 3px;
+  margin: 0 0 18px;
+  border-radius: 999px;
+  background: var(--terminal-cursor);
+  content: '';
+}
+
+.connection-status__panel h1 {
+  margin: 0 0 10px;
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: 0;
+}
+
+.connection-status__panel p {
+  margin: 0;
+  color: color-mix(in srgb, var(--terminal-foreground) 78%, transparent);
+  font-size: 15px;
+  line-height: 1.5;
+  letter-spacing: 0;
+}
+
+:root[data-theme='light'] .connection-status {
+  background: rgba(247, 250, 253, 0.78);
+}
+
+:root[data-theme='light'] .connection-status__panel {
+  border-color: rgba(7, 20, 36, 0.14);
+  background: #ffffff;
+  box-shadow: 0 24px 80px rgba(7, 20, 36, 0.18);
+  color: #071424;
+}
+
+:root[data-theme='light'] .connection-status__panel p {
+  color: #425466;
 }

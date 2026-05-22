@@ -8,141 +8,16 @@
       "assets/index.css"
     ],
     "assets": [
-      "assets/jetbrains-mono-cyrillic-400-normal.woff2",
-      "assets/jetbrains-mono-cyrillic-400-normal.woff",
-      "assets/jetbrains-mono-greek-400-normal.woff2",
-      "assets/jetbrains-mono-greek-400-normal.woff",
-      "assets/jetbrains-mono-vietnamese-400-normal.woff",
-      "assets/jetbrains-mono-latin-ext-400-normal.woff2",
-      "assets/jetbrains-mono-latin-ext-400-normal.woff",
-      "assets/jetbrains-mono-latin-400-normal.woff2",
-      "assets/jetbrains-mono-latin-400-normal.woff",
-      "assets/jetbrains-mono-cyrillic-500-normal.woff2",
-      "assets/jetbrains-mono-cyrillic-500-normal.woff",
-      "assets/jetbrains-mono-greek-500-normal.woff2",
-      "assets/jetbrains-mono-greek-500-normal.woff",
-      "assets/jetbrains-mono-vietnamese-500-normal.woff",
-      "assets/jetbrains-mono-latin-ext-500-normal.woff2",
-      "assets/jetbrains-mono-latin-ext-500-normal.woff",
-      "assets/jetbrains-mono-latin-500-normal.woff2",
-      "assets/jetbrains-mono-latin-500-normal.woff",
-      "assets/jetbrains-mono-cyrillic-700-normal.woff2",
-      "assets/jetbrains-mono-cyrillic-700-normal.woff",
-      "assets/jetbrains-mono-greek-700-normal.woff2",
-      "assets/jetbrains-mono-greek-700-normal.woff",
-      "assets/jetbrains-mono-vietnamese-700-normal.woff",
-      "assets/jetbrains-mono-latin-ext-700-normal.woff2",
-      "assets/jetbrains-mono-latin-ext-700-normal.woff",
-      "assets/jetbrains-mono-latin-700-normal.woff2",
-      "assets/jetbrains-mono-latin-700-normal.woff"
+      "assets/JetBrainsMonoNLNerdFontMono-Regular.ttf",
+      "assets/JetBrainsMonoNLNerdFontMono-Bold.ttf"
     ]
   },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-cyrillic-400-normal.woff": {
-    "file": "assets/jetbrains-mono-cyrillic-400-normal.woff",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-cyrillic-400-normal.woff"
+  "src/assets/fonts/JetBrainsMonoNLNerdFontMono-Bold.ttf": {
+    "file": "assets/JetBrainsMonoNLNerdFontMono-Bold.ttf",
+    "src": "src/assets/fonts/JetBrainsMonoNLNerdFontMono-Bold.ttf"
   },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-cyrillic-400-normal.woff2": {
-    "file": "assets/jetbrains-mono-cyrillic-400-normal.woff2",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-cyrillic-400-normal.woff2"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-cyrillic-500-normal.woff": {
-    "file": "assets/jetbrains-mono-cyrillic-500-normal.woff",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-cyrillic-500-normal.woff"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-cyrillic-500-normal.woff2": {
-    "file": "assets/jetbrains-mono-cyrillic-500-normal.woff2",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-cyrillic-500-normal.woff2"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-cyrillic-700-normal.woff": {
-    "file": "assets/jetbrains-mono-cyrillic-700-normal.woff",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-cyrillic-700-normal.woff"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-cyrillic-700-normal.woff2": {
-    "file": "assets/jetbrains-mono-cyrillic-700-normal.woff2",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-cyrillic-700-normal.woff2"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-greek-400-normal.woff": {
-    "file": "assets/jetbrains-mono-greek-400-normal.woff",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-greek-400-normal.woff"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-greek-400-normal.woff2": {
-    "file": "assets/jetbrains-mono-greek-400-normal.woff2",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-greek-400-normal.woff2"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-greek-500-normal.woff": {
-    "file": "assets/jetbrains-mono-greek-500-normal.woff",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-greek-500-normal.woff"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-greek-500-normal.woff2": {
-    "file": "assets/jetbrains-mono-greek-500-normal.woff2",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-greek-500-normal.woff2"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-greek-700-normal.woff": {
-    "file": "assets/jetbrains-mono-greek-700-normal.woff",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-greek-700-normal.woff"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-greek-700-normal.woff2": {
-    "file": "assets/jetbrains-mono-greek-700-normal.woff2",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-greek-700-normal.woff2"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-400-normal.woff": {
-    "file": "assets/jetbrains-mono-latin-400-normal.woff",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-400-normal.woff"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-400-normal.woff2": {
-    "file": "assets/jetbrains-mono-latin-400-normal.woff2",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-400-normal.woff2"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-500-normal.woff": {
-    "file": "assets/jetbrains-mono-latin-500-normal.woff",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-500-normal.woff"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-500-normal.woff2": {
-    "file": "assets/jetbrains-mono-latin-500-normal.woff2",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-500-normal.woff2"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-700-normal.woff": {
-    "file": "assets/jetbrains-mono-latin-700-normal.woff",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-700-normal.woff"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-700-normal.woff2": {
-    "file": "assets/jetbrains-mono-latin-700-normal.woff2",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-700-normal.woff2"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-ext-400-normal.woff": {
-    "file": "assets/jetbrains-mono-latin-ext-400-normal.woff",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-ext-400-normal.woff"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-ext-400-normal.woff2": {
-    "file": "assets/jetbrains-mono-latin-ext-400-normal.woff2",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-ext-400-normal.woff2"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-ext-500-normal.woff": {
-    "file": "assets/jetbrains-mono-latin-ext-500-normal.woff",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-ext-500-normal.woff"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-ext-500-normal.woff2": {
-    "file": "assets/jetbrains-mono-latin-ext-500-normal.woff2",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-ext-500-normal.woff2"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-ext-700-normal.woff": {
-    "file": "assets/jetbrains-mono-latin-ext-700-normal.woff",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-ext-700-normal.woff"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-ext-700-normal.woff2": {
-    "file": "assets/jetbrains-mono-latin-ext-700-normal.woff2",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-ext-700-normal.woff2"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-vietnamese-400-normal.woff": {
-    "file": "assets/jetbrains-mono-vietnamese-400-normal.woff",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-vietnamese-400-normal.woff"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-vietnamese-500-normal.woff": {
-    "file": "assets/jetbrains-mono-vietnamese-500-normal.woff",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-vietnamese-500-normal.woff"
-  },
-  "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-vietnamese-700-normal.woff": {
-    "file": "assets/jetbrains-mono-vietnamese-700-normal.woff",
-    "src": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-vietnamese-700-normal.woff"
+  "src/assets/fonts/JetBrainsMonoNLNerdFontMono-Regular.ttf": {
+    "file": "assets/JetBrainsMonoNLNerdFontMono-Regular.ttf",
+    "src": "src/assets/fonts/JetBrainsMonoNLNerdFontMono-Regular.ttf"
   }
 }

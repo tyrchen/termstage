@@ -34,26 +34,26 @@ const MAX_FONT_SIZE = 96;
 
 const THEMES: Record<PresentationThemeName, ThemePalette> = {
   'high-contrast': {
-    background: '#080b0f',
-    foreground: '#f4f7fb',
-    cursor: '#f8d84a',
-    selectionBackground: '#315f7a',
-    black: '#11151a',
-    red: '#ff5f57',
-    green: '#38d878',
-    yellow: '#f8d84a',
-    blue: '#54a6ff',
-    magenta: '#d186ff',
-    cyan: '#43d7d6',
-    white: '#d9e2ec',
-    brightBlack: '#6a7380',
-    brightRed: '#ff8a80',
-    brightGreen: '#72f0a0',
-    brightYellow: '#ffe978',
-    brightBlue: '#8ac7ff',
-    brightMagenta: '#e5b4ff',
-    brightCyan: '#78f0ef',
-    brightWhite: '#ffffff'
+    background: '#0c2f38',
+    foreground: '#d5dee1',
+    cursor: '#f4d35e',
+    selectionBackground: '#225866',
+    black: '#0b2028',
+    red: '#e76f51',
+    green: '#65d46e',
+    yellow: '#f4d35e',
+    blue: '#58c4dd',
+    magenta: '#d65a9f',
+    cyan: '#5fc9bd',
+    white: '#d5dee1',
+    brightBlack: '#6f858b',
+    brightRed: '#ff8a6b',
+    brightGreen: '#8de996',
+    brightYellow: '#ffe17a',
+    brightBlue: '#79d7ef',
+    brightMagenta: '#ea74b7',
+    brightCyan: '#83ded4',
+    brightWhite: '#f7fbfc'
   },
   light: {
     background: '#fbfcfe',
@@ -83,8 +83,16 @@ export function readPresentationSettings(): PresentationSettings {
   const params = new URLSearchParams(window.location.search);
   const fontSize = parseFontSize(params.get('fontSize'));
   const theme = parseTheme(params.get('theme'));
+  const palette = themePalette(theme);
   document.documentElement.dataset.theme = theme;
   document.documentElement.style.setProperty('--terminal-font-size', `${fontSize}px`);
+  document.documentElement.style.setProperty('--terminal-background', palette.background);
+  document.documentElement.style.setProperty('--terminal-foreground', palette.foreground);
+  document.documentElement.style.setProperty('--terminal-cursor', palette.cursor);
+  document.documentElement.style.setProperty(
+    '--terminal-selection-background',
+    palette.selectionBackground
+  );
   return { fontSize, theme };
 }
 

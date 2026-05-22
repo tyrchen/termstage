@@ -12,12 +12,15 @@ use axum::{
     },
     response::IntoResponse,
 };
+use rust_embed::Embed;
 use termstage_core::security::BasePath;
 
 const INDEX_HTML: &str = include_str!("../web/dist/index.html");
-const APP_JS: &[u8] = include_bytes!("../web/dist/assets/index.js");
-const APP_CSS: &str = include_str!("../web/dist/assets/index.css");
 const BASE_HREF_PLACEHOLDER: &str = "<!--TERMSTAGE_BASE_HREF-->";
+
+#[derive(Debug, Embed)]
+#[folder = "web/dist/assets/"]
+struct EmbeddedAssets;
 
 /// Serves the browser terminal HTML document.
 ///
@@ -41,10 +44,27 @@ pub fn index_response(base_path: Option<&BasePath>) -> Response<Body> {
 /// Serves a bundled static asset.
 #[must_use]
 pub fn asset_response(path: &str) -> Response<Body> {
-    match path {
-        "index.js" => response("text/javascript; charset=utf-8", Body::from(APP_JS)),
-        "index.css" => response("text/css; charset=utf-8", Body::from(APP_CSS)),
-        _ => StatusCode::NOT_FOUND.into_response(),
+    if let Some(asset) = EmbeddedAssets::get(path) {
+        response(
+            content_type_for_path(path),
+            Body::from(asset.data.into_owned()),
+        )
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+fn content_type_for_path(path: &str) -> &'static str {
+    let Some(extension) = path.rsplit('.').next() else {
+        return "application/octet-stream";
+    };
+    match extension {
+        "css" => "text/css; charset=utf-8",
+        "js" => "text/javascript; charset=utf-8",
+        "ttf" => "font/ttf",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
     }
 }
 
@@ -69,4 +89,34 @@ fn response(content_type: &'static str, body: Body) -> Response<Body> {
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_serve_embedded_font_asset() -> anyhow::Result<()> {
+        let font_path = EmbeddedAssets::iter()
+            .find(|path| path.ends_with(".ttf"))
+            .ok_or_else(|| anyhow::anyhow!("embedded nerd font asset"))?;
+        let response = asset_response(font_path.as_ref());
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .map(HeaderValue::as_bytes),
+            Some(b"font/ttf".as_slice()),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_unknown_embedded_asset() {
+        let response = asset_response("../index.js");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }

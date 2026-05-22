@@ -8,13 +8,14 @@ use std::{
     ffi::OsString,
     io::{Read, Write},
     path::{Path, PathBuf},
+    process::Stdio,
     sync::mpsc::{self, RecvTimeoutError},
     thread::{self, JoinHandle},
     time::Duration,
 };
 
 use bytes::Bytes;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, SlavePty, native_pty_system};
 use thiserror::Error;
 use tokio::sync::mpsc::{self as tokio_mpsc, error::TrySendError};
 use tracing::warn;
@@ -29,6 +30,10 @@ const CLIENT_OUTPUT_CAPACITY: usize = 256;
 const PTY_READ_CHUNK_SIZE: usize = 8192;
 const REPLAY_BUFFER_BYTES: usize = 1024 * 1024;
 const ACTOR_IDLE_WAIT: Duration = Duration::from_millis(10);
+const TERMINAL_TERM: &str = "xterm-256color";
+const TERMINAL_COLOR_MODE: &str = "truecolor";
+const TERMINAL_PROGRAM: &str = "termstage";
+const DISABLE_COLOR_ENV: [&str; 2] = ["NO_COLOR", "ANSI_COLORS_DISABLED"];
 
 /// Runtime failure.
 #[derive(Debug, Error)]
@@ -172,6 +177,15 @@ pub enum ReconnectPolicy {
     TerminateOnShutdown,
 }
 
+/// Behavior after the terminal child exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitPolicy {
+    /// Keep the browser session open and report the exited process.
+    Hold,
+    /// Close the browser session when the terminal child exits.
+    End,
+}
+
 /// Runtime configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
@@ -181,6 +195,8 @@ pub struct RuntimeConfig {
     pub initial_size: TerminalSize,
     /// Reconnect behavior.
     pub reconnect_policy: ReconnectPolicy,
+    /// Child process exit behavior.
+    pub exit_policy: ExitPolicy,
 }
 
 /// Reason for runtime shutdown.
@@ -190,6 +206,8 @@ pub enum ShutdownReason {
     Supervisor,
     /// The browser/client disconnected.
     ClientDisconnect,
+    /// A newer browser/client took over the controller role.
+    ControllerReplaced,
     /// The child process exited or the PTY reached EOF.
     ChildExit,
     /// Runtime error.
@@ -278,21 +296,27 @@ impl RuntimeSession {
         let (command_tx, command_rx) = tokio_mpsc::channel(COMMAND_MAILBOX_CAPACITY);
         let (pty_tx, pty_rx) = mpsc::sync_channel(COMMAND_MAILBOX_CAPACITY);
         let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
-        let reader = spawn_reader(reader, pty_tx)?;
+        let reader = spawn_reader(reader, pty_tx.clone(), 0)?;
+        let initial_size = config.initial_size;
         let actor = thread::Builder::new()
             .name("termstage-pty-actor".to_owned())
             .spawn(move || {
                 let actor = SessionActor {
                     config,
+                    slave: pair.slave,
                     master: pair.master,
                     writer,
                     child,
                     command_rx,
                     shutdown_rx,
                     pty_rx,
-                    reader,
+                    pty_tx,
+                    reader: Some(reader),
+                    reader_generation: 0,
                     clients: HashMap::new(),
                     controller: None,
+                    child_exited: false,
+                    current_size: initial_size,
                     replay: VecDeque::new(),
                     replay_bytes: 0,
                 };
@@ -368,7 +392,13 @@ impl Drop for RuntimeSession {
 }
 
 #[derive(Debug)]
-enum PtyEvent {
+struct PtyEvent {
+    generation: u64,
+    kind: PtyEventKind,
+}
+
+#[derive(Debug)]
+enum PtyEventKind {
     Output(Bytes),
     ReaderError(String),
     Eof,
@@ -385,15 +415,20 @@ impl ActorOutcome {
 
 struct SessionActor {
     config: RuntimeConfig,
+    slave: Box<dyn SlavePty + Send>,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
     command_rx: tokio_mpsc::Receiver<RuntimeCommand>,
     shutdown_rx: mpsc::Receiver<ShutdownReason>,
     pty_rx: mpsc::Receiver<PtyEvent>,
-    reader: JoinHandle<()>,
+    pty_tx: mpsc::SyncSender<PtyEvent>,
+    reader: Option<JoinHandle<()>>,
+    reader_generation: u64,
     clients: HashMap<ClientId, ClientOutputTx>,
     controller: Option<ClientId>,
+    child_exited: bool,
+    current_size: TerminalSize,
     replay: VecDeque<Bytes>,
     replay_bytes: usize,
 }
@@ -402,9 +437,22 @@ impl SessionActor {
     fn run(mut self) -> ActorOutcome {
         let reason = self.run_loop();
         self.close_clients(&reason);
-        drop(self.writer);
-        let _result = self.child.kill();
-        let _result = self.reader.join();
+        let Self {
+            slave,
+            master,
+            writer,
+            mut child,
+            reader,
+            ..
+        } = self;
+        let _result = child.kill();
+        drop(child);
+        drop(writer);
+        drop(master);
+        drop(slave);
+        if let Some(reader) = reader {
+            let _result = reader.join();
+        }
         ActorOutcome(Ok(()))
     }
 
@@ -415,8 +463,13 @@ impl SessionActor {
                 Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {}
             }
 
-            while let Ok(event) = self.pty_rx.try_recv() {
-                if let Some(reason) = self.handle_pty_event(event) {
+            if !self.child_exited {
+                while let Ok(event) = self.pty_rx.try_recv() {
+                    if let Some(reason) = self.handle_pty_event(event) {
+                        return reason;
+                    }
+                }
+                if let Some(reason) = self.poll_child_exit() {
                     return reason;
                 }
             }
@@ -434,14 +487,102 @@ impl SessionActor {
                 }
             }
 
-            match self.pty_rx.recv_timeout(ACTOR_IDLE_WAIT) {
-                Ok(event) => {
-                    if let Some(reason) = self.handle_pty_event(event) {
-                        return reason;
+            if self.child_exited {
+                thread::sleep(ACTOR_IDLE_WAIT);
+            } else {
+                match self.pty_rx.recv_timeout(ACTOR_IDLE_WAIT) {
+                    Ok(event) => {
+                        if let Some(reason) = self.handle_pty_event(event) {
+                            return reason;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        if let Some(reason) = self.handle_child_exit() {
+                            return reason;
+                        }
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return ShutdownReason::ChildExit,
+            }
+        }
+    }
+
+    fn handle_child_exit(&mut self) -> Option<ShutdownReason> {
+        if self.child_exited {
+            return None;
+        }
+
+        match self.config.exit_policy {
+            ExitPolicy::End => Some(ShutdownReason::ChildExit),
+            ExitPolicy::Hold => {
+                self.child_exited = true;
+                self.notify_process_exited();
+                None
+            }
+        }
+    }
+
+    fn poll_child_exit(&mut self) -> Option<ShutdownReason> {
+        match self.child.try_wait() {
+            Ok(Some(_status)) => self.handle_child_exit(),
+            Ok(None) => None,
+            Err(error) => Some(ShutdownReason::RuntimeError(error.to_string())),
+        }
+    }
+
+    fn handle_reader_error(&mut self, error: String) -> Option<ShutdownReason> {
+        match self.child.try_wait() {
+            Ok(Some(_status)) => self.handle_child_exit(),
+            Ok(None) | Err(_) => Some(ShutdownReason::RuntimeError(error)),
+        }
+    }
+
+    fn restart_child(&mut self) -> Result<(), RuntimeError> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(to_pty_size(self.current_size))
+            .map_err(RuntimeError::OpenPty)?;
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(RuntimeError::CloneReader)?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(RuntimeError::TakeWriter)?;
+        let child = spawn_child(&*pair.slave, &self.config.mode)?;
+        let next_generation = self.reader_generation.saturating_add(1);
+        let old_reader =
+            self.reader
+                .replace(spawn_reader(reader, self.pty_tx.clone(), next_generation)?);
+        self.reader_generation = next_generation;
+        self.slave = pair.slave;
+        self.master = pair.master;
+        self.writer = writer;
+        self.child = child;
+        if let Some(reader) = old_reader {
+            let _result = reader.join();
+        }
+        self.child_exited = false;
+        self.replay.clear();
+        self.replay_bytes = 0;
+        Ok(())
+    }
+
+    fn notify_process_exited(&mut self) {
+        let message = ClientOutput::Control(ServerControlMessage::ProcessExited {
+            message: SafeMessage::from_static("The terminal process exited."),
+        });
+        let mut closed = Vec::new();
+        for (client_id, output) in &self.clients {
+            if output.try_send(message.clone()).is_err() {
+                closed.push(*client_id);
+            }
+        }
+        for client_id in closed {
+            self.clients.remove(&client_id);
+            if self.controller == Some(client_id) {
+                self.controller = None;
             }
         }
     }
@@ -449,15 +590,14 @@ impl SessionActor {
     fn handle_command(&mut self, command: RuntimeCommand) -> Option<ShutdownReason> {
         match command {
             RuntimeCommand::AttachClient { client_id, output } => {
-                self.attach_client(client_id, output);
-                None
+                self.attach_client(client_id, output)
             }
             RuntimeCommand::DetachClient { client_id } => {
                 self.detach_client(client_id);
                 None
             }
             RuntimeCommand::Input { client_id, bytes } => {
-                if self.controller == Some(client_id) {
+                if self.controller == Some(client_id) && !self.child_exited {
                     match self
                         .writer
                         .write_all(&bytes)
@@ -470,41 +610,58 @@ impl SessionActor {
                     None
                 }
             }
-            RuntimeCommand::Resize { size } => self
-                .master
-                .resize(to_pty_size(size))
-                .err()
-                .map(|error| ShutdownReason::RuntimeError(error.to_string())),
+            RuntimeCommand::Resize { size } => {
+                self.current_size = size;
+                if self.child_exited {
+                    None
+                } else {
+                    self.master
+                        .resize(to_pty_size(size))
+                        .err()
+                        .map(|error| ShutdownReason::RuntimeError(error.to_string()))
+                }
+            }
             RuntimeCommand::Shutdown { reason } => Some(reason),
         }
     }
 
     fn handle_pty_event(&mut self, event: PtyEvent) -> Option<ShutdownReason> {
-        match event {
-            PtyEvent::Output(bytes) => {
+        if event.generation != self.reader_generation {
+            return None;
+        }
+
+        match event.kind {
+            PtyEventKind::Output(bytes) => {
                 self.record_replay(bytes.clone());
                 self.broadcast_bytes(&bytes);
                 None
             }
-            PtyEvent::ReaderError(error) => Some(ShutdownReason::RuntimeError(error)),
-            PtyEvent::Eof => Some(ShutdownReason::ChildExit),
+            PtyEventKind::ReaderError(error) => self.handle_reader_error(error),
+            PtyEventKind::Eof => self.handle_child_exit(),
         }
     }
 
-    fn attach_client(&mut self, client_id: ClientId, output: ClientOutputTx) {
-        if self
-            .controller
-            .is_some_and(|controller| controller != client_id)
+    fn attach_client(
+        &mut self,
+        client_id: ClientId,
+        output: ClientOutputTx,
+    ) -> Option<ShutdownReason> {
+        if self.child_exited
+            && let Err(error) = self.restart_child()
         {
-            if let Some(message) = safe_message("another controller is already attached") {
-                let warning = ClientOutput::Control(ServerControlMessage::Warning {
-                    code: WarningCode::ClientBackpressure,
-                    message,
-                });
-                let _result = output.try_send(warning);
+            let reason = ShutdownReason::RuntimeError(error.to_string());
+            let _result = output.try_send(ClientOutput::Closed(reason.clone()));
+            return Some(reason);
+        }
+
+        match self.controller {
+            Some(controller) if controller != client_id => {
+                if let Some(previous) = self.clients.remove(&controller) {
+                    let _result =
+                        previous.try_send(ClientOutput::Closed(ShutdownReason::ControllerReplaced));
+                }
             }
-            let _result = output.try_send(ClientOutput::Closed(ShutdownReason::ClientDisconnect));
-            return;
+            Some(_) | None => {}
         }
 
         self.controller = Some(client_id);
@@ -517,15 +674,16 @@ impl SessionActor {
         };
         if output.try_send(ready).is_err() {
             self.controller = None;
-            return;
+            return None;
         }
         for bytes in &self.replay {
             if output.try_send(ClientOutput::Bytes(bytes.clone())).is_err() {
                 self.controller = None;
-                return;
+                return None;
             }
         }
         self.clients.insert(client_id, output);
+        None
     }
 
     fn detach_client(&mut self, client_id: ClientId) {
@@ -600,22 +758,187 @@ fn spawn_child(
         SessionMode::NewShell { shell } => shell.command_builder(),
         SessionMode::Tmux { session } => {
             let tmux = which::which("tmux").map_err(|_error| RuntimeError::TmuxUnavailable)?;
+            prepare_tmux_server_environment(&tmux)?;
+            prepare_tmux_session_environment(&tmux, session)?;
             let mut command = CommandBuilder::new(tmux);
             command.env_remove("TMUX");
+            command.arg("-2");
+            command.arg("-T");
+            command.arg("RGB");
             command.arg("new-session");
             command.arg("-A");
+            command.arg("-e");
+            command.arg(format!("COLORTERM={TERMINAL_COLOR_MODE}"));
+            command.arg("-e");
+            command.arg("CLICOLOR=1");
+            command.arg("-e");
+            command.arg(format!("TERM_PROGRAM={TERMINAL_PROGRAM}"));
+            command.arg("-e");
+            command.arg(format!(
+                "TERM_PROGRAM_VERSION={}",
+                env!("CARGO_PKG_VERSION")
+            ));
             command.arg("-s");
             command.arg(session.as_str());
             command
         }
     };
-    command.env("TERM", "xterm-256color");
+    apply_terminal_environment(&mut command);
     slave.spawn_command(command).map_err(RuntimeError::Spawn)
+}
+
+fn apply_terminal_environment(command: &mut CommandBuilder) {
+    command.env("TERM", TERMINAL_TERM);
+    command.env("COLORTERM", TERMINAL_COLOR_MODE);
+    command.env("CLICOLOR", "1");
+    command.env("TERM_PROGRAM", TERMINAL_PROGRAM);
+    command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    for name in DISABLE_COLOR_ENV {
+        command.env_remove(name);
+    }
+}
+
+fn prepare_tmux_server_environment(tmux: &Path) -> Result<(), RuntimeError> {
+    if !tmux_server_exists(tmux)? {
+        return Ok(());
+    }
+
+    for name in DISABLE_COLOR_ENV {
+        run_tmux_environment_command(tmux, ["set-environment", "-g", "-u", name])?;
+    }
+    run_tmux_environment_command(
+        tmux,
+        ["set-environment", "-g", "COLORTERM", TERMINAL_COLOR_MODE],
+    )?;
+    run_tmux_environment_command(tmux, ["set-environment", "-g", "CLICOLOR", "1"])?;
+    run_tmux_environment_command(
+        tmux,
+        ["set-environment", "-g", "TERM_PROGRAM", TERMINAL_PROGRAM],
+    )?;
+    run_tmux_environment_command(
+        tmux,
+        [
+            "set-environment",
+            "-g",
+            "TERM_PROGRAM_VERSION",
+            env!("CARGO_PKG_VERSION"),
+        ],
+    )?;
+    Ok(())
+}
+
+fn prepare_tmux_session_environment(
+    tmux: &Path,
+    session: &SessionName,
+) -> Result<(), RuntimeError> {
+    if !tmux_session_exists(tmux, session)? {
+        return Ok(());
+    }
+
+    for name in DISABLE_COLOR_ENV {
+        run_tmux_environment_command(
+            tmux,
+            ["set-environment", "-t", session.as_str(), "-u", name],
+        )?;
+    }
+    run_tmux_environment_command(
+        tmux,
+        [
+            "set-environment",
+            "-t",
+            session.as_str(),
+            "COLORTERM",
+            TERMINAL_COLOR_MODE,
+        ],
+    )?;
+    run_tmux_environment_command(
+        tmux,
+        ["set-environment", "-t", session.as_str(), "CLICOLOR", "1"],
+    )?;
+    run_tmux_environment_command(
+        tmux,
+        [
+            "set-environment",
+            "-t",
+            session.as_str(),
+            "TERM_PROGRAM",
+            TERMINAL_PROGRAM,
+        ],
+    )?;
+    run_tmux_environment_command(
+        tmux,
+        [
+            "set-environment",
+            "-t",
+            session.as_str(),
+            "TERM_PROGRAM_VERSION",
+            env!("CARGO_PKG_VERSION"),
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(
+    clippy::disallowed_types,
+    reason = "tmux probes run on the runtime actor's dedicated blocking thread before spawning \
+              tmux"
+)]
+fn tmux_server_exists(tmux: &Path) -> Result<bool, RuntimeError> {
+    let status = std::process::Command::new(tmux)
+        .env_remove("TMUX")
+        .arg("list-sessions")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| RuntimeError::Spawn(error.into()))?;
+    Ok(status.success())
+}
+
+#[allow(
+    clippy::disallowed_types,
+    reason = "tmux probes run on the runtime actor's dedicated blocking thread before spawning \
+              tmux"
+)]
+fn tmux_session_exists(tmux: &Path, session: &SessionName) -> Result<bool, RuntimeError> {
+    let status = std::process::Command::new(tmux)
+        .env_remove("TMUX")
+        .arg("has-session")
+        .arg("-t")
+        .arg(session.as_str())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| RuntimeError::Spawn(error.into()))?;
+    Ok(status.success())
+}
+
+#[allow(
+    clippy::disallowed_types,
+    reason = "tmux environment setup runs on the runtime actor's dedicated blocking thread before \
+              spawning tmux"
+)]
+fn run_tmux_environment_command<const N: usize>(
+    tmux: &Path,
+    args: [&str; N],
+) -> Result<(), RuntimeError> {
+    let status = std::process::Command::new(tmux)
+        .env_remove("TMUX")
+        .args(args)
+        .status()
+        .map_err(|error| RuntimeError::Spawn(error.into()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(RuntimeError::Spawn(anyhow::anyhow!(
+            "tmux environment command exited with {status}"
+        )))
+    }
 }
 
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     pty_tx: mpsc::SyncSender<PtyEvent>,
+    generation: u64,
 ) -> Result<JoinHandle<()>, RuntimeError> {
     thread::Builder::new()
         .name("termstage-pty-reader".to_owned())
@@ -624,24 +947,35 @@ fn spawn_reader(
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => {
-                        let _result = pty_tx.send(PtyEvent::Eof);
+                        let _result = pty_tx.send(PtyEvent {
+                            generation,
+                            kind: PtyEventKind::Eof,
+                        });
                         break;
                     }
                     Ok(read) => {
                         let Some(chunk) = buffer.get(..read) else {
-                            let _result =
-                                pty_tx.send(PtyEvent::ReaderError("invalid pty read size".into()));
+                            let _result = pty_tx.send(PtyEvent {
+                                generation,
+                                kind: PtyEventKind::ReaderError("invalid pty read size".into()),
+                            });
                             break;
                         };
                         if pty_tx
-                            .send(PtyEvent::Output(Bytes::copy_from_slice(chunk)))
+                            .send(PtyEvent {
+                                generation,
+                                kind: PtyEventKind::Output(Bytes::copy_from_slice(chunk)),
+                            })
                             .is_err()
                         {
                             break;
                         }
                     }
                     Err(error) => {
-                        let _result = pty_tx.send(PtyEvent::ReaderError(error.to_string()));
+                        let _result = pty_tx.send(PtyEvent {
+                            generation,
+                            kind: PtyEventKind::ReaderError(error.to_string()),
+                        });
                         break;
                     }
                 }
@@ -675,11 +1009,20 @@ fn safe_fallback_message(_error: ProtocolError) -> SafeMessage {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_types,
+    reason = "runtime tests use blocking subprocess probes to validate tmux integration"
+)]
 mod tests {
-    use std::time::Instant;
+    use std::{ffi::OsStr, process::Command, time::Instant};
 
     use anyhow::Context;
-    use tokio::time::{sleep, timeout};
+    use tokio::{
+        sync::Mutex,
+        time::{sleep, timeout},
+    };
+
+    static TMUX_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     use super::*;
 
@@ -693,6 +1036,24 @@ mod tests {
             [OsString::from("--noprofile"), OsString::from("--norc")],
         )
         .map_err(Into::into)
+    }
+
+    #[test]
+    fn test_should_advertise_truecolor_terminal_environment() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.env("NO_COLOR", "1");
+        command.env("ANSI_COLORS_DISABLED", "1");
+        apply_terminal_environment(&mut command);
+
+        assert_eq!(command.get_env("TERM"), Some(OsStr::new("xterm-256color")));
+        assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
+        assert_eq!(command.get_env("CLICOLOR"), Some(OsStr::new("1")));
+        assert_eq!(
+            command.get_env("TERM_PROGRAM"),
+            Some(OsStr::new("termstage"))
+        );
+        assert_eq!(command.get_env("NO_COLOR"), None);
+        assert_eq!(command.get_env("ANSI_COLORS_DISABLED"), None);
     }
 
     async fn recv_until_contains(
@@ -720,6 +1081,42 @@ mod tests {
         anyhow::bail!("runtime output did not contain requested marker");
     }
 
+    async fn recv_until_closed(
+        output: &mut ClientOutputRx,
+        reason: ShutdownReason,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let message = timeout(remaining, output.recv())
+                .await
+                .context("test runtime output timed out")?
+                .context("client output channel closed")?;
+            if message == ClientOutput::Closed(reason.clone()) {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("runtime output did not close with requested reason");
+    }
+
+    async fn recv_until_process_exited(output: &mut ClientOutputRx) -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let message = timeout(remaining, output.recv())
+                .await
+                .context("test runtime output timed out")?
+                .context("client output channel closed")?;
+            if matches!(
+                message,
+                ClientOutput::Control(ServerControlMessage::ProcessExited { .. })
+            ) {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("runtime output did not report process exit");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_start_shell_attach_input_resize_detach_and_shutdown() -> anyhow::Result<()>
     {
@@ -729,6 +1126,7 @@ mod tests {
             },
             initial_size: test_size()?,
             reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::Hold,
         };
         let session = RuntimeSession::start(config)?;
         let (output_tx, mut output_rx) = RuntimeSession::client_mailbox();
@@ -775,15 +1173,13 @@ mod tests {
     async fn test_should_report_child_exit() -> anyhow::Result<()> {
         let shell = ShellCommand::new(
             "/bin/sh",
-            [
-                OsString::from("-c"),
-                OsString::from("printf done; sleep 0.2"),
-            ],
+            [OsString::from("-c"), OsString::from("printf done")],
         )?;
         let config = RuntimeConfig {
             mode: SessionMode::NewShell { shell },
             initial_size: test_size()?,
             reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::End,
         };
         let session = RuntimeSession::start(config)?;
         let (output_tx, mut output_rx) = RuntimeSession::client_mailbox();
@@ -796,12 +1192,75 @@ mod tests {
         let _ready = output_rx.recv().await.context("ready output")?;
         let output = recv_until_contains(&mut output_rx, b"done").await?;
         assert!(output.windows(4).any(|window| window == b"done"));
+        recv_until_closed(&mut output_rx, ShutdownReason::ChildExit).await?;
+        drop(session);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_hold_session_after_child_exit() -> anyhow::Result<()> {
+        let shell = test_shell_command()?;
+        let config = RuntimeConfig {
+            mode: SessionMode::NewShell { shell },
+            initial_size: test_size()?,
+            reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::Hold,
+        };
+        let session = RuntimeSession::start(config)?;
+        let (output_tx, mut output_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(1),
+                output: output_tx,
+            })
+            .await?;
+        let _ready = output_rx.recv().await.context("ready output")?;
+        session
+            .send(RuntimeCommand::Input {
+                client_id: ClientId::new(1),
+                bytes: Bytes::from_static(b"exit\n"),
+            })
+            .await?;
+        recv_until_process_exited(&mut output_rx)
+            .await
+            .context("initial process exit notice")?;
+
+        let (reattach_tx, mut reattach_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(2),
+                output: reattach_tx,
+            })
+            .await?;
+        let ready = reattach_rx.recv().await.context("reattach ready output")?;
+        assert!(
+            matches!(
+                ready,
+                ClientOutput::Control(ServerControlMessage::Ready { .. })
+            ),
+            "{ready:?}"
+        );
+        session
+            .send(RuntimeCommand::Input {
+                client_id: ClientId::new(2),
+                bytes: Bytes::from_static(b"printf restarted-after-exit\\n\n"),
+            })
+            .await?;
+        let output = recv_until_contains(&mut reattach_rx, b"restarted-after-exit")
+            .await
+            .context("restart output")?;
+        assert!(
+            output
+                .windows(b"restarted-after-exit".len())
+                .any(|window| window == b"restarted-after-exit")
+        );
         session.shutdown(ShutdownReason::Supervisor).await?;
         Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_start_tmux_mode() -> anyhow::Result<()> {
+        let _tmux_guard = TMUX_TEST_LOCK.lock().await;
         let session_name = SessionName::new(format!("termstage-test-{}", std::process::id()))?;
         let config = RuntimeConfig {
             mode: SessionMode::Tmux {
@@ -809,6 +1268,7 @@ mod tests {
             },
             initial_size: test_size()?,
             reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::Hold,
         };
         let session = RuntimeSession::start(config)?;
         let (output_tx, mut output_rx) = RuntimeSession::client_mailbox();
@@ -838,6 +1298,101 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_should_prepare_existing_tmux_session_color_environment() -> anyhow::Result<()> {
+        let _tmux_guard = TMUX_TEST_LOCK.lock().await;
+        let tmux = which::which("tmux").context("tmux unavailable")?;
+        let session_name = SessionName::new(format!("termstage-env-test-{}", std::process::id()))?;
+        let _cleanup = TmuxSessionCleanup::new(tmux.clone(), session_name.clone());
+        let status = Command::new(&tmux)
+            .env_remove("TMUX")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                session_name.as_str(),
+                "sleep",
+                "30",
+            ])
+            .status()
+            .context("failed to create tmux test session")?;
+        assert!(status.success());
+        set_tmux_test_environment(&tmux, &session_name, "NO_COLOR", "1")?;
+        set_tmux_test_environment(&tmux, &session_name, "ANSI_COLORS_DISABLED", "1")?;
+
+        prepare_tmux_session_environment(&tmux, &session_name)?;
+
+        assert_eq!(
+            tmux_environment_value(&tmux, &session_name, "NO_COLOR")?,
+            None
+        );
+        assert_eq!(
+            tmux_environment_value(&tmux, &session_name, "ANSI_COLORS_DISABLED")?,
+            None
+        );
+        assert_eq!(
+            tmux_environment_value(&tmux, &session_name, "COLORTERM")?,
+            Some(TERMINAL_COLOR_MODE.to_owned())
+        );
+        assert_eq!(
+            tmux_environment_value(&tmux, &session_name, "CLICOLOR")?,
+            Some("1".to_owned())
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_should_prepare_tmux_server_color_environment() -> anyhow::Result<()> {
+        let _tmux_guard = TMUX_TEST_LOCK.lock().await;
+        let tmux = which::which("tmux").context("tmux unavailable")?;
+        let session_name =
+            SessionName::new(format!("termstage-global-env-test-{}", std::process::id()))?;
+        let _session_cleanup = TmuxSessionCleanup::new(tmux.clone(), session_name.clone());
+        let _environment_cleanup = TmuxGlobalEnvironmentCleanup::capture(
+            tmux.clone(),
+            [
+                "NO_COLOR",
+                "ANSI_COLORS_DISABLED",
+                "COLORTERM",
+                "CLICOLOR",
+                "TERM_PROGRAM",
+                "TERM_PROGRAM_VERSION",
+            ],
+        )?;
+        let status = Command::new(&tmux)
+            .env_remove("TMUX")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                session_name.as_str(),
+                "sleep",
+                "30",
+            ])
+            .status()
+            .context("failed to create tmux test session")?;
+        assert!(status.success());
+        set_tmux_global_test_environment(&tmux, "NO_COLOR", "1")?;
+        set_tmux_global_test_environment(&tmux, "ANSI_COLORS_DISABLED", "1")?;
+
+        prepare_tmux_server_environment(&tmux)?;
+
+        assert_eq!(tmux_global_environment_value(&tmux, "NO_COLOR")?, None);
+        assert_eq!(
+            tmux_global_environment_value(&tmux, "ANSI_COLORS_DISABLED")?,
+            None
+        );
+        assert_eq!(
+            tmux_global_environment_value(&tmux, "COLORTERM")?,
+            Some(TERMINAL_COLOR_MODE.to_owned())
+        );
+        assert_eq!(
+            tmux_global_environment_value(&tmux, "CLICOLOR")?,
+            Some("1".to_owned())
+        );
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_allow_controller_reattach_after_detach() -> anyhow::Result<()> {
         let config = RuntimeConfig {
@@ -846,6 +1401,7 @@ mod tests {
             },
             initial_size: test_size()?,
             reconnect_policy: ReconnectPolicy::KeepAlive,
+            exit_policy: ExitPolicy::Hold,
         };
         let session = RuntimeSession::start(config)?;
         let (first_tx, mut first_rx) = RuntimeSession::client_mailbox();
@@ -907,6 +1463,205 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_replace_existing_controller_on_new_attach() -> anyhow::Result<()> {
+        let config = RuntimeConfig {
+            mode: SessionMode::NewShell {
+                shell: test_shell_command()?,
+            },
+            initial_size: test_size()?,
+            reconnect_policy: ReconnectPolicy::KeepAlive,
+            exit_policy: ExitPolicy::Hold,
+        };
+        let session = RuntimeSession::start(config)?;
+        let (first_tx, mut first_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(1),
+                output: first_tx,
+            })
+            .await?;
+        let first_ready = first_rx.recv().await.context("first ready output")?;
+        assert!(matches!(
+            first_ready,
+            ClientOutput::Control(ServerControlMessage::Ready { .. })
+        ));
+
+        let (second_tx, mut second_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(2),
+                output: second_tx,
+            })
+            .await?;
+
+        recv_until_closed(&mut first_rx, ShutdownReason::ControllerReplaced).await?;
+        let second_ready = second_rx.recv().await.context("second ready output")?;
+        assert!(matches!(
+            second_ready,
+            ClientOutput::Control(ServerControlMessage::Ready { .. })
+        ));
+        session
+            .send(RuntimeCommand::Input {
+                client_id: ClientId::new(1),
+                bytes: Bytes::from_static(b"printf should-not-run\\n\n"),
+            })
+            .await?;
+        session
+            .send(RuntimeCommand::Input {
+                client_id: ClientId::new(2),
+                bytes: Bytes::from_static(b"printf replacement-controller-ok\\n\n"),
+            })
+            .await?;
+        let second_output =
+            recv_until_contains(&mut second_rx, b"replacement-controller-ok").await?;
+        assert!(
+            second_output
+                .windows(b"replacement-controller-ok".len())
+                .any(|window| window == b"replacement-controller-ok")
+        );
+        session.shutdown(ShutdownReason::Supervisor).await?;
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct TmuxSessionCleanup {
+        tmux: PathBuf,
+        session: SessionName,
+    }
+
+    impl TmuxSessionCleanup {
+        fn new(tmux: PathBuf, session: SessionName) -> Self {
+            Self { tmux, session }
+        }
+    }
+
+    #[derive(Debug)]
+    struct TmuxGlobalEnvironmentCleanup {
+        tmux: PathBuf,
+        values: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl TmuxGlobalEnvironmentCleanup {
+        fn capture<const N: usize>(
+            tmux: PathBuf,
+            names: [&'static str; N],
+        ) -> anyhow::Result<Self> {
+            let mut values = Vec::with_capacity(names.len());
+            for name in names {
+                values.push((name, tmux_global_environment_value(&tmux, name)?));
+            }
+            Ok(Self { tmux, values })
+        }
+    }
+
+    impl Drop for TmuxGlobalEnvironmentCleanup {
+        fn drop(&mut self) {
+            for (name, value) in &self.values {
+                match value {
+                    Some(value) => {
+                        let _result = Command::new(&self.tmux)
+                            .env_remove("TMUX")
+                            .args(["set-environment", "-g", name, value])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status();
+                    }
+                    None => {
+                        let _result = Command::new(&self.tmux)
+                            .env_remove("TMUX")
+                            .args(["set-environment", "-g", "-u", name])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status();
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for TmuxSessionCleanup {
+        fn drop(&mut self) {
+            let _result = Command::new(&self.tmux)
+                .env_remove("TMUX")
+                .args(["kill-session", "-t", self.session.as_str()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+
+    fn set_tmux_test_environment(
+        tmux: &Path,
+        session: &SessionName,
+        name: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
+        let status = Command::new(tmux)
+            .env_remove("TMUX")
+            .args(["set-environment", "-t", session.as_str(), name, value])
+            .status()
+            .with_context(|| format!("failed to set tmux env {name}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!("tmux set-environment {name} exited with {status}");
+        }
+    }
+
+    fn set_tmux_global_test_environment(
+        tmux: &Path,
+        name: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
+        let status = Command::new(tmux)
+            .env_remove("TMUX")
+            .args(["set-environment", "-g", name, value])
+            .status()
+            .with_context(|| format!("failed to set global tmux env {name}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!("tmux set-environment -g {name} exited with {status}");
+        }
+    }
+
+    fn tmux_environment_value(
+        tmux: &Path,
+        session: &SessionName,
+        name: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let output = Command::new(tmux)
+            .env_remove("TMUX")
+            .args(["show-environment", "-t", session.as_str(), name])
+            .output()
+            .with_context(|| format!("failed to read tmux env {name}"))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let line = String::from_utf8(output.stdout).context("tmux env output was not utf-8")?;
+        Ok(line
+            .trim()
+            .strip_prefix(&format!("{name}="))
+            .map(ToOwned::to_owned))
+    }
+
+    fn tmux_global_environment_value(tmux: &Path, name: &str) -> anyhow::Result<Option<String>> {
+        let output = Command::new(tmux)
+            .env_remove("TMUX")
+            .args(["show-environment", "-g", name])
+            .output()
+            .with_context(|| format!("failed to read global tmux env {name}"))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let line = String::from_utf8(output.stdout).context("tmux env output was not utf-8")?;
+        Ok(line
+            .trim()
+            .strip_prefix(&format!("{name}="))
+            .map(ToOwned::to_owned))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_replay_recent_output_after_reattach() -> anyhow::Result<()> {
         let config = RuntimeConfig {
             mode: SessionMode::NewShell {
@@ -914,6 +1669,7 @@ mod tests {
             },
             initial_size: test_size()?,
             reconnect_policy: ReconnectPolicy::KeepAlive,
+            exit_policy: ExitPolicy::Hold,
         };
         let session = RuntimeSession::start(config)?;
         let (first_tx, mut first_rx) = RuntimeSession::client_mailbox();
@@ -968,6 +1724,7 @@ mod tests {
             },
             initial_size: test_size()?,
             reconnect_policy: ReconnectPolicy::KeepAlive,
+            exit_policy: ExitPolicy::Hold,
         };
         let session = RuntimeSession::start(config)?;
         let (slow_tx, mut slow_rx) = tokio_mpsc::channel(1);
