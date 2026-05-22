@@ -3,6 +3,12 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+declare global {
+  interface Window {
+    __termstageMockSocketCount?: number;
+  }
+}
+
 test('terminal app renders and round-trips through the Rust PTY bridge', async ({
   page
 }, testInfo) => {
@@ -118,6 +124,72 @@ test('terminal app stops reconnecting when another browser takes over', async ({
     await expect(secondPage.locator('.xterm-rows')).toContainText('controller-after-replace');
   } finally {
     await secondPage.close();
+    await server.stop();
+  }
+});
+
+test('terminal app reconnects after ambiguous session-ended socket close', async ({
+  page
+}, testInfo) => {
+  const server = await startTermstageServer();
+  try {
+    testInfo.attach('launch-url-redacted', {
+      body: server.url.replace(/token=[^&]+/, 'token=[REDACTED]'),
+      contentType: 'text/plain'
+    });
+    await page.addInitScript(() => {
+      let socketCount = 0;
+
+      class MockTerminalWebSocket extends EventTarget {
+        static readonly CONNECTING = 0;
+        static readonly OPEN = 1;
+        static readonly CLOSING = 2;
+        static readonly CLOSED = 3;
+
+        readonly url: string;
+        binaryType: BinaryType = 'arraybuffer';
+        readyState = MockTerminalWebSocket.CONNECTING;
+
+        constructor(url: string | URL) {
+          super();
+          this.url = url.toString();
+          socketCount += 1;
+          window.__termstageMockSocketCount = socketCount;
+          window.setTimeout(() => {
+            this.readyState = MockTerminalWebSocket.OPEN;
+            this.dispatchEvent(new Event('open'));
+            if (socketCount === 1) {
+              window.setTimeout(() => {
+                this.readyState = MockTerminalWebSocket.CLOSED;
+                this.dispatchEvent(
+                  new CloseEvent('close', {
+                    code: 1000,
+                    reason: 'session ended',
+                    wasClean: true
+                  })
+                );
+              }, 20);
+            }
+          }, 0);
+        }
+
+        close(): void {
+          this.readyState = MockTerminalWebSocket.CLOSED;
+          this.dispatchEvent(new CloseEvent('close', { code: 1000, wasClean: true }));
+        }
+
+        send(_data: string | ArrayBufferLike | Blob | ArrayBufferView): void {}
+      }
+
+      window.WebSocket = MockTerminalWebSocket as unknown as typeof WebSocket;
+    });
+    await page.goto(server.url);
+    await expect(page.locator('.xterm')).toBeVisible();
+    await expect
+      .poll(() => page.evaluate(() => window.__termstageMockSocketCount ?? 0))
+      .toBeGreaterThan(1);
+    await expect(page.getByRole('dialog')).toBeHidden();
+  } finally {
     await server.stop();
   }
 });
