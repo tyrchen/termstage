@@ -3,6 +3,41 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [termstage-v0.3.2](https://github.com/compare/termstage-v0.3.1..termstage-v0.3.2) - 2026-05-23
+
+### Miscellaneous Chores
+
+- bump version - ([ec282c1](https://github.com/commit/ec282c18f2c6a72a580d85bc3589364f74965026)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([ba9c4a4](https://github.com/commit/ba9c4a442b6440f120627e8d6049d859c0e4162e)) - Tyr Chen
+- Fix reconnect loop after long replay (#7)
+
+## Summary
+- bound runtime replay by chunk count as well as bytes so reattach
+cannot overfill the client mailbox
+- keep recent replay best-effort with mailbox headroom for live output
+- add server-side WebSocket protocol pings to keep idle proxy paths
+active below JS timer throttling
+- enable tmux mouse scrolling and set a larger session history limit
+before attaching the browser PTY
+
+## Verification
+- cargo build
+- cargo test
+- cargo +nightly fmt --check
+- cargo clippy -- -D warnings -W clippy::pedantic
+- cargo clippy -- -D warnings -W clippy::pedantic -W clippy::unwrap_used
+-W clippy::expect_used -W clippy::indexing_slicing -W clippy::panic
+- cargo audit
+- cargo deny check
+
+## Notes
+`cargo deny check` exited successfully with existing warnings about
+unmatched license allowances and duplicate crate versions. - ([bccf8d5](https://github.com/commit/bccf8d5f3b40091f742d6b769bd99ad91881f369)) - Tyr Chen
+
+---
 ## [termstage-v0.3.1](https://github.com/compare/termstage-v0.3.0..termstage-v0.3.1) - 2026-05-22
 
 ### Miscellaneous Chores
