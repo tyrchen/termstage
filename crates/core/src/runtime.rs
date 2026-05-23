@@ -29,10 +29,12 @@ const COMMAND_MAILBOX_CAPACITY: usize = 128;
 const CLIENT_OUTPUT_CAPACITY: usize = 256;
 const PTY_READ_CHUNK_SIZE: usize = 8192;
 const REPLAY_BUFFER_BYTES: usize = 1024 * 1024;
+const REPLAY_BUFFER_CHUNKS: usize = CLIENT_OUTPUT_CAPACITY / 2;
 const ACTOR_IDLE_WAIT: Duration = Duration::from_millis(10);
 const TERMINAL_TERM: &str = "xterm-256color";
 const TERMINAL_COLOR_MODE: &str = "truecolor";
 const TERMINAL_PROGRAM: &str = "termstage";
+const TMUX_HISTORY_LIMIT: &str = "100000";
 const DISABLE_COLOR_ENV: [&str; 2] = ["NO_COLOR", "ANSI_COLORS_DISABLED"];
 
 /// Runtime failure.
@@ -737,15 +739,19 @@ impl SessionActor {
     }
 
     fn record_replay(&mut self, bytes: Bytes) {
-        self.replay_bytes = self.replay_bytes.saturating_add(bytes.len());
-        self.replay.push_back(bytes);
-        while self.replay_bytes > REPLAY_BUFFER_BYTES {
-            if let Some(removed) = self.replay.pop_front() {
-                self.replay_bytes = self.replay_bytes.saturating_sub(removed.len());
-            } else {
-                self.replay_bytes = 0;
-                break;
-            }
+        record_replay_chunk(&mut self.replay, &mut self.replay_bytes, bytes);
+    }
+}
+
+fn record_replay_chunk(replay: &mut VecDeque<Bytes>, replay_bytes: &mut usize, bytes: Bytes) {
+    *replay_bytes = replay_bytes.saturating_add(bytes.len());
+    replay.push_back(bytes);
+    while *replay_bytes > REPLAY_BUFFER_BYTES || replay.len() > REPLAY_BUFFER_CHUNKS {
+        if let Some(removed) = replay.pop_front() {
+            *replay_bytes = replay_bytes.saturating_sub(removed.len());
+        } else {
+            *replay_bytes = 0;
+            break;
         }
     }
 }
@@ -759,26 +765,16 @@ fn spawn_child(
         SessionMode::Tmux { session } => {
             let tmux = which::which("tmux").map_err(|_error| RuntimeError::TmuxUnavailable)?;
             prepare_tmux_server_environment(&tmux)?;
+            ensure_tmux_session(&tmux, session)?;
             prepare_tmux_session_environment(&tmux, session)?;
+            prepare_tmux_session_options(&tmux, session)?;
             let mut command = CommandBuilder::new(tmux);
             command.env_remove("TMUX");
             command.arg("-2");
             command.arg("-T");
             command.arg("RGB");
-            command.arg("new-session");
-            command.arg("-A");
-            command.arg("-e");
-            command.arg(format!("COLORTERM={TERMINAL_COLOR_MODE}"));
-            command.arg("-e");
-            command.arg("CLICOLOR=1");
-            command.arg("-e");
-            command.arg(format!("TERM_PROGRAM={TERMINAL_PROGRAM}"));
-            command.arg("-e");
-            command.arg(format!(
-                "TERM_PROGRAM_VERSION={}",
-                env!("CARGO_PKG_VERSION")
-            ));
-            command.arg("-s");
+            command.arg("attach-session");
+            command.arg("-t");
             command.arg(session.as_str());
             command
         }
@@ -831,10 +827,6 @@ fn prepare_tmux_session_environment(
     tmux: &Path,
     session: &SessionName,
 ) -> Result<(), RuntimeError> {
-    if !tmux_session_exists(tmux, session)? {
-        return Ok(());
-    }
-
     for name in DISABLE_COLOR_ENV {
         run_tmux_environment_command(
             tmux,
@@ -878,6 +870,29 @@ fn prepare_tmux_session_environment(
     Ok(())
 }
 
+fn ensure_tmux_session(tmux: &Path, session: &SessionName) -> Result<(), RuntimeError> {
+    if tmux_session_exists(tmux, session)? {
+        return Ok(());
+    }
+
+    create_tmux_session(tmux, session)
+}
+
+fn prepare_tmux_session_options(tmux: &Path, session: &SessionName) -> Result<(), RuntimeError> {
+    run_tmux_option_command(tmux, ["set-option", "-t", session.as_str(), "mouse", "on"])?;
+    run_tmux_option_command(
+        tmux,
+        [
+            "set-option",
+            "-t",
+            session.as_str(),
+            "history-limit",
+            TMUX_HISTORY_LIMIT,
+        ],
+    )?;
+    Ok(())
+}
+
 #[allow(
     clippy::disallowed_types,
     reason = "tmux probes run on the runtime actor's dedicated blocking thread before spawning \
@@ -914,6 +929,47 @@ fn tmux_session_exists(tmux: &Path, session: &SessionName) -> Result<bool, Runti
 
 #[allow(
     clippy::disallowed_types,
+    reason = "tmux session creation runs on the runtime actor's dedicated blocking thread before \
+              spawning tmux"
+)]
+fn create_tmux_session(tmux: &Path, session: &SessionName) -> Result<(), RuntimeError> {
+    let status = std::process::Command::new(tmux)
+        .env_remove("TMUX")
+        .env("TERM", TERMINAL_TERM)
+        .env("COLORTERM", TERMINAL_COLOR_MODE)
+        .env("CLICOLOR", "1")
+        .env("TERM_PROGRAM", TERMINAL_PROGRAM)
+        .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"))
+        .env_remove("NO_COLOR")
+        .env_remove("ANSI_COLORS_DISABLED")
+        .arg("new-session")
+        .arg("-d")
+        .arg("-s")
+        .arg(session.as_str())
+        .arg("-e")
+        .arg(format!("COLORTERM={TERMINAL_COLOR_MODE}"))
+        .arg("-e")
+        .arg("CLICOLOR=1")
+        .arg("-e")
+        .arg(format!("TERM_PROGRAM={TERMINAL_PROGRAM}"))
+        .arg("-e")
+        .arg(format!(
+            "TERM_PROGRAM_VERSION={}",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .status()
+        .map_err(|error| RuntimeError::Spawn(error.into()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(RuntimeError::Spawn(anyhow::anyhow!(
+            "tmux new-session exited with {status}"
+        )))
+    }
+}
+
+#[allow(
+    clippy::disallowed_types,
     reason = "tmux environment setup runs on the runtime actor's dedicated blocking thread before \
               spawning tmux"
 )]
@@ -931,6 +987,29 @@ fn run_tmux_environment_command<const N: usize>(
     } else {
         Err(RuntimeError::Spawn(anyhow::anyhow!(
             "tmux environment command exited with {status}"
+        )))
+    }
+}
+
+#[allow(
+    clippy::disallowed_types,
+    reason = "tmux option setup runs on the runtime actor's dedicated blocking thread before \
+              spawning tmux"
+)]
+fn run_tmux_option_command<const N: usize>(
+    tmux: &Path,
+    args: [&str; N],
+) -> Result<(), RuntimeError> {
+    let status = std::process::Command::new(tmux)
+        .env_remove("TMUX")
+        .args(args)
+        .status()
+        .map_err(|error| RuntimeError::Spawn(error.into()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(RuntimeError::Spawn(anyhow::anyhow!(
+            "tmux option command exited with {status}"
         )))
     }
 }
@@ -1014,7 +1093,7 @@ fn safe_fallback_message(_error: ProtocolError) -> SafeMessage {
     reason = "runtime tests use blocking subprocess probes to validate tmux integration"
 )]
 mod tests {
-    use std::{ffi::OsStr, process::Command, time::Instant};
+    use std::{collections::VecDeque, ffi::OsStr, process::Command, time::Instant};
 
     use anyhow::Context;
     use tokio::{
@@ -1342,6 +1421,70 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_should_prepare_existing_tmux_session_scroll_options() -> anyhow::Result<()> {
+        let _tmux_guard = TMUX_TEST_LOCK.lock().await;
+        let tmux = which::which("tmux").context("tmux unavailable")?;
+        let session_name =
+            SessionName::new(format!("termstage-scroll-test-{}", std::process::id()))?;
+        let _cleanup = TmuxSessionCleanup::new(tmux.clone(), session_name.clone());
+        let status = Command::new(&tmux)
+            .env_remove("TMUX")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                session_name.as_str(),
+                "sleep",
+                "30",
+            ])
+            .status()
+            .context("failed to create tmux test session")?;
+        assert!(status.success());
+        set_tmux_session_option(&tmux, &session_name, "mouse", "off")?;
+        set_tmux_session_option(&tmux, &session_name, "history-limit", "2000")?;
+
+        prepare_tmux_session_options(&tmux, &session_name)?;
+
+        assert_eq!(
+            tmux_option_value(&tmux, &session_name, "mouse")?,
+            Some("on".to_owned())
+        );
+        assert_eq!(
+            tmux_option_value(&tmux, &session_name, "history-limit")?,
+            Some(TMUX_HISTORY_LIMIT.to_owned())
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_should_create_tmux_session_before_attach() -> anyhow::Result<()> {
+        let _tmux_guard = TMUX_TEST_LOCK.lock().await;
+        let tmux = which::which("tmux").context("tmux unavailable")?;
+        let session_name =
+            SessionName::new(format!("termstage-ensure-test-{}", std::process::id()))?;
+        let _cleanup = TmuxSessionCleanup::new(tmux.clone(), session_name.clone());
+
+        ensure_tmux_session(&tmux, &session_name)?;
+        prepare_tmux_session_environment(&tmux, &session_name)?;
+        prepare_tmux_session_options(&tmux, &session_name)?;
+
+        assert!(tmux_session_exists(&tmux, &session_name)?);
+        assert_eq!(
+            tmux_environment_value(&tmux, &session_name, "COLORTERM")?,
+            Some(TERMINAL_COLOR_MODE.to_owned())
+        );
+        assert_eq!(
+            tmux_option_value(&tmux, &session_name, "mouse")?,
+            Some("on".to_owned())
+        );
+        assert_eq!(
+            tmux_option_value(&tmux, &session_name, "history-limit")?,
+            Some(TMUX_HISTORY_LIMIT.to_owned())
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_should_prepare_tmux_server_color_environment() -> anyhow::Result<()> {
         let _tmux_guard = TMUX_TEST_LOCK.lock().await;
         let tmux = which::which("tmux").context("tmux unavailable")?;
@@ -1625,6 +1768,24 @@ mod tests {
         }
     }
 
+    fn set_tmux_session_option(
+        tmux: &Path,
+        session: &SessionName,
+        name: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
+        let status = Command::new(tmux)
+            .env_remove("TMUX")
+            .args(["set-option", "-t", session.as_str(), name, value])
+            .status()
+            .with_context(|| format!("failed to set tmux option {name}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!("tmux set-option {name} exited with {status}");
+        }
+    }
+
     fn tmux_environment_value(
         tmux: &Path,
         session: &SessionName,
@@ -1642,6 +1803,26 @@ mod tests {
         Ok(line
             .trim()
             .strip_prefix(&format!("{name}="))
+            .map(ToOwned::to_owned))
+    }
+
+    fn tmux_option_value(
+        tmux: &Path,
+        session: &SessionName,
+        name: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let output = Command::new(tmux)
+            .env_remove("TMUX")
+            .args(["show-options", "-t", session.as_str(), name])
+            .output()
+            .with_context(|| format!("failed to read tmux option {name}"))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let line = String::from_utf8(output.stdout).context("tmux option output was not utf-8")?;
+        Ok(line
+            .trim()
+            .strip_prefix(&format!("{name} "))
             .map(ToOwned::to_owned))
     }
 
@@ -1714,6 +1895,36 @@ mod tests {
         );
         session.shutdown(ShutdownReason::Supervisor).await?;
         Ok(())
+    }
+
+    #[test]
+    fn test_should_bound_replay_by_chunks_with_mailbox_headroom() {
+        let total_chunks = CLIENT_OUTPUT_CAPACITY + 25;
+        let mut replay = VecDeque::new();
+        let mut replay_bytes = 0;
+
+        for index in 0..total_chunks {
+            record_replay_chunk(
+                &mut replay,
+                &mut replay_bytes,
+                Bytes::from(format!("chunk-{index:03}")),
+            );
+        }
+
+        assert_eq!(replay.len(), REPLAY_BUFFER_CHUNKS);
+        assert!(replay.len() + 1 < CLIENT_OUTPUT_CAPACITY);
+        assert_eq!(replay_bytes, replay.iter().map(Bytes::len).sum::<usize>());
+        assert_eq!(
+            replay.front(),
+            Some(&Bytes::from(format!(
+                "chunk-{:03}",
+                total_chunks - REPLAY_BUFFER_CHUNKS
+            )))
+        );
+        assert_eq!(
+            replay.back(),
+            Some(&Bytes::from(format!("chunk-{:03}", total_chunks - 1)))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
