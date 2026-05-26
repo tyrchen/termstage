@@ -1,26 +1,27 @@
-# Local/Remote Command Lease Design
+# Shell Mode Local/Remote Lease Design
 
-Status: draft v1
+Status: draft v2
 Last updated: 2026-05-26
 
 ## 1. Problem
 
 `termstage` currently starts a browser terminal whose primary controller is the
-browser. That works for presentation-first flows, but it does not support a wrapper
-shape such as `termstage claude` or `termstage codex` where the command feels native
-in the invoking terminal while also being visible and controllable from the browser.
+browser. That works for presentation-first flows, but shell mode also needs an
+operator-local shape where the shell process feels native in the invoking terminal
+while also being visible and controllable from the browser.
 
 The new mode must preserve TTY semantics for interactive CLIs. The child process
 must run inside a PTY, not through ordinary piped stdin/stdout, so color, raw mode,
 cursor movement, Ctrl-C, paste, and resize behavior remain compatible with native
-terminal execution.
+terminal execution. This is an extension of `--mode shell`, not a separate
+positional subcommand mode.
 
 ## 2. Goals
 
 | # | Goal | Measure |
 | --- | --- | --- |
-| G1 | Launch an arbitrary subcommand as the terminal process. | `termstage -- claude` and `termstage -- codex` run the requested command in the local terminal frontend. |
-| G2 | Keep `termstage` lifecycle coupled to the subcommand. | When the child exits or is killed, the local frontend exits and the web server shuts down. |
+| G1 | Launch shell-mode commands with argv support. | `termstage --mode shell --command claude --attach-local-terminal` and `termstage --mode shell --command codemax -g claude --attach-local-terminal` run the requested command in the local terminal frontend. |
+| G2 | Keep `termstage` lifecycle coupled to explicit shell-mode commands. | When the configured command exits or is killed, the web server shuts down unless the operator explicitly sets `--exit-policy hold`. |
 | G3 | Make remote browser readonly at startup. | Browser attach receives a lease state where `terminal` owns input until browser sends terminal bytes. |
 | G4 | Support explicit input takeover. | First real browser input transfers ownership to browser; first real local terminal input transfers ownership back to terminal. |
 | G5 | Notify both sides about control changes. | Runtime emits a lease control frame to browser clients and local terminal frontend on each ownership epoch change. |
@@ -35,25 +36,28 @@ terminal execution.
   connection remains the active browser endpoint; previous browser controllers are
   closed as before.
 
-## 4. Command Mode
+## 4. Shell Mode Local Terminal Attachment
 
-The CLI accepts an optional trailing subcommand:
+The CLI extends existing shell mode instead of adding a new positional
+subcommand. `--attach-local-terminal` is valid only with `--mode shell`. When present,
+the configured shell-mode command becomes the PTY child process and the
+invoking terminal becomes a local frontend.
 
 ```bash
-termstage -- claude
-termstage -- codex
-termstage -- cargo test
+termstage --mode shell --command claude --attach-local-terminal
+termstage --mode shell --command codemax -g claude --attach-local-terminal
+termstage --mode shell --command cargo -g test --attach-local-terminal
 ```
 
-When present, this command becomes the PTY child process. The local terminal is
-placed into raw mode and becomes a first-class runtime client. The server still
-starts in the background and prints or opens the tokenized browser URL before raw
-mode starts.
+Without `--attach-local-terminal`, shell mode keeps the existing browser-first behavior.
+With `--attach-local-terminal`, the local terminal is placed into raw mode and becomes a
+first-class runtime client. The server still starts in the background and prints
+or opens the tokenized browser URL before raw mode starts.
 
 ```text
 Terminal process
   │
-  │ termstage -- claude
+  │ termstage --mode shell --command claude --attach-local-terminal
   ▼
 ┌────────────────────────────────────────────────────────────────────┐
 │ termstage wrapper                                                  │
@@ -72,7 +76,7 @@ Terminal process
 │                                                                 │ PTY
 └─────────────────────────────────────────────────────────────────┼───────┘
                                                                   ▼
-                                                           claude/codex/etc.
+                                                           shell-mode child
 ```
 
 ## 5. Lease State Machine
@@ -111,7 +115,7 @@ Events:
 
   child exit
     close all clients
-    command mode supervisor shuts down the web server
+    local-terminal shell-mode supervisor shuts down the web server
 ```
 
 Resize, heartbeat, reconnect, and attach are not input ownership events. Only bytes
@@ -148,6 +152,6 @@ the runtime can transfer the lease.
 - Depends on [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md)
   for actor ownership and PTY lifecycle.
 - Extends [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md)
-  with trailing subcommand execution.
+  with shell-mode local terminal attachment and shell argv support.
 - Extends [70-browser-terminal-security-design.md](./70-browser-terminal-security-design.md)
   without changing the trust boundary.

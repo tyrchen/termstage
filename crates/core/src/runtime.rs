@@ -359,6 +359,14 @@ impl RuntimeSession {
         self.commands.clone()
     }
 
+    /// Returns whether the runtime actor thread has exited.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.actor
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+    }
+
     /// Creates a bounded client output mailbox.
     #[must_use]
     pub fn client_mailbox() -> (ClientOutputTx, ClientOutputRx) {
