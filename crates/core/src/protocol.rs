@@ -424,6 +424,16 @@ pub enum ErrorCode {
     Forbidden,
 }
 
+/// Current input lease owner.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum LeaseOwner {
+    /// The local terminal frontend owns input.
+    Terminal,
+    /// The browser frontend owns input.
+    Browser,
+}
+
 /// Server-to-browser JSON control frame.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
@@ -432,6 +442,22 @@ pub enum ServerControlMessage {
     Ready {
         /// Active session name.
         session: SessionName,
+    },
+    /// Runtime terminal size changed.
+    SizeChanged {
+        /// Current PTY size.
+        size: TerminalSize,
+    },
+    /// The runtime is about to replay buffered terminal output.
+    ReplayStarted,
+    /// The runtime finished replaying buffered terminal output.
+    ReplayFinished,
+    /// Input lease ownership changed.
+    LeaseChanged {
+        /// Current lease owner.
+        owner: LeaseOwner,
+        /// Monotonic lease epoch for this runtime session.
+        epoch: u64,
     },
     /// The terminal process exited while the server kept the session open.
     ProcessExited {
@@ -558,6 +584,23 @@ mod tests {
         );
         let decoded: ServerControlMessage = serde_json::from_str(&json)?;
         assert_eq!(decoded, message);
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_round_trip_replay_markers_as_camel_case() -> anyhow::Result<()> {
+        let started = serde_json::to_string(&ServerControlMessage::ReplayStarted)?;
+        assert_eq!(started, r#"{"type":"replayStarted"}"#);
+        let finished = serde_json::to_string(&ServerControlMessage::ReplayFinished)?;
+        assert_eq!(finished, r#"{"type":"replayFinished"}"#);
+        assert_eq!(
+            serde_json::from_str::<ServerControlMessage>(&started)?,
+            ServerControlMessage::ReplayStarted
+        );
+        assert_eq!(
+            serde_json::from_str::<ServerControlMessage>(&finished)?,
+            ServerControlMessage::ReplayFinished
+        );
         Ok(())
     }
 

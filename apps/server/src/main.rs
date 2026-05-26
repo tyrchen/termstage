@@ -2,6 +2,7 @@
 
 mod assets;
 mod cli;
+mod local_terminal;
 mod web;
 
 #[tokio::main]

@@ -440,7 +440,7 @@ async fn bridge_socket(state: AppState, socket: WebSocket) {
                         match serde_json::from_str::<ClientControlMessage>(&text) {
                             Ok(ClientControlMessage::Resize { cols, rows }) => {
                                 let size = TerminalSize { cols, rows };
-                                if send_runtime(&state.inner.commands, RuntimeCommand::Resize { size }).await.is_err() {
+                                if send_runtime(&state.inner.commands, RuntimeCommand::BrowserResize { client_id, size }).await.is_err() {
                                     let _result = sender.send(Message::Close(Some(runtime_unavailable_close()))).await;
                                     break;
                                 }

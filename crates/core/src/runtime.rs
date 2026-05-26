@@ -21,8 +21,8 @@ use tokio::sync::mpsc::{self as tokio_mpsc, error::TrySendError};
 use tracing::warn;
 
 use crate::protocol::{
-    ErrorCode, ProtocolError, SafeMessage, ServerControlMessage, SessionName, TerminalSize,
-    WarningCode,
+    ErrorCode, LeaseOwner, ProtocolError, SafeMessage, ServerControlMessage, SessionName,
+    TerminalSize, WarningCode,
 };
 
 const COMMAND_MAILBOX_CAPACITY: usize = 128;
@@ -236,6 +236,11 @@ pub enum ClientOutput {
 /// Runtime actor command.
 #[derive(Debug)]
 pub enum RuntimeCommand {
+    /// Attach the local terminal frontend.
+    AttachTerminal {
+        /// Bounded output mailbox.
+        output: ClientOutputTx,
+    },
     /// Attach a write-capable browser client.
     AttachClient {
         /// Client id.
@@ -248,6 +253,11 @@ pub enum RuntimeCommand {
         /// Client id.
         client_id: ClientId,
     },
+    /// Write bytes to the PTY from the local terminal frontend.
+    TerminalInput {
+        /// Terminal bytes.
+        bytes: Bytes,
+    },
     /// Write bytes to the PTY from the controlling client.
     Input {
         /// Client id.
@@ -257,6 +267,13 @@ pub enum RuntimeCommand {
     },
     /// Resize the PTY.
     Resize {
+        /// New PTY size.
+        size: TerminalSize,
+    },
+    /// Resize the PTY from a browser client.
+    BrowserResize {
+        /// Client id.
+        client_id: ClientId,
         /// New PTY size.
         size: TerminalSize,
     },
@@ -315,8 +332,11 @@ impl RuntimeSession {
                     pty_tx,
                     reader: Some(reader),
                     reader_generation: 0,
+                    terminal: None,
                     clients: HashMap::new(),
-                    controller: None,
+                    client_sizes: HashMap::new(),
+                    browser_controller: None,
+                    lease: InputLease::terminal(),
                     child_exited: false,
                     current_size: initial_size,
                     replay: VecDeque::new(),
@@ -427,12 +447,45 @@ struct SessionActor {
     pty_tx: mpsc::SyncSender<PtyEvent>,
     reader: Option<JoinHandle<()>>,
     reader_generation: u64,
+    terminal: Option<ClientOutputTx>,
     clients: HashMap<ClientId, ClientOutputTx>,
-    controller: Option<ClientId>,
+    client_sizes: HashMap<ClientId, TerminalSize>,
+    browser_controller: Option<ClientId>,
+    lease: InputLease,
     child_exited: bool,
     current_size: TerminalSize,
     replay: VecDeque<Bytes>,
     replay_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InputLease {
+    owner: InputLeaseOwner,
+    epoch: u64,
+}
+
+impl InputLease {
+    const fn terminal() -> Self {
+        Self {
+            owner: InputLeaseOwner::Terminal,
+            epoch: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputLeaseOwner {
+    Terminal,
+    Browser(ClientId),
+}
+
+impl InputLeaseOwner {
+    const fn protocol_owner(self) -> LeaseOwner {
+        match self {
+            Self::Terminal => LeaseOwner::Terminal,
+            Self::Browser(_client_id) => LeaseOwner::Browser,
+        }
+    }
 }
 
 impl SessionActor {
@@ -576,6 +629,11 @@ impl SessionActor {
             message: SafeMessage::from_static("The terminal process exited."),
         });
         let mut closed = Vec::new();
+        if let Some(output) = &self.terminal
+            && output.try_send(message.clone()).is_err()
+        {
+            self.terminal = None;
+        }
         for (client_id, output) in &self.clients {
             if output.try_send(message.clone()).is_err() {
                 closed.push(*client_id);
@@ -583,14 +641,15 @@ impl SessionActor {
         }
         for client_id in closed {
             self.clients.remove(&client_id);
-            if self.controller == Some(client_id) {
-                self.controller = None;
+            if self.browser_controller == Some(client_id) {
+                self.browser_controller = None;
             }
         }
     }
 
     fn handle_command(&mut self, command: RuntimeCommand) -> Option<ShutdownReason> {
         match command {
+            RuntimeCommand::AttachTerminal { output } => self.attach_terminal(output),
             RuntimeCommand::AttachClient { client_id, output } => {
                 self.attach_client(client_id, output)
             }
@@ -598,33 +657,59 @@ impl SessionActor {
                 self.detach_client(client_id);
                 None
             }
-            RuntimeCommand::Input { client_id, bytes } => {
-                if self.controller == Some(client_id) && !self.child_exited {
-                    match self
-                        .writer
-                        .write_all(&bytes)
-                        .and_then(|()| self.writer.flush())
-                    {
-                        Ok(()) => None,
-                        Err(error) => Some(ShutdownReason::RuntimeError(error.to_string())),
-                    }
+            RuntimeCommand::TerminalInput { bytes } => {
+                if self.terminal.is_some() && !self.child_exited {
+                    self.claim_terminal();
+                    self.write_input(&bytes)
                 } else {
                     None
                 }
             }
-            RuntimeCommand::Resize { size } => {
-                self.current_size = size;
-                if self.child_exited {
-                    None
+            RuntimeCommand::Input { client_id, bytes } => {
+                if self.browser_controller == Some(client_id) && !self.child_exited {
+                    self.claim_browser(client_id);
+                    self.write_input(&bytes)
                 } else {
-                    self.master
-                        .resize(to_pty_size(size))
-                        .err()
-                        .map(|error| ShutdownReason::RuntimeError(error.to_string()))
+                    None
+                }
+            }
+            RuntimeCommand::Resize { size } => self.resize(size),
+            RuntimeCommand::BrowserResize { client_id, size } => {
+                self.client_sizes.insert(client_id, size);
+                if self.should_apply_browser_resize(client_id) {
+                    self.resize(size)
+                } else {
+                    None
                 }
             }
             RuntimeCommand::Shutdown { reason } => Some(reason),
         }
+    }
+
+    fn resize(&mut self, size: TerminalSize) -> Option<ShutdownReason> {
+        self.current_size = size;
+        let resize_result = if self.child_exited {
+            Ok(())
+        } else {
+            self.master
+                .resize(to_pty_size(size))
+                .map_err(|error| ShutdownReason::RuntimeError(error.to_string()))
+        };
+        match resize_result {
+            Ok(()) => {
+                self.broadcast_size();
+                None
+            }
+            Err(reason) => Some(reason),
+        }
+    }
+
+    fn write_input(&mut self, bytes: &[u8]) -> Option<ShutdownReason> {
+        self.writer
+            .write_all(bytes)
+            .and_then(|()| self.writer.flush())
+            .err()
+            .map(|error| ShutdownReason::RuntimeError(error.to_string()))
     }
 
     fn handle_pty_event(&mut self, event: PtyEvent) -> Option<ShutdownReason> {
@@ -656,17 +741,18 @@ impl SessionActor {
             return Some(reason);
         }
 
-        match self.controller {
+        match self.browser_controller {
             Some(controller) if controller != client_id => {
                 if let Some(previous) = self.clients.remove(&controller) {
                     let _result =
                         previous.try_send(ClientOutput::Closed(ShutdownReason::ControllerReplaced));
                 }
+                self.client_sizes.remove(&controller);
             }
             Some(_) | None => {}
         }
 
-        self.controller = Some(client_id);
+        self.browser_controller = Some(client_id);
         let ready = match display_session_name(&self.config.mode) {
             Ok(session) => ClientOutput::Control(ServerControlMessage::Ready { session }),
             Err(error) => ClientOutput::Control(ServerControlMessage::Error {
@@ -675,28 +761,92 @@ impl SessionActor {
             }),
         };
         if output.try_send(ready).is_err() {
-            self.controller = None;
+            self.browser_controller = None;
+            return None;
+        }
+        if output.try_send(self.current_size_message()).is_err() {
+            self.browser_controller = None;
+            return None;
+        }
+        if self.should_send_lease_to_browser() && self.send_current_lease_to(&output).is_err() {
+            self.browser_controller = None;
+            return None;
+        }
+        if output
+            .try_send(ClientOutput::Control(ServerControlMessage::ReplayStarted))
+            .is_err()
+        {
+            self.browser_controller = None;
             return None;
         }
         for bytes in &self.replay {
             if output.try_send(ClientOutput::Bytes(bytes.clone())).is_err() {
-                self.controller = None;
+                self.browser_controller = None;
                 return None;
             }
+        }
+        if output
+            .try_send(ClientOutput::Control(ServerControlMessage::ReplayFinished))
+            .is_err()
+        {
+            self.browser_controller = None;
+            return None;
         }
         self.clients.insert(client_id, output);
         None
     }
 
+    fn attach_terminal(&mut self, output: ClientOutputTx) -> Option<ShutdownReason> {
+        if self.child_exited
+            && let Err(error) = self.restart_child()
+        {
+            let reason = ShutdownReason::RuntimeError(error.to_string());
+            let _result = output.try_send(ClientOutput::Closed(reason.clone()));
+            return Some(reason);
+        }
+
+        self.terminal = Some(output);
+        if self.lease.owner == InputLeaseOwner::Terminal {
+            self.broadcast_lease();
+        } else {
+            self.claim_terminal();
+        }
+        let replay: Vec<Bytes> = self.replay.iter().cloned().collect();
+        for bytes in replay {
+            let Some(output) = &self.terminal else {
+                return None;
+            };
+            if output.try_send(ClientOutput::Bytes(bytes)).is_err() {
+                self.terminal = None;
+                return None;
+            }
+        }
+        None
+    }
+
+    fn should_send_lease_to_browser(&self) -> bool {
+        self.terminal.is_some() || matches!(self.lease.owner, InputLeaseOwner::Browser(_))
+    }
+
+    fn should_apply_browser_resize(&self, client_id: ClientId) -> bool {
+        self.terminal.is_none() && self.browser_controller == Some(client_id)
+    }
+
     fn detach_client(&mut self, client_id: ClientId) {
         self.clients.remove(&client_id);
-        if self.controller == Some(client_id) {
-            self.controller = None;
+        self.client_sizes.remove(&client_id);
+        if self.browser_controller == Some(client_id) {
+            self.browser_controller = None;
         }
     }
 
     fn broadcast_bytes(&mut self, bytes: &Bytes) {
         let mut closed = Vec::new();
+        if let Some(output) = &self.terminal
+            && output.try_send(ClientOutput::Bytes(bytes.clone())).is_err()
+        {
+            self.terminal = None;
+        }
         for (client_id, output) in &self.clients {
             match output.try_send(ClientOutput::Bytes(bytes.clone())) {
                 Ok(()) => {}
@@ -725,21 +875,106 @@ impl SessionActor {
             }
             let _result = output.try_send(ClientOutput::Closed(ShutdownReason::ClientDisconnect));
         }
-        if self.controller == Some(client_id) {
-            self.controller = None;
+        if self.browser_controller == Some(client_id) {
+            self.browser_controller = None;
         }
+        self.client_sizes.remove(&client_id);
     }
 
     fn close_clients(&mut self, reason: &ShutdownReason) {
+        if let Some(output) = self.terminal.take() {
+            let _result = output.try_send(ClientOutput::Closed(reason.clone()));
+        }
         for output in self.clients.values() {
             let _result = output.try_send(ClientOutput::Closed(reason.clone()));
         }
         self.clients.clear();
-        self.controller = None;
+        self.client_sizes.clear();
+        self.browser_controller = None;
     }
 
     fn record_replay(&mut self, bytes: Bytes) {
         record_replay_chunk(&mut self.replay, &mut self.replay_bytes, bytes);
+    }
+
+    fn claim_terminal(&mut self) {
+        if self.lease.owner != InputLeaseOwner::Terminal {
+            self.lease.owner = InputLeaseOwner::Terminal;
+            self.bump_lease_epoch();
+            self.broadcast_lease();
+        }
+    }
+
+    fn claim_browser(&mut self, client_id: ClientId) {
+        let owner = InputLeaseOwner::Browser(client_id);
+        if self.lease.owner != owner {
+            self.lease.owner = owner;
+            self.bump_lease_epoch();
+            self.broadcast_lease();
+        }
+    }
+
+    fn bump_lease_epoch(&mut self) {
+        self.lease.epoch = self.lease.epoch.saturating_add(1);
+    }
+
+    fn broadcast_lease(&mut self) {
+        let message = self.current_lease_message();
+        let mut closed = Vec::new();
+        if let Some(output) = &self.terminal
+            && output.try_send(message.clone()).is_err()
+        {
+            self.terminal = None;
+        }
+        for (client_id, output) in &self.clients {
+            if output.try_send(message.clone()).is_err() {
+                closed.push(*client_id);
+            }
+        }
+        for client_id in closed {
+            self.clients.remove(&client_id);
+            self.client_sizes.remove(&client_id);
+            if self.browser_controller == Some(client_id) {
+                self.browser_controller = None;
+            }
+        }
+    }
+
+    fn broadcast_size(&mut self) {
+        let message = self.current_size_message();
+        let mut closed = Vec::new();
+        for (client_id, output) in &self.clients {
+            if output.try_send(message.clone()).is_err() {
+                closed.push(*client_id);
+            }
+        }
+        for client_id in closed {
+            self.clients.remove(&client_id);
+            self.client_sizes.remove(&client_id);
+            if self.browser_controller == Some(client_id) {
+                self.browser_controller = None;
+            }
+        }
+    }
+
+    fn send_current_lease_to(
+        &self,
+        output: &ClientOutputTx,
+    ) -> Result<(), TrySendError<ClientOutput>> {
+        output.try_send(self.current_lease_message())
+    }
+
+    fn current_lease_message(&self) -> ClientOutput {
+        ClientOutput::Control(ServerControlMessage::LeaseChanged {
+            owner: self.lease.owner.protocol_owner(),
+            epoch: self.lease.epoch,
+        })
+    }
+
+    fn current_size_message(&self) -> ClientOutput {
+        ClientOutput::Control(ServerControlMessage::SizeChanged {
+            size: self.current_size,
+        })
     }
 }
 
@@ -1196,6 +1431,54 @@ mod tests {
         anyhow::bail!("runtime output did not report process exit");
     }
 
+    async fn recv_until_lease(
+        output: &mut ClientOutputRx,
+        owner: LeaseOwner,
+        epoch: u64,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let message = timeout(remaining, output.recv())
+                .await
+                .context("test runtime output timed out")?
+                .context("client output channel closed")?;
+            if matches!(
+                message,
+                ClientOutput::Control(ServerControlMessage::LeaseChanged {
+                    owner: lease_owner,
+                    epoch: lease_epoch,
+                }) if lease_owner == owner && lease_epoch == epoch
+            ) {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("runtime output did not receive requested lease state");
+    }
+
+    async fn recv_until_replay_finished(
+        output: &mut ClientOutputRx,
+    ) -> anyhow::Result<Vec<ClientOutput>> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut messages = Vec::new();
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let message = timeout(remaining, output.recv())
+                .await
+                .context("test runtime output timed out")?
+                .context("client output channel closed")?;
+            let finished = matches!(
+                message,
+                ClientOutput::Control(ServerControlMessage::ReplayFinished)
+            );
+            messages.push(message);
+            if finished {
+                return Ok(messages);
+            }
+        }
+        anyhow::bail!("runtime output did not finish replay");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_start_shell_attach_input_resize_detach_and_shutdown() -> anyhow::Result<()>
     {
@@ -1273,6 +1556,213 @@ mod tests {
         assert!(output.windows(4).any(|window| window == b"done"));
         recv_until_closed(&mut output_rx, ShutdownReason::ChildExit).await?;
         drop(session);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_wrap_browser_replay_with_control_markers() -> anyhow::Result<()> {
+        let config = RuntimeConfig {
+            mode: SessionMode::NewShell {
+                shell: test_shell_command()?,
+            },
+            initial_size: test_size()?,
+            reconnect_policy: ReconnectPolicy::KeepAlive,
+            exit_policy: ExitPolicy::Hold,
+        };
+        let session = RuntimeSession::start(config)?;
+        let (first_tx, mut first_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(1),
+                output: first_tx,
+            })
+            .await?;
+        recv_until_replay_finished(&mut first_rx).await?;
+
+        session
+            .send(RuntimeCommand::Input {
+                client_id: ClientId::new(1),
+                bytes: Bytes::from_static(b"printf replay-marker\\n\n"),
+            })
+            .await?;
+        recv_until_contains(&mut first_rx, b"replay-marker").await?;
+
+        let (second_tx, mut second_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(2),
+                output: second_tx,
+            })
+            .await?;
+        let messages = recv_until_replay_finished(&mut second_rx).await?;
+        assert!(matches!(
+            messages.first(),
+            Some(ClientOutput::Control(ServerControlMessage::Ready { .. }))
+        ));
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            ClientOutput::Control(ServerControlMessage::ReplayStarted)
+        )));
+        let replay_started_index = messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    ClientOutput::Control(ServerControlMessage::ReplayStarted)
+                )
+            })
+            .context("missing replay started marker")?;
+        let replay_finished_index = messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    ClientOutput::Control(ServerControlMessage::ReplayFinished)
+                )
+            })
+            .context("missing replay finished marker")?;
+        assert!(replay_started_index < replay_finished_index);
+        assert!(
+            messages[replay_started_index + 1..replay_finished_index]
+                .iter()
+                .any(|message| matches!(message, ClientOutput::Bytes(bytes) if bytes.windows(b"replay-marker".len()).any(|window| window == b"replay-marker")))
+        );
+        session.shutdown(ShutdownReason::Supervisor).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_transfer_input_lease_between_terminal_and_browser() -> anyhow::Result<()> {
+        let config = RuntimeConfig {
+            mode: SessionMode::NewShell {
+                shell: test_shell_command()?,
+            },
+            initial_size: test_size()?,
+            reconnect_policy: ReconnectPolicy::KeepAlive,
+            exit_policy: ExitPolicy::Hold,
+        };
+        let session = RuntimeSession::start(config)?;
+        let (terminal_tx, mut terminal_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachTerminal {
+                output: terminal_tx,
+            })
+            .await?;
+        recv_until_lease(&mut terminal_rx, LeaseOwner::Terminal, 0).await?;
+
+        let (browser_tx, mut browser_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(1),
+                output: browser_tx,
+            })
+            .await?;
+        let ready = browser_rx.recv().await.context("browser ready output")?;
+        assert!(matches!(
+            ready,
+            ClientOutput::Control(ServerControlMessage::Ready { .. })
+        ));
+        recv_until_lease(&mut browser_rx, LeaseOwner::Terminal, 0).await?;
+
+        session
+            .send(RuntimeCommand::Input {
+                client_id: ClientId::new(1),
+                bytes: Bytes::from_static(b"printf browser-lease\\n\n"),
+            })
+            .await?;
+        recv_until_lease(&mut terminal_rx, LeaseOwner::Browser, 1).await?;
+        recv_until_lease(&mut browser_rx, LeaseOwner::Browser, 1).await?;
+        let browser_output = recv_until_contains(&mut browser_rx, b"browser-lease").await?;
+        assert!(
+            browser_output
+                .windows(b"browser-lease".len())
+                .any(|window| window == b"browser-lease")
+        );
+
+        session
+            .send(RuntimeCommand::TerminalInput {
+                bytes: Bytes::from_static(b"printf terminal-lease\\n\n"),
+            })
+            .await?;
+        recv_until_lease(&mut terminal_rx, LeaseOwner::Terminal, 2).await?;
+        recv_until_lease(&mut browser_rx, LeaseOwner::Terminal, 2).await?;
+        let terminal_output = recv_until_contains(&mut terminal_rx, b"terminal-lease").await?;
+        assert!(
+            terminal_output
+                .windows(b"terminal-lease".len())
+                .any(|window| window == b"terminal-lease")
+        );
+        session.shutdown(ShutdownReason::Supervisor).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_ignore_browser_resize_while_terminal_owns_lease() -> anyhow::Result<()> {
+        let config = RuntimeConfig {
+            mode: SessionMode::NewShell {
+                shell: test_shell_command()?,
+            },
+            initial_size: test_size()?,
+            reconnect_policy: ReconnectPolicy::KeepAlive,
+            exit_policy: ExitPolicy::Hold,
+        };
+        let session = RuntimeSession::start(config)?;
+        let (terminal_tx, mut terminal_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachTerminal {
+                output: terminal_tx,
+            })
+            .await?;
+        recv_until_lease(&mut terminal_rx, LeaseOwner::Terminal, 0).await?;
+
+        let (browser_tx, mut browser_rx) = RuntimeSession::client_mailbox();
+        let browser_id = ClientId::new(1);
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: browser_id,
+                output: browser_tx,
+            })
+            .await?;
+        let ready = browser_rx.recv().await.context("browser ready output")?;
+        assert!(matches!(
+            ready,
+            ClientOutput::Control(ServerControlMessage::Ready { .. })
+        ));
+        recv_until_lease(&mut browser_rx, LeaseOwner::Terminal, 0).await?;
+
+        session
+            .send(RuntimeCommand::BrowserResize {
+                client_id: browser_id,
+                size: TerminalSize::new(120, 40)?,
+            })
+            .await?;
+        session
+            .send(RuntimeCommand::TerminalInput {
+                bytes: Bytes::from_static(b"printf 'terminal-size:%s\\n' \"$(stty size)\"\n"),
+            })
+            .await?;
+        let terminal_output = recv_until_contains(&mut terminal_rx, b"terminal-size:24 80").await?;
+        assert!(
+            terminal_output
+                .windows(b"terminal-size:24 80".len())
+                .any(|window| window == b"terminal-size:24 80")
+        );
+
+        session
+            .send(RuntimeCommand::Input {
+                client_id: browser_id,
+                bytes: Bytes::from_static(b"printf 'browser-size:%s\\n' \"$(stty size)\"\n"),
+            })
+            .await?;
+        recv_until_lease(&mut browser_rx, LeaseOwner::Browser, 1).await?;
+        let browser_output = recv_until_contains(&mut browser_rx, b"browser-size:24 80").await?;
+        assert!(
+            browser_output
+                .windows(b"browser-size:24 80".len())
+                .any(|window| window == b"browser-size:24 80")
+        );
+
+        session.shutdown(ShutdownReason::Supervisor).await?;
         Ok(())
     }
 

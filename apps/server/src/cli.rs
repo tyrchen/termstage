@@ -20,7 +20,10 @@ use termstage_core::{
 };
 use tracing::info;
 
-use crate::web::{PresentationSettings, PresentationTheme, WebConfig, WebExposure, serve};
+use crate::{
+    local_terminal,
+    web::{PresentationSettings, PresentationTheme, WebConfig, WebExposure, serve},
+};
 
 const DEFAULT_SESSION: &str = "presentation";
 const DEFAULT_FONT_SIZE: u16 = 24;
@@ -82,6 +85,9 @@ pub struct CliArgs {
     /// (e.g. `/p/<sessionId>/`). Must start and end with `/`.
     #[arg(long)]
     base_path: Option<String>,
+    /// Command to run inside the PTY. Use `--` before commands with flags.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<OsString>,
 }
 
 /// Validated CLI configuration.
@@ -103,6 +109,8 @@ pub struct ValidatedCliConfig {
     pub token: AccessToken,
     /// Optional reverse-proxy base path.
     pub base_path: Option<BasePath>,
+    /// Whether to attach the invoking terminal as the local frontend.
+    pub local_terminal: bool,
 }
 
 impl TryFrom<CliArgs> for ValidatedCliConfig {
@@ -118,21 +126,36 @@ impl TryFrom<CliArgs> for ValidatedCliConfig {
         };
         let (exposure, token) = exposure_and_token(&args)?;
         let initial_size = TerminalSize::new(80, 24).context("default terminal size is invalid")?;
-        let mode = match args.mode {
-            CliMode::Tmux => SessionMode::Tmux {
-                session: SessionName::from_str(&args.session)
-                    .context("invalid tmux session name")?,
-            },
-            CliMode::Shell => SessionMode::NewShell {
-                shell: shell_command(args.shell)?,
-            },
+        let local_terminal = !args.command.is_empty();
+        if local_terminal && args.shell.is_some() {
+            bail!("--shell cannot be combined with a trailing command");
+        }
+        let mode = if local_terminal {
+            SessionMode::NewShell {
+                shell: command_from_args(args.command)?,
+            }
+        } else {
+            match args.mode {
+                CliMode::Tmux => SessionMode::Tmux {
+                    session: SessionName::from_str(&args.session)
+                        .context("invalid tmux session name")?,
+                },
+                CliMode::Shell => SessionMode::NewShell {
+                    shell: shell_command(args.shell)?,
+                },
+            }
+        };
+        let exit_policy = if local_terminal {
+            ExitPolicy::End
+        } else {
+            args.exit_policy.into()
         };
         Ok(Self {
             runtime: RuntimeConfig {
                 mode,
                 initial_size,
                 reconnect_policy: args.keepalive.into(),
-                exit_policy: args.exit_policy.into(),
+                exit_policy,
             },
             host: args.host,
             port: args.port,
@@ -144,6 +167,7 @@ impl TryFrom<CliArgs> for ValidatedCliConfig {
             exposure,
             token,
             base_path,
+            local_terminal,
         })
     }
 }
@@ -166,8 +190,14 @@ pub async fn run() -> anyhow::Result<()> {
 /// # Errors
 ///
 /// Returns an error when runtime or server startup fails.
-pub async fn run_with_config(config: ValidatedCliConfig) -> anyhow::Result<()> {
+pub async fn run_with_config(mut config: ValidatedCliConfig) -> anyhow::Result<()> {
     reject_root_user()?;
+    if config.local_terminal
+        && let Some(size) =
+            local_terminal::current_terminal_size().context("failed to read local terminal size")?
+    {
+        config.runtime.initial_size = size;
+    }
     let session = RuntimeSession::start(config.runtime.clone())
         .context("failed to start browser terminal runtime")?;
     let mut web_config = WebConfig::local(config.token, session.command_sender(), config.runtime);
@@ -190,15 +220,31 @@ pub async fn run_with_config(config: ValidatedCliConfig) -> anyhow::Result<()> {
         eprintln!("{launch_url}");
     }
     info!(address = %server.address(), "browser terminal server started");
-    wait_for_shutdown().await;
+    let shutdown_reason = if config.local_terminal {
+        local_terminal::run(session.command_sender())
+            .await
+            .context("local terminal frontend failed")?
+    } else {
+        wait_for_shutdown().await;
+        ShutdownReason::Supervisor
+    };
     server
         .shutdown()
         .await
         .context("failed to shutdown browser terminal server")?;
     session
-        .shutdown(ShutdownReason::Supervisor)
+        .shutdown(shutdown_reason)
         .await
         .context("failed to shutdown browser terminal runtime")
+}
+
+fn command_from_args(command: Vec<OsString>) -> anyhow::Result<ShellCommand> {
+    let mut command = command.into_iter();
+    let executable = command
+        .next()
+        .map(PathBuf::from)
+        .context("trailing command must include an executable")?;
+    ShellCommand::new(executable, command).map_err(Into::into)
 }
 
 fn shell_command(path: Option<PathBuf>) -> anyhow::Result<ShellCommand> {
@@ -363,6 +409,7 @@ impl Default for CliArgs {
             public_url: None,
             token_env: None,
             base_path: None,
+            command: Vec::new(),
         }
     }
 }
@@ -380,6 +427,7 @@ mod tests {
         assert!(matches!(config.exposure, WebExposure::Local));
         assert!(matches!(config.runtime.mode, SessionMode::Tmux { .. }));
         assert_eq!(config.runtime.exit_policy, ExitPolicy::Hold);
+        assert!(!config.local_terminal);
         Ok(())
     }
 
@@ -462,6 +510,29 @@ mod tests {
         let config = ValidatedCliConfig::try_from(args)?;
         assert!(matches!(config.runtime.mode, SessionMode::NewShell { .. }));
         Ok(())
+    }
+
+    #[test]
+    fn test_should_validate_trailing_command_mode() -> anyhow::Result<()> {
+        let args = CliArgs {
+            command: vec![OsString::from("/bin/sh"), OsString::from("-i")],
+            ..CliArgs::default()
+        };
+        let config = ValidatedCliConfig::try_from(args)?;
+        assert!(config.local_terminal);
+        assert_eq!(config.runtime.exit_policy, ExitPolicy::End);
+        assert!(matches!(config.runtime.mode, SessionMode::NewShell { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_shell_option_with_trailing_command() {
+        let args = CliArgs {
+            shell: Some(PathBuf::from("/bin/zsh")),
+            command: vec![OsString::from("/bin/sh")],
+            ..CliArgs::default()
+        };
+        assert!(ValidatedCliConfig::try_from(args).is_err());
     }
 
     #[test]
