@@ -65,8 +65,19 @@ cargo run -p termstage --bin termstage -- --session presentation --open
 Run a fresh shell instead of tmux:
 
 ```bash
-cargo run -p termstage --bin termstage -- --mode shell --shell /bin/zsh --open
+cargo run -p termstage --bin termstage -- --mode shell --command /bin/zsh --open
 ```
+
+Attach the invoking terminal to a shell-mode PTY while the browser can view or
+take over:
+
+```bash
+cargo run -p termstage --bin termstage -- --mode shell --command claude --attach-local-terminal --open
+```
+
+When `--command` is set, `termstage` exits when that command exits. Use
+`--exit-policy hold` only when you want the browser to stay open on a
+`Process exited` status.
 
 Print the launch URL instead of opening the browser:
 
@@ -90,7 +101,9 @@ cargo run -p termstage --bin termstage -- \
 | --------------------- | --------------------- | -------------------------------------------------- |
 | `--session <name>`    | `presentation`        | Attach to or create this validated tmux session.   |
 | `--mode <tmux         | shell>`               | `tmux`                                             | Use a shared tmux session or a fresh shell.    |
-| `--shell <path>`      | `$SHELL` or `/bin/sh` | Shell executable for shell mode.                   |
+| `--command <path>`      | `$SHELL` or `/bin/sh` | Command executable for shell mode.                   |
+| `-g, --command-arg <arg>` | unset               | Repeatable argv tail for shell mode.               |
+| `-a, --attach-local-terminal` | `false`              | Attach the invoking terminal in shell mode.        |
 | `--host <addr>`       | `127.0.0.1`           | Bind address. Non-loopback addresses require `--expose-public`. |
 | `--port <port>`       | `0`                   | `0` lets the OS choose a free port.                |
 | `--open`              | `false`               | Open the tokenized URL in the default browser.     |
@@ -222,7 +235,13 @@ cargo run -p termstage --bin termstage -- --session presentation --open
 如果只想开一个新的 shell：
 
 ```bash
-cargo run -p termstage --bin termstage -- --mode shell --shell /bin/zsh --open
+cargo run -p termstage --bin termstage -- --mode shell --command /bin/zsh --open
+```
+
+如果希望当前终端也接管 shell-mode PTY，同时浏览器可以查看或接管：
+
+```bash
+cargo run -p termstage --bin termstage -- --mode shell --command claude --attach-local-terminal --open
 ```
 
 如果不想自动打开浏览器，只打印 URL：

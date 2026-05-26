@@ -24,7 +24,9 @@ Planned arguments:
 | --- | --- | --- |
 | `--session <name>` | `presentation` | Attach/create a tmux session with the validated name. |
 | `--mode <tmux|shell>` | `tmux` | Choose shared tmux or fresh shell mode. |
-| `--shell <path>` | `$SHELL` on Unix | Shell executable for shell mode only. |
+| `--command <path>` | `$SHELL` on Unix | Command executable for shell mode only. |
+| `-g, --command-arg <arg>` | unset | Repeatable argv tail for shell mode only. |
+| `-a, --attach-local-terminal` | false | Attach the invoking terminal as a local frontend in shell mode. |
 | `--host <addr>` | `127.0.0.1` | Bind address; non-loopback requires `--expose-public`. |
 | `--port <port>` | `0` | Port `0` means OS-chosen random port. |
 | `--open` | false | Open the tokenized URL in the default browser. |
@@ -61,8 +63,11 @@ CLI                 Server              Browser              Runtime
   validation succeeds.
 - CLI arguments crossing trust boundaries are validated before server startup.
 - `--session` is a tmux session name, not a shell command.
-- `--shell` is an executable path plus argv handling, not a string passed through
-  `sh -c`.
+- `--command` is an executable path and `-g` / `--command-arg` is repeatable argv
+  handling, not a string passed through `sh -c`.
+- `--attach-local-terminal` requires `--mode shell`. It preserves the existing
+  browser-first shell mode unless the operator explicitly asks to attach the
+  invoking terminal.
 - Browser URL printed to logs redacts token unless the output is the explicit user
   launch URL.
 - Public mode requires `--public-url` and `--token-env`; local mode rejects both to
