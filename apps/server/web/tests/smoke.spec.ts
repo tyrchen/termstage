@@ -28,6 +28,15 @@ test('terminal app renders and round-trips through the Rust PTY bridge', async (
     expect(failedAssets).toEqual([]);
     const root = page.locator('#terminal-root');
     await expect(root).toBeVisible();
+    const toolbar = page.getByRole('navigation', { name: 'Terminal session' });
+    await expect(toolbar).toBeVisible();
+    await expect(toolbar).toContainText('Session');
+    await expect(toolbar).toContainText('control by terminal');
+    await expect(toolbar).toContainText('24px');
+    await page.getByRole('button', { name: 'Increase font size' }).click();
+    await expect(toolbar).toContainText('25px');
+    await page.getByRole('button', { name: 'Decrease font size' }).click();
+    await expect(toolbar).toContainText('24px');
     await expect(page.locator('.xterm')).toBeVisible();
     await page.keyboard.type('printf phase4-output');
     await page.keyboard.press('Enter');

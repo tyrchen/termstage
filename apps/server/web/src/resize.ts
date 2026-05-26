@@ -13,12 +13,14 @@ export function watchTerminalResize(
   sendResize: (size: TerminalSize) => void
 ): () => void {
   let timeout: number | undefined;
-  let lastSize = currentSize(terminal);
+  let lastSize = proposedSize(fitAddon) ?? currentSize(terminal);
   const resizeObserver = new ResizeObserver(() => {
     window.clearTimeout(timeout);
     timeout = window.setTimeout(() => {
-      fitAddon.fit();
-      const nextSize = currentSize(terminal);
+      const nextSize = proposedSize(fitAddon);
+      if (nextSize === undefined) {
+        return;
+      }
       if (nextSize.cols !== lastSize.cols || nextSize.rows !== lastSize.rows) {
         lastSize = nextSize;
         sendResize(nextSize);
@@ -33,9 +35,24 @@ export function watchTerminalResize(
   };
 }
 
+export function proposedTerminalSize(fitAddon: FitAddon, terminal: Terminal): TerminalSize {
+  return proposedSize(fitAddon) ?? currentSize(terminal);
+}
+
 function currentSize(terminal: Terminal): TerminalSize {
   return {
     cols: terminal.cols,
     rows: terminal.rows
+  };
+}
+
+function proposedSize(fitAddon: FitAddon): TerminalSize | undefined {
+  const dimensions = fitAddon.proposeDimensions();
+  if (dimensions === undefined) {
+    return undefined;
+  }
+  return {
+    cols: dimensions.cols,
+    rows: dimensions.rows
   };
 }

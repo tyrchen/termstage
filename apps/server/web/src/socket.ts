@@ -2,6 +2,7 @@ import { Terminal } from '@xterm/xterm';
 
 import { ConnectionStatus } from './connection-status';
 import { TerminalSize } from './resize';
+import { scrollTerminalViewportToContentEnd, writeTerminalOutput } from './terminal';
 
 interface ResizeControlMessage {
   type: 'resize';
@@ -23,6 +24,9 @@ export interface TerminalSocket {
 
 export interface TerminalSocketOptions {
   onStatusChange?: (status: ConnectionStatus) => void;
+  onLeaseChange?: (owner: 'terminal' | 'browser') => void;
+  onSessionReady?: (session: string) => void;
+  onSizeChange?: (size: TerminalSize) => void;
 }
 
 const RECONNECT_DELAYS_MS = [250, 500, 1000, 2000] as const;
@@ -53,9 +57,16 @@ export function connectTerminalSocket(
   let terminalEnded = false;
   let lastSize: TerminalSize = { cols: terminal.cols, rows: terminal.rows };
   let socket = openSocket();
+  let inputForwardingSuppressed = true;
+  let leaseOwner: 'terminal' | 'browser' = 'terminal';
+  const userInputArm = createUserInputArm(terminal);
 
   const disposable = terminal.onData((data: string) => {
-    if (socket.readyState === WebSocket.OPEN) {
+    if (
+      !inputForwardingSuppressed &&
+      (leaseOwner === 'browser' || userInputArm.isArmed()) &&
+      socket.readyState === WebSocket.OPEN
+    ) {
       socket.send(encoder.encode(data));
     }
   });
@@ -68,6 +79,7 @@ export function connectTerminalSocket(
     close: () => {
       closedByClient = true;
       disposable.dispose();
+      userInputArm.dispose();
       window.clearInterval(heartbeatId);
       window.clearTimeout(reconnectId);
       socket.close();
@@ -79,6 +91,7 @@ export function connectTerminalSocket(
     nextSocket.binaryType = 'arraybuffer';
     nextSocket.addEventListener('open', () => {
       reconnectAttempt = 0;
+      setInputForwardingSuppressed(true);
       emitStatus({ state: 'connected' });
       sendControl(nextSocket, { type: 'resize', cols: lastSize.cols, rows: lastSize.rows });
       heartbeatId = window.setInterval(() => {
@@ -88,10 +101,21 @@ export function connectTerminalSocket(
     });
     nextSocket.addEventListener('message', (event: MessageEvent<string | ArrayBuffer>) => {
       if (event.data instanceof ArrayBuffer) {
-        terminal.write(decoder.decode(event.data, { stream: true }));
+        writeTerminalOutput(terminal, decoder.decode(event.data, { stream: true }));
         return;
       }
-      terminalEnded = handleControlMessage(terminal, event.data, emitStatus) || terminalEnded;
+      terminalEnded =
+        handleControlMessage(
+          terminal,
+          event.data,
+          setInputForwardingSuppressed,
+          finishReplay,
+          emitStatus,
+          emitLeaseChange,
+          emitSessionReady,
+          emitSizeChange
+        ) ||
+        terminalEnded;
     });
     nextSocket.addEventListener('close', (event: CloseEvent) => {
       window.clearInterval(heartbeatId);
@@ -128,6 +152,68 @@ export function connectTerminalSocket(
   function emitStatus(status: ConnectionStatus): void {
     options.onStatusChange?.(status);
   }
+
+  function emitLeaseChange(owner: 'terminal' | 'browser'): void {
+    leaseOwner = owner;
+    options.onLeaseChange?.(owner);
+  }
+
+  function emitSessionReady(session: string): void {
+    options.onSessionReady?.(session);
+  }
+
+  function emitSizeChange(size: TerminalSize): void {
+    options.onSizeChange?.(size);
+  }
+
+  function setInputForwardingSuppressed(suppressed: boolean): void {
+    inputForwardingSuppressed = suppressed;
+    terminal.options.disableStdin = suppressed;
+  }
+
+  function finishReplay(): void {
+    terminal.write('', () => {
+      scrollTerminalViewportToContentEnd(terminal);
+      setInputForwardingSuppressed(false);
+    });
+  }
+}
+
+interface UserInputArm {
+  dispose: () => void;
+  isArmed: () => boolean;
+}
+
+function createUserInputArm(terminal: Terminal): UserInputArm {
+  let armed = false;
+  let disarmTimeout: number | undefined;
+  const element = terminal.element;
+  if (element === undefined) {
+    return {
+      dispose: () => {},
+      isArmed: () => false
+    };
+  }
+  const arm = (): void => {
+    armed = true;
+    window.clearTimeout(disarmTimeout);
+    disarmTimeout = window.setTimeout(() => {
+      armed = false;
+    }, 100);
+  };
+  const eventTypes = ['keydown', 'keypress', 'paste', 'compositionend', 'mousedown', 'wheel'];
+  for (const eventType of eventTypes) {
+    element.addEventListener(eventType, arm, { capture: true });
+  }
+  return {
+    dispose: () => {
+      window.clearTimeout(disarmTimeout);
+      for (const eventType of eventTypes) {
+        element.removeEventListener(eventType, arm, { capture: true });
+      }
+    },
+    isArmed: () => armed
+  };
 }
 
 function sendControl(socket: WebSocket, message: ClientControlMessage): void {
@@ -139,10 +225,48 @@ function sendControl(socket: WebSocket, message: ClientControlMessage): void {
 function handleControlMessage(
   terminal: Terminal,
   data: string,
-  emitStatus: (status: ConnectionStatus) => void
+  suppressInputForwarding: (suppressed: boolean) => void,
+  finishReplay: () => void,
+  emitStatus: (status: ConnectionStatus) => void,
+  emitLeaseChange: (owner: 'terminal' | 'browser') => void,
+  emitSessionReady: (session: string) => void,
+  emitSizeChange: (size: TerminalSize) => void
 ): boolean {
   try {
     const message = JSON.parse(data) as { type?: string; message?: string };
+    if (
+      message.type === 'ready' &&
+      typeof (message as { session?: unknown }).session === 'string'
+    ) {
+      emitSessionReady((message as { session: string }).session);
+      return false;
+    }
+    if (message.type === 'replayStarted') {
+      suppressInputForwarding(true);
+      return false;
+    }
+    if (message.type === 'replayFinished') {
+      finishReplay();
+      return false;
+    }
+    if (message.type === 'sizeChanged') {
+      const size = (message as { size?: unknown }).size;
+      if (isTerminalSize(size)) {
+        emitSizeChange(size);
+        return false;
+      }
+    }
+    if (
+      message.type === 'leaseChanged' &&
+      (message as { owner?: string }).owner !== undefined
+    ) {
+      const owner = (message as { owner?: string }).owner;
+      if (owner === 'terminal' || owner === 'browser') {
+        emitStatus({ state: 'connected' });
+        emitLeaseChange(owner);
+        return false;
+      }
+    }
     if (message.type === 'processExited') {
       emitStatus({
         state: 'ended',
@@ -158,6 +282,14 @@ function handleControlMessage(
     terminal.writeln('\r\nprotocol error');
   }
   return false;
+}
+
+function isTerminalSize(value: unknown): value is TerminalSize {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const candidate = value as { cols?: unknown; rows?: unknown };
+  return typeof candidate.cols === 'number' && typeof candidate.rows === 'number';
 }
 
 function terminalEndStatus(event: CloseEvent): ConnectionStatus | undefined {
