@@ -1,8 +1,27 @@
 export type PresentationThemeName = 'high-contrast' | 'light';
+export type TerminalFontFamilyName =
+  | 'termstage'
+  | 'sf-mono'
+  | 'menlo'
+  | 'monaco'
+  | 'jetbrains'
+  | 'monospace';
 
 export interface PresentationSettings {
+  fontFamily: TerminalFontFamily;
   fontSize: number;
   theme: PresentationThemeName;
+}
+
+export interface TerminalFontFamily {
+  name: TerminalFontFamilyName;
+  label: string;
+  css: string;
+}
+
+export interface PresentationTheme {
+  name: PresentationThemeName;
+  label: string;
 }
 
 export interface ThemePalette {
@@ -29,8 +48,53 @@ export interface ThemePalette {
 }
 
 const DEFAULT_FONT_SIZE = 24;
-const MIN_FONT_SIZE = 12;
-const MAX_FONT_SIZE = 96;
+const DEFAULT_FONT_FAMILY: TerminalFontFamilyName = 'termstage';
+export const MIN_FONT_SIZE = 12;
+export const MAX_FONT_SIZE = 96;
+
+export const FONT_FAMILIES: readonly TerminalFontFamily[] = [
+  {
+    name: 'termstage',
+    label: 'Termstage Nerd',
+    css: '"Termstage Nerd Font", monospace'
+  },
+  {
+    name: 'sf-mono',
+    label: 'SF Mono',
+    css: '"SF Mono", Menlo, Monaco, monospace'
+  },
+  {
+    name: 'menlo',
+    label: 'Menlo',
+    css: 'Menlo, Monaco, "Courier New", monospace'
+  },
+  {
+    name: 'monaco',
+    label: 'Monaco',
+    css: 'Monaco, Menlo, "Courier New", monospace'
+  },
+  {
+    name: 'jetbrains',
+    label: 'JetBrains Mono',
+    css: '"JetBrains Mono", "Termstage Nerd Font", monospace'
+  },
+  {
+    name: 'monospace',
+    label: 'System Mono',
+    css: 'monospace'
+  }
+];
+
+export const PRESENTATION_THEMES: readonly PresentationTheme[] = [
+  {
+    name: 'high-contrast',
+    label: 'High Contrast'
+  },
+  {
+    name: 'light',
+    label: 'Light'
+  }
+];
 
 const THEMES: Record<PresentationThemeName, ThemePalette> = {
   'high-contrast': {
@@ -81,11 +145,18 @@ const THEMES: Record<PresentationThemeName, ThemePalette> = {
 
 export function readPresentationSettings(): PresentationSettings {
   const params = new URLSearchParams(window.location.search);
+  const fontFamily = parseFontFamily(params.get('fontFamily'));
   const fontSize = parseFontSize(params.get('fontSize'));
   const theme = parseTheme(params.get('theme'));
+  document.documentElement.style.setProperty('--terminal-font-family', fontFamily.css);
+  document.documentElement.style.setProperty('--terminal-font-size', `${fontSize}px`);
+  applyThemeToDocument(theme);
+  return { fontFamily, fontSize, theme };
+}
+
+export function applyThemeToDocument(theme: PresentationThemeName): void {
   const palette = themePalette(theme);
   document.documentElement.dataset.theme = theme;
-  document.documentElement.style.setProperty('--terminal-font-size', `${fontSize}px`);
   document.documentElement.style.setProperty('--terminal-background', palette.background);
   document.documentElement.style.setProperty('--terminal-foreground', palette.foreground);
   document.documentElement.style.setProperty('--terminal-cursor', palette.cursor);
@@ -93,11 +164,22 @@ export function readPresentationSettings(): PresentationSettings {
     '--terminal-selection-background',
     palette.selectionBackground
   );
-  return { fontSize, theme };
 }
 
 export function themePalette(name: PresentationThemeName): ThemePalette {
   return THEMES[name];
+}
+
+export function themeByName(name: PresentationThemeName): PresentationTheme {
+  return PRESENTATION_THEMES.find((theme) => theme.name === name) ?? PRESENTATION_THEMES[0];
+}
+
+export function clampFontSize(fontSize: number): number {
+  return Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, fontSize));
+}
+
+export function fontFamilyByName(name: TerminalFontFamilyName): TerminalFontFamily {
+  return FONT_FAMILIES.find((family) => family.name === name) ?? FONT_FAMILIES[0];
 }
 
 function parseFontSize(value: string | null): number {
@@ -108,7 +190,12 @@ function parseFontSize(value: string | null): number {
   if (!Number.isFinite(parsed)) {
     return DEFAULT_FONT_SIZE;
   }
-  return Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, parsed));
+  return clampFontSize(parsed);
+}
+
+function parseFontFamily(value: string | null): TerminalFontFamily {
+  const family = FONT_FAMILIES.find((candidate) => candidate.name === value);
+  return family ?? fontFamilyByName(DEFAULT_FONT_FAMILY);
 }
 
 function parseTheme(value: string | null): PresentationThemeName {
