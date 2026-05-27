@@ -9,6 +9,7 @@ pub mod operation_lock;
 pub mod protocol;
 pub mod runtime;
 pub mod security;
+pub mod session_gateway;
 pub mod session_registry;
 pub mod tmux_backend;
 pub mod tunnel;

@@ -258,6 +258,11 @@ impl OperationLockTable {
         Ok(lease)
     }
 
+    /// Removes any tracked lease state for a session.
+    pub fn remove_session(&mut self, session: &SessionName) {
+        self.entries.remove(session);
+    }
+
     /// Returns the current non-expired lease for a session.
     #[must_use]
     pub fn current(&mut self, session: &SessionName, now: Instant) -> Option<OperationLease> {
@@ -400,6 +405,23 @@ mod tests {
         table.acquire(&session, owner, now, Duration::from_secs(1))?;
 
         assert_eq!(table.current(&session, now + Duration::from_secs(2)), None);
+        assert!(table.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_remove_session_lease_state() -> anyhow::Result<()> {
+        let mut table = OperationLockTable::new();
+        let session = SessionName::new("demo")?;
+        table.acquire(
+            &session,
+            browser(1)?,
+            Instant::now(),
+            Duration::from_secs(30),
+        )?;
+
+        table.remove_session(&session);
+
         assert!(table.is_empty());
         Ok(())
     }
