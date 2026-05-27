@@ -432,6 +432,8 @@ pub enum LeaseOwner {
     Terminal,
     /// The browser frontend owns input.
     Browser,
+    /// An Agent Semantic Operations API client owns input.
+    Agent,
 }
 
 /// Server-to-browser JSON control frame.

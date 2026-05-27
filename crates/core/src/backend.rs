@@ -9,6 +9,15 @@ use thiserror::Error;
 
 use crate::protocol::{SafeMessage, SessionName, TerminalSize};
 
+/// Backend scroll direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BackendScrollDirection {
+    /// Scroll up through backend history.
+    Up,
+    /// Scroll down through backend history.
+    Down,
+}
+
 /// Terminal backend implementation kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackendKind {
@@ -251,6 +260,18 @@ pub trait BackendAdapter: Send {
         &mut self,
         target: &BackendSessionRef,
     ) -> Result<BackendScreenSnapshot, BackendError>;
+
+    /// Scrolls backend-visible pane history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when the backend cannot scroll the pane.
+    async fn scroll(
+        &mut self,
+        target: &BackendSessionRef,
+        direction: BackendScrollDirection,
+        amount: u16,
+    ) -> Result<(), BackendError>;
 
     /// Closes or detaches a backend session according to caller policy.
     ///

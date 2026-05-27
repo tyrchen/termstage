@@ -13,20 +13,20 @@ use std::{
 
 use anyhow::Context;
 use axum::{
-    Router,
+    Json, Router,
     extract::{
-        ConnectInfo, Path, Query, State,
+        ConnectInfo, DefaultBodyLimit, Path, Query, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
     },
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use termstage_core::{
-    backend::BackendScreenSnapshot,
+    backend::{BackendScreenSnapshot, BackendScrollDirection},
     operation_lock::{ControllerId, ControllerKind, ControllerRef, OperationLockError},
     protocol::{
         AccessToken, ClientControlMessage, ErrorCode, LeaseOwner, SafeMessage,
@@ -59,6 +59,10 @@ type BrowserSocketSender = futures_util::stream::SplitSink<WebSocket, Message>;
 const DEFAULT_BIND_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const MAX_FRAME_SIZE: usize = 16 * 1024;
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
+const API_BODY_LIMIT_BYTES: usize = 8 * 1024;
+const SEMANTIC_TEXT_MAX_BYTES: usize = 4096;
+const SEMANTIC_KEY_MAX_BYTES: usize = 32;
+const SEMANTIC_SCROLL_MAX_AMOUNT: u16 = 100;
 const CLIENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 const CLIENT_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const SERVER_PING_INTERVAL: Duration = Duration::from_secs(25);
@@ -349,11 +353,41 @@ pub fn router(config: WebConfig) -> Result<Router, SecurityError> {
         .route(&format!("{prefix}/"), get(index))
         .route(&format!("{prefix}/assets/{{*path}}"), get(asset))
         .route(&format!("{prefix}/ws"), get(ws))
+        .route(
+            &format!("{prefix}/api/sessions/{{session}}/acquire-lock"),
+            post(api_acquire_lock),
+        )
+        .route(
+            &format!("{prefix}/api/sessions/{{session}}/release-lock"),
+            post(api_release_lock),
+        )
+        .route(
+            &format!("{prefix}/api/sessions/{{session}}/press-key"),
+            post(api_press_key),
+        )
+        .route(
+            &format!("{prefix}/api/sessions/{{session}}/write-text"),
+            post(api_write_text),
+        )
+        .route(
+            &format!("{prefix}/api/sessions/{{session}}/run-command"),
+            post(api_run_command),
+        )
+        .route(
+            &format!("{prefix}/api/sessions/{{session}}/read-screen"),
+            post(api_read_screen),
+        )
+        .route(
+            &format!("{prefix}/api/sessions/{{session}}/scroll"),
+            post(api_scroll),
+        )
         .route(&format!("{prefix}/healthz"), get(healthz));
     if !prefix.is_empty() {
         router = router.route(prefix, get(index));
     }
-    Ok(router.with_state(state))
+    Ok(router
+        .layer(DefaultBodyLimit::max(API_BODY_LIMIT_BYTES))
+        .with_state(state))
 }
 
 /// Starts the Axum server.
@@ -406,6 +440,76 @@ struct TokenQuery {
     token: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiSessionPath {
+    session: SessionName,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ControllerRequest {
+    controller_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PressKeyRequest {
+    controller_id: u64,
+    key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WriteTextRequest {
+    controller_id: u64,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RunCommandRequest {
+    controller_id: u64,
+    command: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ScrollRequest {
+    controller_id: u64,
+    direction: ScrollDirection,
+    amount: u16,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum ScrollDirection {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LeaseResponse {
+    owner: LeaseOwner,
+    epoch: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationResponse {
+    ok: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScreenResponse {
+    size: TerminalSize,
+    cursor_col: u16,
+    cursor_row: u16,
+    lines: Vec<String>,
+}
+
 async fn index(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -443,6 +547,141 @@ async fn ws(
         .max_message_size(MAX_MESSAGE_SIZE)
         .on_upgrade(move |socket| bridge_socket(state, socket))
         .into_response())
+}
+
+async fn api_acquire_lock(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<ApiSessionPath>,
+    Query(query): Query<TokenQuery>,
+    Json(request): Json<ControllerRequest>,
+) -> Result<Json<LeaseResponse>, ApiError> {
+    validate_api_request(&state, peer, &headers, &query)?;
+    let controller = agent_controller(request.controller_id)?;
+    let gateway = gateway_for_session(&state, &path.session)?;
+    let mut gateway = gateway.lock().await;
+    let lease = gateway
+        .acquire_controller(&path.session, controller, Instant::now())
+        .map_err(ApiError::from_gateway)?;
+    Ok(Json(LeaseResponse {
+        owner: LeaseOwner::Agent,
+        epoch: lease.epoch(),
+    }))
+}
+
+async fn api_release_lock(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<ApiSessionPath>,
+    Query(query): Query<TokenQuery>,
+    Json(request): Json<ControllerRequest>,
+) -> Result<Json<LeaseResponse>, ApiError> {
+    validate_api_request(&state, peer, &headers, &query)?;
+    let controller = agent_controller(request.controller_id)?;
+    let gateway = gateway_for_session(&state, &path.session)?;
+    let mut gateway = gateway.lock().await;
+    let lease = gateway
+        .release_controller(&path.session, controller, Instant::now())
+        .map_err(ApiError::from_gateway)?;
+    Ok(Json(LeaseResponse {
+        owner: LeaseOwner::Terminal,
+        epoch: lease.epoch(),
+    }))
+}
+
+async fn api_press_key(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<ApiSessionPath>,
+    Query(query): Query<TokenQuery>,
+    Json(request): Json<PressKeyRequest>,
+) -> Result<Json<OperationResponse>, ApiError> {
+    validate_api_request(&state, peer, &headers, &query)?;
+    let bytes = semantic_key_bytes(&request.key)?;
+    write_semantic_bytes(&state, &path.session, request.controller_id, bytes).await?;
+    Ok(Json(OperationResponse { ok: true }))
+}
+
+async fn api_write_text(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<ApiSessionPath>,
+    Query(query): Query<TokenQuery>,
+    Json(request): Json<WriteTextRequest>,
+) -> Result<Json<OperationResponse>, ApiError> {
+    validate_api_request(&state, peer, &headers, &query)?;
+    let bytes = bounded_semantic_text(request.text)?;
+    write_semantic_bytes(&state, &path.session, request.controller_id, bytes).await?;
+    Ok(Json(OperationResponse { ok: true }))
+}
+
+async fn api_run_command(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<ApiSessionPath>,
+    Query(query): Query<TokenQuery>,
+    Json(request): Json<RunCommandRequest>,
+) -> Result<Json<OperationResponse>, ApiError> {
+    validate_api_request(&state, peer, &headers, &query)?;
+    let bytes = semantic_command_bytes(request.command)?;
+    write_semantic_bytes(&state, &path.session, request.controller_id, bytes).await?;
+    Ok(Json(OperationResponse { ok: true }))
+}
+
+async fn api_read_screen(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<ApiSessionPath>,
+    Query(query): Query<TokenQuery>,
+) -> Result<Json<ScreenResponse>, ApiError> {
+    validate_api_request(&state, peer, &headers, &query)?;
+    let gateway = gateway_for_session(&state, &path.session)?;
+    let snapshot = {
+        let mut gateway = gateway.lock().await;
+        gateway
+            .read_screen(&path.session)
+            .await
+            .map_err(ApiError::from_gateway)?
+    };
+    Ok(Json(screen_response(&snapshot)))
+}
+
+async fn api_scroll(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<ApiSessionPath>,
+    Query(query): Query<TokenQuery>,
+    Json(request): Json<ScrollRequest>,
+) -> Result<Json<OperationResponse>, ApiError> {
+    validate_api_request(&state, peer, &headers, &query)?;
+    if request.amount == 0 || request.amount > SEMANTIC_SCROLL_MAX_AMOUNT {
+        return Err(ApiError::BadRequest);
+    }
+    let controller = agent_controller(request.controller_id)?;
+    let direction = match request.direction {
+        ScrollDirection::Up => BackendScrollDirection::Up,
+        ScrollDirection::Down => BackendScrollDirection::Down,
+    };
+    let gateway = gateway_for_session(&state, &path.session)?;
+    let mut gateway = gateway.lock().await;
+    gateway
+        .scroll(
+            &path.session,
+            controller,
+            direction,
+            request.amount,
+            Instant::now(),
+        )
+        .await
+        .map_err(ApiError::from_gateway)?;
+    Ok(Json(OperationResponse { ok: true }))
 }
 
 async fn bridge_socket(state: AppState, socket: WebSocket) {
@@ -1246,6 +1485,102 @@ fn close_frame_for_tunnel_reason(reason: TunnelCloseReason) -> CloseFrame {
     }
 }
 
+fn validate_api_request(
+    state: &AppState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    query: &TokenQuery,
+) -> Result<(), ApiError> {
+    validate_http_request(state, peer, headers, query, false).map_err(ApiError::Security)
+}
+
+fn gateway_for_session(
+    state: &AppState,
+    requested: &SessionName,
+) -> Result<Arc<Mutex<SessionGateway<TmuxBackend>>>, ApiError> {
+    let WebSession::TmuxGateway { gateway, session } = &state.inner.session else {
+        return Err(ApiError::Unsupported);
+    };
+    if session != requested {
+        return Err(ApiError::NotFound);
+    }
+    Ok(Arc::clone(gateway))
+}
+
+fn agent_controller(id: u64) -> Result<ControllerRef, ApiError> {
+    Ok(ControllerRef::new(
+        ControllerKind::Agent,
+        ControllerId::new(id).map_err(|_error| ApiError::BadRequest)?,
+    ))
+}
+
+fn bounded_semantic_text(text: String) -> Result<Bytes, ApiError> {
+    if text.len() > SEMANTIC_TEXT_MAX_BYTES || text.as_bytes().contains(&0) {
+        return Err(ApiError::BadRequest);
+    }
+    Ok(Bytes::from(text))
+}
+
+fn semantic_command_bytes(command: String) -> Result<Bytes, ApiError> {
+    if command.contains(['\r', '\n']) {
+        return Err(ApiError::BadRequest);
+    }
+    let mut command = bounded_semantic_text(command)?.to_vec();
+    command.push(b'\n');
+    Ok(Bytes::from(command))
+}
+
+fn semantic_key_bytes(key: &str) -> Result<Bytes, ApiError> {
+    if key.is_empty() || key.len() > SEMANTIC_KEY_MAX_BYTES {
+        return Err(ApiError::BadRequest);
+    }
+    let bytes = match key {
+        "Enter" => Bytes::from_static(b"\n"),
+        "Tab" => Bytes::from_static(b"\t"),
+        "Escape" => Bytes::from_static(b"\x1b"),
+        "Backspace" => Bytes::from_static(b"\x7f"),
+        "CtrlC" => Bytes::from_static(b"\x03"),
+        "CtrlD" => Bytes::from_static(b"\x04"),
+        "ArrowUp" => Bytes::from_static(b"\x1b[A"),
+        "ArrowDown" => Bytes::from_static(b"\x1b[B"),
+        "ArrowRight" => Bytes::from_static(b"\x1b[C"),
+        "ArrowLeft" => Bytes::from_static(b"\x1b[D"),
+        _ => {
+            if key.chars().count() == 1 {
+                Bytes::copy_from_slice(key.as_bytes())
+            } else {
+                return Err(ApiError::BadRequest);
+            }
+        }
+    };
+    Ok(bytes)
+}
+
+async fn write_semantic_bytes(
+    state: &AppState,
+    session: &SessionName,
+    controller_id: u64,
+    bytes: Bytes,
+) -> Result<(), ApiError> {
+    let controller = agent_controller(controller_id)?;
+    let gateway = gateway_for_session(state, session)?;
+    let mut gateway = gateway.lock().await;
+    gateway
+        .write_input(session, controller, bytes, Instant::now())
+        .await
+        .map_err(ApiError::from_gateway)?;
+    Ok(())
+}
+
+fn screen_response(snapshot: &BackendScreenSnapshot) -> ScreenResponse {
+    ScreenResponse {
+        size: snapshot.size(),
+        cursor_col: snapshot.cursor_col(),
+        cursor_row: snapshot.cursor_row(),
+        lines: snapshot.lines().to_vec(),
+    }
+}
+
 fn validate_http_request(
     state: &AppState,
     peer: SocketAddr,
@@ -1317,6 +1652,77 @@ impl IntoResponse for WebError {
     }
 }
 
+#[derive(Debug)]
+enum ApiError {
+    BadRequest,
+    Conflict,
+    Forbidden,
+    NotFound,
+    Runtime,
+    Security(WebError),
+    Unsupported,
+}
+
+impl ApiError {
+    fn from_gateway(error: SessionGatewayError) -> Self {
+        match error {
+            SessionGatewayError::Lock(OperationLockError::LeaseConflict { .. }) => Self::Conflict,
+            SessionGatewayError::Lock(OperationLockError::NotLeaseOwner { .. }) => Self::Forbidden,
+            SessionGatewayError::Lock(_error) => Self::BadRequest,
+            SessionGatewayError::Registry(_error) => Self::NotFound,
+            SessionGatewayError::Backend(_error) => Self::Runtime,
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Security(error) => error.into_response(),
+            error => {
+                debug!(reason = ?error, "semantic api request failed");
+                let (status, code, message) = match error {
+                    Self::BadRequest => (
+                        StatusCode::BAD_REQUEST,
+                        ErrorCode::Protocol,
+                        SafeMessage::from_static("invalid semantic operation request"),
+                    ),
+                    Self::Conflict => (
+                        StatusCode::CONFLICT,
+                        ErrorCode::Forbidden,
+                        SafeMessage::from_static("operation lease is owned by another controller"),
+                    ),
+                    Self::Forbidden => (
+                        StatusCode::FORBIDDEN,
+                        ErrorCode::Forbidden,
+                        SafeMessage::from_static("controller does not own input lease"),
+                    ),
+                    Self::NotFound => (
+                        StatusCode::NOT_FOUND,
+                        ErrorCode::Runtime,
+                        SafeMessage::from_static("session was not found"),
+                    ),
+                    Self::Runtime => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ErrorCode::Runtime,
+                        SafeMessage::from_static("backend operation failed"),
+                    ),
+                    Self::Unsupported => (
+                        StatusCode::CONFLICT,
+                        ErrorCode::Runtime,
+                        SafeMessage::from_static("semantic api requires a backend session"),
+                    ),
+                    Self::Security(_error) => {
+                        return StatusCode::FORBIDDEN.into_response();
+                    }
+                };
+                let body = ServerControlMessage::Error { code, message };
+                (status, Json(body)).into_response()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1329,10 +1735,12 @@ mod tests {
     use anyhow::Context;
     use axum::{
         body::Body,
-        http::{Request, StatusCode},
+        http::{Method, Request, StatusCode},
     };
     use bytes::Bytes;
     use http_body_util::BodyExt;
+    use serde::de::DeserializeOwned;
+    use serde_json::json;
     use termstage_core::{
         protocol::{AccessToken, SessionName, TerminalSize},
         runtime::{
@@ -1439,6 +1847,56 @@ mod tests {
             )
             .await?;
         Ok(response.status())
+    }
+
+    async fn api_post_json(
+        app: &Router,
+        path: &str,
+        token: &AccessToken,
+        body: serde_json::Value,
+    ) -> anyhow::Result<Response> {
+        let uri = format!("{path}?token={}", token.to_url_token());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::HOST, "127.0.0.1:49152")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .extension(ConnectInfo(SocketAddr::from((Ipv4Addr::LOCALHOST, 50000))))
+                    .body(Body::from(serde_json::to_vec(&body)?))?,
+            )
+            .await?;
+        Ok(response)
+    }
+
+    async fn api_post_empty(
+        app: &Router,
+        path: &str,
+        token: &AccessToken,
+    ) -> anyhow::Result<Response> {
+        let uri = format!("{path}?token={}", token.to_url_token());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::HOST, "127.0.0.1:49152")
+                    .extension(ConnectInfo(SocketAddr::from((Ipv4Addr::LOCALHOST, 50000))))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        Ok(response)
+    }
+
+    async fn decode_json<T>(response: Response) -> anyhow::Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let body = response.into_body().collect().await?.to_bytes();
+        serde_json::from_slice(&body).map_err(Into::into)
     }
 
     #[tokio::test]
@@ -1713,6 +2171,131 @@ mod tests {
         );
         socket.close(None).await?;
         server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_operate_tmux_gateway_with_semantic_api() -> anyhow::Result<()> {
+        let backend = TmuxBackend::from_path().context("tmux unavailable")?;
+        let tmux = backend.tmux_path().to_path_buf();
+        let token = AccessToken::from_bytes([18; 32]);
+        let session = SessionName::new(format!("termstage-semantic-api-{}", std::process::id()))?;
+        let _cleanup = TmuxSessionCleanup::new(tmux, session.clone());
+        let mut gateway = SessionGateway::new(backend, Duration::from_secs(90));
+        gateway
+            .create_or_find_session(session.clone(), session.clone(), TerminalSize::new(80, 24)?)
+            .await?;
+        let mut config = WebConfig::local_tmux_gateway(
+            token.clone(),
+            Arc::new(Mutex::new(gateway)),
+            session.clone(),
+        );
+        config.port = 49152;
+        let app = router(config)?;
+        let base = format!("/api/sessions/{}", session.as_str());
+
+        let response = api_post_json(
+            &app,
+            &format!("{base}/acquire-lock"),
+            &token,
+            json!({ "controllerId": 42 }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let lease: LeaseResponse = decode_json(response).await?;
+        assert_eq!(lease.owner, LeaseOwner::Agent);
+
+        let response = api_post_json(
+            &app,
+            &format!("{base}/write-text"),
+            &token,
+            json!({ "controllerId": 42, "text": "printf semantic-write-ok" }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = api_post_json(
+            &app,
+            &format!("{base}/press-key"),
+            &token,
+            json!({ "controllerId": 42, "key": "Enter" }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            read_semantic_screen_until(&app, &base, &token, "semantic-write-ok").await?,
+            "semantic write-text/press-key output was not visible"
+        );
+
+        let response = api_post_json(
+            &app,
+            &format!("{base}/run-command"),
+            &token,
+            json!({ "controllerId": 42, "command": "printf semantic-run-ok" }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            read_semantic_screen_until(&app, &base, &token, "semantic-run-ok").await?,
+            "semantic run-command output was not visible"
+        );
+
+        let response = api_post_json(
+            &app,
+            &format!("{base}/scroll"),
+            &token,
+            json!({ "controllerId": 42, "direction": "up", "amount": 1 }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = api_post_json(
+            &app,
+            &format!("{base}/release-lock"),
+            &token,
+            json!({ "controllerId": 42 }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_reject_semantic_write_from_non_owner() -> anyhow::Result<()> {
+        let backend = TmuxBackend::from_path().context("tmux unavailable")?;
+        let tmux = backend.tmux_path().to_path_buf();
+        let token = AccessToken::from_bytes([19; 32]);
+        let session = SessionName::new(format!("termstage-semantic-lock-{}", std::process::id()))?;
+        let _cleanup = TmuxSessionCleanup::new(tmux, session.clone());
+        let mut gateway = SessionGateway::new(backend, Duration::from_secs(90));
+        gateway
+            .create_or_find_session(session.clone(), session.clone(), TerminalSize::new(80, 24)?)
+            .await?;
+        let mut config = WebConfig::local_tmux_gateway(
+            token.clone(),
+            Arc::new(Mutex::new(gateway)),
+            session.clone(),
+        );
+        config.port = 49152;
+        let app = router(config)?;
+        let base = format!("/api/sessions/{}", session.as_str());
+
+        let response = api_post_json(
+            &app,
+            &format!("{base}/acquire-lock"),
+            &token,
+            json!({ "controllerId": 1 }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = api_post_json(
+            &app,
+            &format!("{base}/write-text"),
+            &token,
+            json!({ "controllerId": 2, "text": "blocked" }),
+        )
+        .await?;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         Ok(())
     }
 
@@ -2209,6 +2792,28 @@ mod tests {
                 }
             }
             anyhow::Ok(false)
+        })
+        .await?
+    }
+
+    async fn read_semantic_screen_until(
+        app: &Router,
+        base: &str,
+        token: &AccessToken,
+        needle: &str,
+    ) -> anyhow::Result<bool> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let response = api_post_empty(app, &format!("{base}/read-screen"), token).await?;
+                if response.status() != StatusCode::OK {
+                    return anyhow::Ok(false);
+                }
+                let screen: ScreenResponse = decode_json(response).await?;
+                if screen.lines.iter().any(|line| line.contains(needle)) {
+                    return anyhow::Ok(true);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         })
         .await?
     }

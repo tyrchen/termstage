@@ -12,7 +12,7 @@ use tokio::process::Command;
 use crate::{
     backend::{
         BackendAdapter, BackendError, BackendKind, BackendPaneId, BackendScreenSnapshot,
-        BackendSessionRef, BackendWindowId,
+        BackendScrollDirection, BackendSessionRef, BackendWindowId,
     },
     protocol::{SafeMessage, SessionName, TerminalSize},
 };
@@ -336,6 +336,31 @@ impl BackendAdapter for TmuxBackend {
         Ok(BackendScreenSnapshot::new(
             size, cursor_col, cursor_row, lines,
         ))
+    }
+
+    async fn scroll(
+        &mut self,
+        target: &BackendSessionRef,
+        direction: BackendScrollDirection,
+        amount: u16,
+    ) -> Result<(), BackendError> {
+        let amount = amount.to_string();
+        let command = match direction {
+            BackendScrollDirection::Up => "scroll-up",
+            BackendScrollDirection::Down => "scroll-down",
+        };
+        self.run(["copy-mode", "-t", target.pane().as_str()])
+            .await?;
+        self.run([
+            "send-keys",
+            "-t",
+            target.pane().as_str(),
+            "-X",
+            "-N",
+            &amount,
+            command,
+        ])
+        .await
     }
 
     async fn close_session(&mut self, target: &BackendSessionRef) -> Result<(), BackendError> {
