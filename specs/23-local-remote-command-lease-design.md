@@ -148,13 +148,21 @@ Layer 3 adds request/response semantics for agents. Example operations:
 
 - `pressKey(session, key = "h")`;
 - `writeText(session, text)`;
-- `runCommand(session, command = "echo hello")`;
+- `runCommand(session, command = "echo hello", waitFor = "hello", capture = true)
+  -> { matched, screen }`;
 - `readScreen(session) -> screen snapshot`;
 - `scroll(session, direction, amount)`;
 - `acquireLock(session, controller, ttl)`.
 
 Semantic operations must be observable by browser and backend viewers because
 they ultimately mutate the same backend session/pane.
+
+`runCommand` is a request/response operation, not just an input write. The first
+implementation submits the command through backend-native command entry, then
+optionally waits for visible screen text and optionally returns a captured screen
+snapshot. Backends with stronger primitives, such as rmux, should implement this
+with `send_text`, `send_key`, output waits, and structured snapshots instead of
+forcing everything through raw bytes.
 
 ## 6. Level 1 Lock
 
@@ -210,6 +218,8 @@ Required capabilities:
 - resolve a session to window/pane identity;
 - stream VT/ANSI output bytes to `termstage`;
 - write input bytes to the pane;
+- send literal text, key tokens, and submitted commands as backend-native
+  semantic operations;
 - resize the pane when the active controller size changes;
 - read a screen snapshot for semantic API operations;
 - close, detach, or keep the backend session according to exit policy.
