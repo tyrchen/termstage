@@ -26,7 +26,6 @@ Planned arguments:
 | `--mode <tmux|shell>` | `tmux` | Choose shared tmux or fresh shell mode. |
 | `--command <path>` | `$SHELL` on Unix | Command executable for shell mode only. |
 | `-g, --command-arg <arg>` | unset | Repeatable argv tail for shell mode only. |
-| `-a, --local-command-terminal` | false | Show and control the command PTY in a local split terminal UI in shell mode. |
 | `--host <addr>` | `127.0.0.1` | Bind address; non-loopback requires `--expose-public`. |
 | `--port <port>` | `0` | Port `0` means OS-chosen random port. |
 | `--open` | false | Open the tokenized URL in the default browser. |
@@ -65,9 +64,11 @@ CLI                 Server              Browser              Runtime
 - `--session` is a tmux session name, not a shell command.
 - `--command` is an executable path and `-g` / `--command-arg` is repeatable argv
   handling, not a string passed through `sh -c`.
-- `--local-command-terminal` requires `--mode shell`. It preserves the existing
-  browser-first shell mode unless the operator explicitly asks to show and
-  control the command PTY in the invoking terminal.
+- Shell mode is browser-first. The invoking terminal remains the `termstage`
+  supervisor console and does not attach to the command PTY.
+- Local attach for shared sessions is provided by the selected backend's native
+  command, for example `tmux attach -t <session>` or a future `rmux attach`
+  command, not by a `termstage` local-terminal flag.
 - Browser URL printed to logs redacts token unless the output is the explicit user
   launch URL.
 - Public mode requires `--public-url` and `--token-env`; local mode rejects both to

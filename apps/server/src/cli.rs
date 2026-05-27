@@ -21,10 +21,7 @@ use termstage_core::{
 };
 use tracing::info;
 
-use crate::{
-    local_terminal,
-    web::{PresentationSettings, PresentationTheme, WebConfig, WebExposure, serve},
-};
+use crate::web::{PresentationSettings, PresentationTheme, WebConfig, WebExposure, serve};
 
 const DEFAULT_SESSION: &str = "presentation";
 const DEFAULT_FONT_SIZE: u16 = 24;
@@ -61,9 +58,6 @@ pub struct CliArgs {
         allow_hyphen_values = true
     )]
     command_args: Vec<OsString>,
-    /// Attach the invoking terminal as a local frontend in shell mode.
-    #[arg(short = 'a', long, default_value_t = false)]
-    attach_local_terminal: bool,
     /// Bind address. Non-loopback addresses require --expose-public.
     #[arg(long, default_value = "127.0.0.1")]
     host: IpAddr,
@@ -119,8 +113,6 @@ pub struct ValidatedCliConfig {
     pub token: AccessToken,
     /// Optional reverse-proxy base path.
     pub base_path: Option<BasePath>,
-    /// Whether to attach the invoking terminal as the local frontend.
-    pub attach_local_terminal: bool,
 }
 
 impl TryFrom<CliArgs> for ValidatedCliConfig {
@@ -136,9 +128,6 @@ impl TryFrom<CliArgs> for ValidatedCliConfig {
         };
         let (exposure, token) = exposure_and_token(&args)?;
         let initial_size = TerminalSize::new(80, 24).context("default terminal size is invalid")?;
-        if args.attach_local_terminal && !matches!(args.mode, CliMode::Shell) {
-            bail!("--attach-local-terminal requires --mode shell");
-        }
         if args.command.is_some() && !matches!(args.mode, CliMode::Shell) {
             bail!("--command requires --mode shell");
         }
@@ -157,7 +146,7 @@ impl TryFrom<CliArgs> for ValidatedCliConfig {
         };
         let exit_policy = match args.exit_policy {
             Some(policy) => policy.into(),
-            None if args.attach_local_terminal || explicit_shell_command => ExitPolicy::End,
+            None if explicit_shell_command => ExitPolicy::End,
             None => ExitPolicy::Hold,
         };
         Ok(Self {
@@ -177,7 +166,6 @@ impl TryFrom<CliArgs> for ValidatedCliConfig {
             exposure,
             token,
             base_path,
-            attach_local_terminal: args.attach_local_terminal,
         })
     }
 }
@@ -200,14 +188,8 @@ pub async fn run() -> anyhow::Result<()> {
 /// # Errors
 ///
 /// Returns an error when runtime or server startup fails.
-pub async fn run_with_config(mut config: ValidatedCliConfig) -> anyhow::Result<()> {
+pub async fn run_with_config(config: ValidatedCliConfig) -> anyhow::Result<()> {
     reject_root_user()?;
-    if config.attach_local_terminal
-        && let Some(size) =
-            local_terminal::current_terminal_size().context("failed to read local terminal size")?
-    {
-        config.runtime.initial_size = size;
-    }
     let session = RuntimeSession::start(config.runtime.clone())
         .context("failed to start browser terminal runtime")?;
     let mut web_config = WebConfig::local(config.token, session.command_sender(), config.runtime);
@@ -230,13 +212,7 @@ pub async fn run_with_config(mut config: ValidatedCliConfig) -> anyhow::Result<(
         eprintln!("{launch_url}");
     }
     info!(address = %server.address(), "browser terminal server started");
-    let shutdown_reason = if config.attach_local_terminal {
-        local_terminal::run(session.command_sender())
-            .await
-            .context("local terminal frontend failed")?
-    } else {
-        wait_for_shutdown_or_runtime_exit(&session).await
-    };
+    let shutdown_reason = wait_for_shutdown_or_runtime_exit(&session).await;
     server
         .shutdown()
         .await
@@ -421,7 +397,6 @@ impl Default for CliArgs {
             mode: CliMode::Tmux,
             command: None,
             command_args: Vec::new(),
-            attach_local_terminal: false,
             host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 0,
             open: false,
@@ -450,7 +425,6 @@ mod tests {
         assert!(matches!(config.exposure, WebExposure::Local));
         assert!(matches!(config.runtime.mode, SessionMode::Tmux { .. }));
         assert_eq!(config.runtime.exit_policy, ExitPolicy::Hold);
-        assert!(!config.attach_local_terminal);
         Ok(())
     }
 
@@ -550,21 +524,6 @@ mod tests {
     }
 
     #[test]
-    fn test_should_validate_attach_local_terminal_shell_mode() -> anyhow::Result<()> {
-        let args = CliArgs {
-            mode: CliMode::Shell,
-            command: Some(PathBuf::from("/bin/sh")),
-            attach_local_terminal: true,
-            ..CliArgs::default()
-        };
-        let config = ValidatedCliConfig::try_from(args)?;
-        assert!(config.attach_local_terminal);
-        assert_eq!(config.runtime.exit_policy, ExitPolicy::End);
-        assert!(matches!(config.runtime.mode, SessionMode::NewShell { .. }));
-        Ok(())
-    }
-
-    #[test]
     fn test_should_pass_shell_arguments_to_shell_mode() -> anyhow::Result<()> {
         let args = CliArgs {
             mode: CliMode::Shell,
@@ -582,15 +541,6 @@ mod tests {
         assert_eq!(shell.executable(), PathBuf::from("codemax").as_path());
         assert_eq!(shell.args(), [OsString::from("claude")]);
         Ok(())
-    }
-
-    #[test]
-    fn test_should_reject_attach_local_terminal_outside_shell_mode() {
-        let args = CliArgs {
-            attach_local_terminal: true,
-            ..CliArgs::default()
-        };
-        assert!(ValidatedCliConfig::try_from(args).is_err());
     }
 
     #[test]
@@ -638,13 +588,10 @@ mod tests {
     }
 
     #[test]
-    fn test_should_parse_short_attach_local_terminal_flag() -> anyhow::Result<()> {
-        let args =
-            CliArgs::try_parse_from(["termstage", "--mode", "shell", "--command", "abc", "-a"])?;
-        let config = ValidatedCliConfig::try_from(args)?;
-        assert!(config.attach_local_terminal);
-        assert_eq!(config.runtime.exit_policy, ExitPolicy::End);
-        Ok(())
+    fn test_should_reject_removed_local_attach_short_flag() {
+        let result =
+            CliArgs::try_parse_from(["termstage", "--mode", "shell", "--command", "abc", "-a"]);
+        assert!(result.is_err());
     }
 
     #[test]

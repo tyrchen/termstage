@@ -2,7 +2,6 @@
 
 mod assets;
 mod cli;
-mod local_terminal;
 pub mod tunnel_ws;
 mod web;
 

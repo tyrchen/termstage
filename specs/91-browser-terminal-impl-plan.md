@@ -127,23 +127,39 @@ Maps to roadmap: closes M4.
 Exit criteria: M4 roadmap criteria pass; local loopback tests still pass; standard
 Cargo quality gates remain green.
 
-## 11. Phase 7 - Local Command Terminal Split UI
+## 11. Phase 7 - Remove Obsolete Local Attach
 
 Maps to roadmap: closes M5.
 
 | # | Task | Spec | Effort |
 | --- | --- | --- | --- |
-| 7.1 | Rename the long CLI flag from the working `--attach-local-terminal` name to `--local-command-terminal`, with parser tests for shell-mode-only validation. | [23](./23-local-remote-command-lease-design.md), [50](./50-browser-terminal-cli-design.md) | 0.5 day |
-| 7.2 | Add a local TUI actor that owns raw mode, alternate screen, layout, panic-safe restore, and keyboard routing. | [23](./23-local-remote-command-lease-design.md), [72](./72-browser-terminal-verification-plan.md) | 1.5 days |
-| 7.3 | Route `tracing`/supervisor events into a bounded log pane rather than stdout/stderr while local command terminal mode is active. | [23](./23-local-remote-command-lease-design.md), [70](./70-browser-terminal-security-design.md) | 1 day |
-| 7.4 | Render command PTY output in a command pane using Ratatui plus a validated terminal parser/widget choice. | [23](./23-local-remote-command-lease-design.md), [61](./61-browser-terminal-crates-and-features.md) | 2 days |
-| 7.5 | Make local command pane dimensions drive runtime resize while local terminal owns the lease. | [11](./11-browser-terminal-runtime-design.md), [23](./23-local-remote-command-lease-design.md) | 1 day |
-| 7.6 | Add E2E smoke for continuous output and a TUI command fixture, plus lease handoff between browser and local command pane. | [23](./23-local-remote-command-lease-design.md), [72](./72-browser-terminal-verification-plan.md) | 1.5 days |
+| 7.1 | Rewrite the local/remote command lease spec around backend-owned sessions, Termstage Protocol, and Level 1 operation locking. | [23](./23-local-remote-command-lease-design.md) | 0.5 day |
+| 7.2 | Remove the CLI flag and config fields for the obsolete local attach mode. | [23](./23-local-remote-command-lease-design.md), [50](./50-browser-terminal-cli-design.md) | 0.5 day |
+| 7.3 | Delete the server-side local terminal passthrough implementation and module wiring. | [23](./23-local-remote-command-lease-design.md) | 0.5 day |
+| 7.4 | Remove runtime commands, state, tests, and docs that model the invoking terminal as a write-capable frontend. | [11](./11-browser-terminal-runtime-design.md), [23](./23-local-remote-command-lease-design.md), [72](./72-browser-terminal-verification-plan.md) | 1 day |
+| 7.5 | Verify shell mode with `--command` remains browser-first and exits according to the configured exit policy. | [50](./50-browser-terminal-cli-design.md), [72](./72-browser-terminal-verification-plan.md) | 0.5 day |
 
-Exit criteria: M5 roadmap criteria pass; logs never interleave with command PTY
-bytes in local command terminal mode; standard Cargo quality gates remain green.
+Exit criteria: M5 roadmap criteria pass; repository search finds no obsolete
+local attach symbols; standard Cargo quality gates remain green.
 
-## 12. Cross-References
+## 12. Phase 8 - Session Backend Gateway and Level 1 Lock
+
+Maps to roadmap: closes M6.
+
+| # | Task | Spec | Effort |
+| --- | --- | --- | --- |
+| 8.1 | Add a session registry that maps `termstage` session ids to backend session/window/pane references. | [23](./23-local-remote-command-lease-design.md), [11](./11-browser-terminal-runtime-design.md) | 1 day |
+| 8.2 | Define the backend adapter trait and implement the first rmux/tmux adapter path for create/find, stream output, write input, resize, and read-screen. | [23](./23-local-remote-command-lease-design.md), [61](./61-browser-terminal-crates-and-features.md) | 2 days |
+| 8.3 | Route browser WebSocket traffic through Termstage Protocol into the backend adapter. | [10](./10-browser-terminal-protocol-design.md), [20](./20-browser-terminal-web-design.md), [23](./23-local-remote-command-lease-design.md) | 1.5 days |
+| 8.4 | Add Semantic Operations API for press-key, write-text, run-command, read-screen, and scroll. | [23](./23-local-remote-command-lease-design.md), [70](./70-browser-terminal-security-design.md) | 2 days |
+| 8.5 | Implement Level 1 operation lock with owner kind, owner id, epoch, TTL, and conflict responses. | [23](./23-local-remote-command-lease-design.md), [72](./72-browser-terminal-verification-plan.md) | 1 day |
+| 8.6 | Add integration tests for browser/API synchronization, lock conflict, native backend attach compatibility, and semantic request/response behavior. | [23](./23-local-remote-command-lease-design.md), [72](./72-browser-terminal-verification-plan.md) | 1.5 days |
+
+Exit criteria: M6 roadmap criteria pass; browser and Agent API operate the same
+backend session; exactly one controller can write at a time; backend-native local
+attach does not share stdout/stderr with `termstage`.
+
+## 13. Cross-References
 
 - Depends on: all numbered browser terminal specs.
 - Pairs with: [90-browser-terminal-roadmap.md](./90-browser-terminal-roadmap.md).
