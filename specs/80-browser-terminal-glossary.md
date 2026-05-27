@@ -50,24 +50,17 @@ a PTY so Chrome and a native terminal can attach to the same demo state.
 A fresh local shell spawned in a PTY. Useful for smoke tests and simple demos, but it
 does not attach to an existing Terminal.app window.
 
-## Termstage session
+## Local command terminal
 
-A termstage-managed session id mapped to a backend session reference. For the
-rmux default backend, this includes the rmux session plus target window/pane.
-Termstage owns the registry and lease state, while the backend owns the actual
-session, pane, and PTY.
+The optional split TUI rendered inside the invoking terminal when shell mode is
+started with `--local-command-terminal`. It contains a `termstage` supervisor/log
+pane and a separate command terminal pane backed by the runtime command PTY.
 
-## Semantic operation
+## Command terminal pane
 
-A backend-neutral API operation such as `PressKey`, `SendText`, `ReadScreen`,
-`WaitForText`, or `ExecCommand`. Semantic operations are translated by backend
-adapters to rmux, tmux, or future backend APIs.
-
-## Operation lease
-
-Termstage-managed write ownership for browser/API clients. A client that does
-not own the lease can read or subscribe but cannot mutate the backend session
-through termstage.
+The local TUI pane that renders parsed command PTY output and forwards keyboard
+input to the runtime when local terminal owns the input lease. It is distinct from
+`termstage`'s supervisor/log pane.
 
 ## Local-only
 
