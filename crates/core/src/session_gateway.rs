@@ -137,6 +137,63 @@ where
         Ok(lease)
     }
 
+    /// Sends literal text to the backend when `controller` owns the lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionGatewayError`] when the session is missing, the
+    /// controller is not the current owner, or the backend write fails.
+    pub async fn send_text(
+        &mut self,
+        session: &SessionName,
+        controller: ControllerRef,
+        text: &str,
+        now: Instant,
+    ) -> Result<OperationLease, SessionGatewayError> {
+        let record = self.registry.get(session)?.clone();
+        let lease = self.locks.validate_owner(session, controller, now)?;
+        self.backend.send_text(record.backend(), text).await?;
+        Ok(lease)
+    }
+
+    /// Sends one key token to the backend when `controller` owns the lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionGatewayError`] when the session is missing, the
+    /// controller is not the current owner, or the backend key send fails.
+    pub async fn send_key(
+        &mut self,
+        session: &SessionName,
+        controller: ControllerRef,
+        key: &str,
+        now: Instant,
+    ) -> Result<OperationLease, SessionGatewayError> {
+        let record = self.registry.get(session)?.clone();
+        let lease = self.locks.validate_owner(session, controller, now)?;
+        self.backend.send_key(record.backend(), key).await?;
+        Ok(lease)
+    }
+
+    /// Submits a command to the backend when `controller` owns the lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionGatewayError`] when the session is missing, the
+    /// controller is not the current owner, or the backend command send fails.
+    pub async fn run_command(
+        &mut self,
+        session: &SessionName,
+        controller: ControllerRef,
+        command: &str,
+        now: Instant,
+    ) -> Result<OperationLease, SessionGatewayError> {
+        let record = self.registry.get(session)?.clone();
+        let lease = self.locks.validate_owner(session, controller, now)?;
+        self.backend.run_command(record.backend(), command).await?;
+        Ok(lease)
+    }
+
     /// Resizes the backend pane when `controller` owns the lease.
     ///
     /// # Errors
@@ -246,6 +303,9 @@ mod tests {
     struct FakeBackend {
         created: Vec<SessionName>,
         writes: Vec<Bytes>,
+        texts: Vec<String>,
+        keys: Vec<String>,
+        commands: Vec<String>,
         resizes: Vec<TerminalSize>,
         scrolls: Vec<(BackendScrollDirection, u16)>,
         closed: Vec<SessionName>,
@@ -279,6 +339,33 @@ mod tests {
             bytes: Bytes,
         ) -> Result<(), BackendError> {
             self.writes.push(bytes);
+            Ok(())
+        }
+
+        async fn send_text(
+            &mut self,
+            _target: &BackendSessionRef,
+            text: &str,
+        ) -> Result<(), BackendError> {
+            self.texts.push(text.to_owned());
+            Ok(())
+        }
+
+        async fn send_key(
+            &mut self,
+            _target: &BackendSessionRef,
+            key: &str,
+        ) -> Result<(), BackendError> {
+            self.keys.push(key.to_owned());
+            Ok(())
+        }
+
+        async fn run_command(
+            &mut self,
+            _target: &BackendSessionRef,
+            command: &str,
+        ) -> Result<(), BackendError> {
+            self.commands.push(command.to_owned());
             Ok(())
         }
 
@@ -391,6 +478,28 @@ mod tests {
         ));
         let backend = gateway.into_backend();
         assert!(backend.writes.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_send_semantic_operations_when_controller_owns_lease() -> anyhow::Result<()>
+    {
+        let mut gateway = gateway().await?;
+        let session = SessionName::new("demo")?;
+        let owner = agent(1)?;
+        let now = Instant::now();
+        gateway.acquire_controller(&session, owner, now)?;
+
+        gateway.send_text(&session, owner, "hello", now).await?;
+        gateway.send_key(&session, owner, "Enter", now).await?;
+        gateway
+            .run_command(&session, owner, "printf semantic", now)
+            .await?;
+
+        let backend = gateway.into_backend();
+        assert_eq!(backend.texts, ["hello"]);
+        assert_eq!(backend.keys, ["Enter"]);
+        assert_eq!(backend.commands, ["printf semantic"]);
         Ok(())
     }
 

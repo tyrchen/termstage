@@ -63,12 +63,10 @@ without interpretation, while `Pane::send_key` sends one tmux-compatible key
 token (`vendors/rmux/crates/rmux-sdk/src/handles/pane.rs:418`,
 `vendors/rmux/crates/rmux-sdk/src/handles/pane.rs:428`). Its wire request also
 preserves `keys: Vec<String>` plus a `literal` flag
-(`vendors/rmux/crates/rmux-proto/src/request/pane.rs:309`). Termstage currently
-has only `BackendAdapter::write_input(Bytes)` and hardcoded key translation for
-the semantic API (`crates/core/src/backend.rs:232`,
-`apps/server/src/web.rs:1533`). This works for tmux bytes, but an rmux backend
-should expose `send_text` and `send_key` explicitly instead of reverse-mapping
-bytes into key tokens.
+(`vendors/rmux/crates/rmux-proto/src/request/pane.rs:309`). Termstage now keeps
+raw `BackendAdapter::write_input(Bytes)` for browser byte streams and exposes
+backend-native `send_text`, `send_key`, and `run_command` for semantic
+operations. That matches the rmux split while preserving tmux compatibility.
 
 4. Screen reads are under-modelled for rmux.
 
@@ -100,11 +98,10 @@ snapshots, armed waits for future output, and wait-for-exit helpers
 (`vendors/rmux/crates/rmux-sdk/src/handles/pane.rs:183`,
 `vendors/rmux/crates/rmux-sdk/src/handles/pane.rs:202`,
 `vendors/rmux/crates/rmux-sdk/src/wait.rs:31`). Termstage's `run-command`
-currently writes command text plus newline and returns `{ ok: true }`
-(`apps/server/src/web.rs:622`, `apps/server/src/web.rs:1524`). That is not
-aligned with the desired HTTP-like semantic operation model. A future rmux
-backend should support `runCommand(command, waitFor, timeout, capture)` and
-return the matched/captured result.
+semantic endpoint now accepts `waitFor`, `waitTimeoutMs`, and `capture`, then
+returns `matched` and an optional captured screen. The tmux implementation uses
+visible-screen polling; a future rmux backend should map the same request shape
+to rmux output waits and structured snapshots.
 
 7. Termstage Level 1 operation lock is not the same as rmux session leases.
 
@@ -125,8 +122,9 @@ The current architecture direction is compatible with rmux, but the backend
 contract should be amended before implementing `RmuxBackend`:
 
 - keep `SessionGateway` and termstage-managed Level 1 operation locks;
-- add backend-native operations for `send_text`, `send_key`, `run_command`,
-  `wait_for_text`, and `capture_snapshot`;
+- keep backend-native operations for `send_text`, `send_key`, and
+  `run_command`, and map future rmux support to `wait_for_text` and
+  structured capture primitives;
 - extend screen snapshots to support structured cells and revisions, or add a
   separate `BackendStructuredSnapshot` path for rmux;
 - add an event/stream capability to `BackendAdapter` so the browser can consume

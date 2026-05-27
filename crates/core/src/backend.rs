@@ -240,6 +240,36 @@ pub trait BackendAdapter: Send {
         bytes: Bytes,
     ) -> Result<(), BackendError>;
 
+    /// Sends literal text to a backend pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when the backend rejects or cannot write text.
+    async fn send_text(
+        &mut self,
+        target: &BackendSessionRef,
+        text: &str,
+    ) -> Result<(), BackendError>;
+
+    /// Sends one backend-compatible key token to a pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when the backend rejects or cannot send the key.
+    async fn send_key(&mut self, target: &BackendSessionRef, key: &str)
+    -> Result<(), BackendError>;
+
+    /// Sends a command and confirms it with Enter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when the backend cannot submit the command.
+    async fn run_command(
+        &mut self,
+        target: &BackendSessionRef,
+        command: &str,
+    ) -> Result<(), BackendError>;
+
     /// Resizes a backend pane.
     ///
     /// # Errors

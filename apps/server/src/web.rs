@@ -63,6 +63,10 @@ const API_BODY_LIMIT_BYTES: usize = 8 * 1024;
 const SEMANTIC_TEXT_MAX_BYTES: usize = 4096;
 const SEMANTIC_KEY_MAX_BYTES: usize = 32;
 const SEMANTIC_SCROLL_MAX_AMOUNT: u16 = 100;
+const SEMANTIC_WAIT_TEXT_MAX_BYTES: usize = 4096;
+const SEMANTIC_WAIT_TIMEOUT_DEFAULT_MS: u64 = 5_000;
+const SEMANTIC_WAIT_TIMEOUT_MAX_MS: u64 = 60_000;
+const SEMANTIC_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CLIENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 const CLIENT_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const SERVER_PING_INTERVAL: Duration = Duration::from_secs(25);
@@ -471,6 +475,12 @@ struct WriteTextRequest {
 struct RunCommandRequest {
     controller_id: u64,
     command: String,
+    #[serde(default)]
+    wait_for: Option<String>,
+    #[serde(default)]
+    wait_timeout_ms: Option<u64>,
+    #[serde(default)]
+    capture: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -499,6 +509,16 @@ struct LeaseResponse {
 #[serde(rename_all = "camelCase")]
 struct OperationResponse {
     ok: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunCommandResponse {
+    ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    matched: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    screen: Option<ScreenResponse>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -600,8 +620,8 @@ async fn api_press_key(
     Json(request): Json<PressKeyRequest>,
 ) -> Result<Json<OperationResponse>, ApiError> {
     validate_api_request(&state, peer, &headers, &query)?;
-    let bytes = semantic_key_bytes(&request.key)?;
-    write_semantic_bytes(&state, &path.session, request.controller_id, bytes).await?;
+    let key = semantic_key_token(&request.key)?;
+    send_semantic_key(&state, &path.session, request.controller_id, &key).await?;
     Ok(Json(OperationResponse { ok: true }))
 }
 
@@ -614,8 +634,8 @@ async fn api_write_text(
     Json(request): Json<WriteTextRequest>,
 ) -> Result<Json<OperationResponse>, ApiError> {
     validate_api_request(&state, peer, &headers, &query)?;
-    let bytes = bounded_semantic_text(request.text)?;
-    write_semantic_bytes(&state, &path.session, request.controller_id, bytes).await?;
+    let text = bounded_semantic_text(request.text)?;
+    send_semantic_text(&state, &path.session, request.controller_id, &text).await?;
     Ok(Json(OperationResponse { ok: true }))
 }
 
@@ -626,11 +646,39 @@ async fn api_run_command(
     Path(path): Path<ApiSessionPath>,
     Query(query): Query<TokenQuery>,
     Json(request): Json<RunCommandRequest>,
-) -> Result<Json<OperationResponse>, ApiError> {
+) -> Result<Json<RunCommandResponse>, ApiError> {
     validate_api_request(&state, peer, &headers, &query)?;
-    let bytes = semantic_command_bytes(request.command)?;
-    write_semantic_bytes(&state, &path.session, request.controller_id, bytes).await?;
-    Ok(Json(OperationResponse { ok: true }))
+    let command = semantic_command_text(request.command)?;
+    let wait_for = request.wait_for.map(bounded_wait_text).transpose()?;
+    let wait_timeout = semantic_wait_timeout(request.wait_timeout_ms)?;
+    let controller = agent_controller(request.controller_id)?;
+    let gateway = gateway_for_session(&state, &path.session)?;
+    {
+        let mut gateway = gateway.lock().await;
+        gateway
+            .run_command(&path.session, controller, &command, Instant::now())
+            .await
+            .map_err(ApiError::from_gateway)?;
+    }
+
+    let mut matched = None;
+    let mut screen = None;
+    if let Some(wait_for) = wait_for.as_deref() {
+        let wait_result =
+            wait_for_screen_text(&gateway, &path.session, wait_for, wait_timeout).await?;
+        matched = Some(wait_result.matched);
+        if request.capture {
+            screen = wait_result.snapshot.as_ref().map(screen_response);
+        }
+    } else if request.capture {
+        screen = Some(read_gateway_screen(&gateway, &path.session).await?);
+    }
+
+    Ok(Json(RunCommandResponse {
+        ok: true,
+        matched,
+        screen,
+    }))
 }
 
 async fn api_read_screen(
@@ -1514,62 +1562,144 @@ fn agent_controller(id: u64) -> Result<ControllerRef, ApiError> {
     ))
 }
 
-fn bounded_semantic_text(text: String) -> Result<Bytes, ApiError> {
+#[derive(Debug)]
+struct WaitForScreenTextResult {
+    matched: bool,
+    snapshot: Option<BackendScreenSnapshot>,
+}
+
+fn bounded_semantic_text(text: String) -> Result<String, ApiError> {
     if text.len() > SEMANTIC_TEXT_MAX_BYTES || text.as_bytes().contains(&0) {
         return Err(ApiError::BadRequest);
     }
-    Ok(Bytes::from(text))
+    Ok(text)
 }
 
-fn semantic_command_bytes(command: String) -> Result<Bytes, ApiError> {
+fn semantic_command_text(command: String) -> Result<String, ApiError> {
     if command.contains(['\r', '\n']) {
         return Err(ApiError::BadRequest);
     }
-    let mut command = bounded_semantic_text(command)?.to_vec();
-    command.push(b'\n');
-    Ok(Bytes::from(command))
+    bounded_semantic_text(command)
 }
 
-fn semantic_key_bytes(key: &str) -> Result<Bytes, ApiError> {
+fn bounded_wait_text(text: String) -> Result<String, ApiError> {
+    if text.is_empty() || text.len() > SEMANTIC_WAIT_TEXT_MAX_BYTES || text.as_bytes().contains(&0)
+    {
+        return Err(ApiError::BadRequest);
+    }
+    Ok(text)
+}
+
+fn semantic_wait_timeout(value: Option<u64>) -> Result<Duration, ApiError> {
+    let millis = value.unwrap_or(SEMANTIC_WAIT_TIMEOUT_DEFAULT_MS);
+    if millis == 0 || millis > SEMANTIC_WAIT_TIMEOUT_MAX_MS {
+        return Err(ApiError::BadRequest);
+    }
+    Ok(Duration::from_millis(millis))
+}
+
+fn semantic_key_token(key: &str) -> Result<String, ApiError> {
     if key.is_empty() || key.len() > SEMANTIC_KEY_MAX_BYTES {
         return Err(ApiError::BadRequest);
     }
-    let bytes = match key {
-        "Enter" => Bytes::from_static(b"\n"),
-        "Tab" => Bytes::from_static(b"\t"),
-        "Escape" => Bytes::from_static(b"\x1b"),
-        "Backspace" => Bytes::from_static(b"\x7f"),
-        "CtrlC" => Bytes::from_static(b"\x03"),
-        "CtrlD" => Bytes::from_static(b"\x04"),
-        "ArrowUp" => Bytes::from_static(b"\x1b[A"),
-        "ArrowDown" => Bytes::from_static(b"\x1b[B"),
-        "ArrowRight" => Bytes::from_static(b"\x1b[C"),
-        "ArrowLeft" => Bytes::from_static(b"\x1b[D"),
+    let token = match key {
+        "Enter" => "Enter",
+        "Tab" => "Tab",
+        "Escape" => "Escape",
+        "Backspace" => "BSpace",
+        "CtrlC" => "C-c",
+        "CtrlD" => "C-d",
+        "ArrowUp" => "Up",
+        "ArrowDown" => "Down",
+        "ArrowRight" => "Right",
+        "ArrowLeft" => "Left",
         _ => {
-            if key.chars().count() == 1 {
-                Bytes::copy_from_slice(key.as_bytes())
-            } else {
+            if key.chars().count() != 1 || key.chars().any(char::is_control) {
                 return Err(ApiError::BadRequest);
             }
+            key
         }
     };
-    Ok(bytes)
+    Ok(token.to_owned())
 }
 
-async fn write_semantic_bytes(
+async fn send_semantic_text(
     state: &AppState,
     session: &SessionName,
     controller_id: u64,
-    bytes: Bytes,
+    text: &str,
 ) -> Result<(), ApiError> {
     let controller = agent_controller(controller_id)?;
     let gateway = gateway_for_session(state, session)?;
     let mut gateway = gateway.lock().await;
     gateway
-        .write_input(session, controller, bytes, Instant::now())
+        .send_text(session, controller, text, Instant::now())
         .await
         .map_err(ApiError::from_gateway)?;
     Ok(())
+}
+
+async fn send_semantic_key(
+    state: &AppState,
+    session: &SessionName,
+    controller_id: u64,
+    key: &str,
+) -> Result<(), ApiError> {
+    let controller = agent_controller(controller_id)?;
+    let gateway = gateway_for_session(state, session)?;
+    let mut gateway = gateway.lock().await;
+    gateway
+        .send_key(session, controller, key, Instant::now())
+        .await
+        .map_err(ApiError::from_gateway)?;
+    Ok(())
+}
+
+async fn wait_for_screen_text(
+    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: &SessionName,
+    needle: &str,
+    timeout: Duration,
+) -> Result<WaitForScreenTextResult, ApiError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(ApiError::BadRequest)?;
+    loop {
+        let snapshot = {
+            let mut gateway = gateway.lock().await;
+            gateway
+                .read_screen(session)
+                .await
+                .map_err(ApiError::from_gateway)?
+        };
+        if snapshot.lines().iter().any(|line| line.contains(needle)) {
+            return Ok(WaitForScreenTextResult {
+                matched: true,
+                snapshot: Some(snapshot),
+            });
+        }
+        if Instant::now() >= deadline {
+            return Ok(WaitForScreenTextResult {
+                matched: false,
+                snapshot: Some(snapshot),
+            });
+        }
+        time::sleep(SEMANTIC_WAIT_POLL_INTERVAL).await;
+    }
+}
+
+async fn read_gateway_screen(
+    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: &SessionName,
+) -> Result<ScreenResponse, ApiError> {
+    let snapshot = {
+        let mut gateway = gateway.lock().await;
+        gateway
+            .read_screen(session)
+            .await
+            .map_err(ApiError::from_gateway)?
+    };
+    Ok(screen_response(&snapshot))
 }
 
 fn screen_response(snapshot: &BackendScreenSnapshot) -> ScreenResponse {
@@ -2233,10 +2363,24 @@ mod tests {
             &app,
             &format!("{base}/run-command"),
             &token,
-            json!({ "controllerId": 42, "command": "printf semantic-run-ok" }),
+            json!({
+                "controllerId": 42,
+                "command": "printf semantic-run-ok",
+                "waitFor": "semantic-run-ok",
+                "capture": true
+            }),
         )
         .await?;
         assert_eq!(response.status(), StatusCode::OK);
+        let run: RunCommandResponse = decode_json(response).await?;
+        assert_eq!(run.matched, Some(true));
+        assert!(
+            run.screen.as_ref().is_some_and(|screen| screen
+                .lines
+                .iter()
+                .any(|line| line.contains("semantic-run-ok"))),
+            "semantic run-command response did not capture the matched screen"
+        );
         assert!(
             read_semantic_screen_until(&app, &base, &token, "semantic-run-ok").await?,
             "semantic run-command output was not visible"
@@ -2341,10 +2485,16 @@ mod tests {
             &app,
             &format!("{base}/run-command"),
             &token,
-            json!({ "controllerId": 77, "command": "printf agent-to-browser-sync-ok" }),
+            json!({
+                "controllerId": 77,
+                "command": "printf agent-to-browser-sync-ok",
+                "waitFor": "agent-to-browser-sync-ok"
+            }),
         )
         .await?;
         assert_eq!(response.status(), StatusCode::OK);
+        let run: RunCommandResponse = decode_json(response).await?;
+        assert_eq!(run.matched, Some(true));
 
         let mut socket = connect_test_socket(server.address(), &token).await?;
         assert!(

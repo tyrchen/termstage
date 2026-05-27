@@ -243,15 +243,34 @@ impl BackendAdapter for TmuxBackend {
     ) -> Result<(), BackendError> {
         let input =
             String::from_utf8(bytes.to_vec()).map_err(|_error| BackendError::UnsupportedInput)?;
-        self.run([
-            "send-keys",
-            "-t",
-            target.pane().as_str(),
-            "-l",
-            "--",
-            &input,
-        ])
-        .await
+        self.send_text(target, &input).await
+    }
+
+    async fn send_text(
+        &mut self,
+        target: &BackendSessionRef,
+        text: &str,
+    ) -> Result<(), BackendError> {
+        self.run(["send-keys", "-t", target.pane().as_str(), "-l", "--", text])
+            .await
+    }
+
+    async fn send_key(
+        &mut self,
+        target: &BackendSessionRef,
+        key: &str,
+    ) -> Result<(), BackendError> {
+        self.run(["send-keys", "-t", target.pane().as_str(), "--", key])
+            .await
+    }
+
+    async fn run_command(
+        &mut self,
+        target: &BackendSessionRef,
+        command: &str,
+    ) -> Result<(), BackendError> {
+        self.send_text(target, command).await?;
+        self.send_key(target, "Enter").await
     }
 
     async fn resize(
@@ -454,10 +473,7 @@ mod tests {
         assert!(!reference.pane().as_str().is_empty());
 
         backend
-            .write_input(
-                &reference,
-                Bytes::from_static(b"printf termstage-backend-ok\\n\n"),
-            )
+            .run_command(&reference, "printf termstage-backend-ok")
             .await?;
         sleep(Duration::from_millis(100)).await;
         let snapshot = backend.read_screen(&reference).await?;
@@ -467,6 +483,12 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("termstage-backend-ok"))
         );
+
+        backend.send_text(&reference, "printf text-ok").await?;
+        backend.send_key(&reference, "Enter").await?;
+        sleep(Duration::from_millis(100)).await;
+        let snapshot = backend.read_screen(&reference).await?;
+        assert!(snapshot.lines().iter().any(|line| line.contains("text-ok")));
 
         backend
             .resize(&reference, TerminalSize::new(100, 30)?)
