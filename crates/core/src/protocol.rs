@@ -428,7 +428,7 @@ pub enum ErrorCode {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum LeaseOwner {
-    /// The local terminal frontend owns input.
+    /// A non-browser controller owns input.
     Terminal,
     /// The browser frontend owns input.
     Browser,

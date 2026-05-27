@@ -50,17 +50,17 @@ a PTY so Chrome and a native terminal can attach to the same demo state.
 A fresh local shell spawned in a PTY. Useful for smoke tests and simple demos, but it
 does not attach to an existing Terminal.app window.
 
-## Local command terminal
+## Backend session
 
-The optional split TUI rendered inside the invoking terminal when shell mode is
-started with `--local-command-terminal`. It contains a `termstage` supervisor/log
-pane and a separate command terminal pane backed by the runtime command PTY.
+A session/window/pane owned by a backend such as tmux, rmux, or a future terminal
+backend. `termstage` stores a reference to it and reaches it through a backend
+adapter; the backend owns the actual PTY and native local attach behavior.
 
-## Command terminal pane
+## Operation lock
 
-The local TUI pane that renders parsed command PTY output and forwards keyboard
-input to the runtime when local terminal owns the input lease. It is distinct from
-`termstage`'s supervisor/log pane.
+The `termstage`-managed write lease for a backend session. At Level 1 it allows
+one browser or API controller to write at a time while other clients remain
+read-only observers.
 
 ## Local-only
 

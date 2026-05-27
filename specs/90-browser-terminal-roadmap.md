@@ -94,26 +94,42 @@ Exit criteria:
 
 Estimate: 0.5-1 focused week.
 
-### M5 - Local Command Terminal Split UI
+### M5 - Remove Local Attach and Stabilize Browser-First Shell Mode
 
-User-visible outcome: an operator can run `termstage --mode shell --command k9s
---local-command-terminal` and see a split local terminal: `termstage` logs/status
-in one pane and the command's PTY UI in another pane, while the browser remains
-connected to the same command PTY.
+User-visible outcome: shell mode no longer exposes the obsolete local PTY
+passthrough flag. The invoking terminal is only the
+`termstage` supervisor console; command interaction remains in the browser until
+the backend-session gateway lands.
 
 Specs touched: 11, 23, 50, 70, 72, 80.
 
 Exit criteria:
 
-- `--local-command-terminal` is accepted only in shell mode.
-- Without the flag, the invoking terminal shows supervisor output only and does
-  not render command PTY bytes.
-- With the flag, local terminal renders a log/status pane and a command terminal
-  pane without interleaving logs into command output.
-- Command pane size drives the command PTY size while local terminal owns the
-  input lease.
-- Browser input and local command pane input transfer lease ownership correctly.
-- E2E smoke covers a continuous-output command and a TUI command fixture.
+- Obsolete local attach symbols are removed from code and docs.
+- CLI rejects `-a` and has no local command terminal flag.
+- Shell mode with `--command` still starts a browser-accessible command.
+- Local terminal output contains supervisor logs/URL/status only.
+
+Estimate: 0.5 focused week.
+
+### M6 - Session Backend Gateway and Level 1 Operation Lock
+
+User-visible outcome: a `termstage` session maps to a backend session/pane owned
+by rmux/tmux/future backends. A local operator can attach through the backend's
+native attach command, while browser and Agent API clients operate the same
+session through `termstage` with one active writer at a time.
+
+Specs touched: 10, 11, 20, 23, 50, 70, 72, 80.
+
+Exit criteria:
+
+- `termstage` maintains a session registry of backend session references.
+- Browser WebSocket traffic flows through a backend adapter instead of a
+  termstage-owned local command PTY abstraction.
+- Semantic API operations can write input and read screen state through the same
+  backend session.
+- Level 1 `termstage` lock allows one write controller and read-only observers.
+- Backend-native local attach remains independent of `termstage` stdout/stderr.
 
 Estimate: 1-2 focused weeks after the runtime tunnel and shell lease foundations
 are stable.

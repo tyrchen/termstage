@@ -102,7 +102,6 @@ browser.
 | `--mode shell` | `tmux` | You want a fresh local shell for quick testing. |
 | `--command <path>` | `$SHELL` or `/bin/sh` | You use shell mode and want a specific executable. |
 | `-g, --command-arg <arg>` | unset | You need to pass argv to the shell-mode command. |
-| `-a, --attach-local-terminal` | off | You want the invoking terminal to control the shell-mode PTY too. |
 | `--host <addr>` | `127.0.0.1` | You need a bind address. Non-loopback addresses require `--expose-public`. |
 | `--port <port>` | `0` | You need a fixed local port, otherwise let the OS choose. |
 | `--open` | off | You want the default browser opened automatically. |
@@ -378,7 +377,6 @@ CLI 启动
 | `--mode shell` | `tmux` | 只是临时开一个新 shell 做测试。 |
 | `--command <path>` | `$SHELL` 或 `/bin/sh` | shell 模式下想指定具体命令。 |
 | `-g, --command-arg <arg>` | 未设置 | shell 模式下需要给命令传 argv。 |
-| `-a, --attach-local-terminal` | 关闭 | 希望当前终端也接管 shell-mode PTY。 |
 | `--host <addr>` | `127.0.0.1` | 绑定地址；非 loopback 需要显式设置 `--expose-public`。 |
 | `--port <port>` | `0` | 需要固定本地端口时指定，否则让系统分配。 |
 | `--open` | 关闭 | 启动后自动打开默认浏览器。 |

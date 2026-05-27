@@ -90,19 +90,20 @@ after implementation begins.
   [70-browser-terminal-security-design.md](./70-browser-terminal-security-design.md).
 - Date: 2026-05-19.
 
-## D8 - Local Command Terminal Uses Split TUI, Not Raw Log Interleaving
+## D8 - Termstage Manages Session References, Not Local Attach PTYs
 
-- Context: Shell mode can optionally show the command PTY in the invoking
-  terminal while the browser remains connected.
-- Alternatives considered: keep `--attach-local-terminal` passthrough behavior,
-  write `termstage` logs to stderr while command output is active, or render a
-  split local TUI with separate supervisor and command panes.
-- Decision: Rename the user-facing behavior to `--local-command-terminal` and
-  render a split local TUI when enabled. The command still runs in the runtime
-  command PTY; `termstage` logs/status render in a separate pane or file.
-- Why: Passthrough attach makes logs and command output contend for the same
-  stdout/stderr surface. A split TUI preserves command PTY semantics while
-  keeping supervisor diagnostics visible and non-corrupting.
+- Context: The old shell-mode local attach plan made `termstage` own a command
+  PTY and mirror it into the invoking terminal and browser.
+- Alternatives considered: keep local passthrough behavior,
+  replace it with a split local TUI, or move shared terminal ownership to a
+  backend session such as rmux/tmux.
+- Decision: Remove the local attach flag and model `termstage` sessions as
+  backend session references. `termstage` owns the registry, gateways, auth, and
+  Level 1 operation lock; rmux/tmux/future backends own actual panes, PTYs,
+  screen state, and native local attach.
+- Why: Backend-native attach is the right abstraction for local viewing.
+  `termstage` should not mix supervisor logs with command output or implement a
+  second terminal multiplexer inside its own stdout/stderr.
 - Pinned by: [23-local-remote-command-lease-design.md](./23-local-remote-command-lease-design.md),
   [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md).
 - Date: 2026-05-27.
