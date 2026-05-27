@@ -22,11 +22,10 @@ Planned arguments:
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
-| `--session <name>` | `presentation` | Attach/create a tmux session with the validated name. |
-| `--mode <tmux|shell>` | `tmux` | Choose shared tmux or fresh shell mode. |
-| `--command <path>` | `$SHELL` on Unix | Command executable for shell mode only. |
-| `-g, --command-arg <arg>` | unset | Repeatable argv tail for shell mode only. |
-| `-a, --local-command-terminal` | false | Show and control the command PTY in a local split terminal UI in shell mode. |
+| `--session <name>` | `presentation` | Termstage session id, mapped to a backend session reference. |
+| `--backend <rmux|tmux|pty>` | `rmux` | Session backend. rmux is the default; tmux is compatibility; pty is fallback. |
+| `--command <path>` | backend default shell | Initial command for newly created backend sessions when the backend supports it. |
+| `-g, --command-arg <arg>` | unset | Repeatable argv tail for initial session command when supported. |
 | `--host <addr>` | `127.0.0.1` | Bind address; non-loopback requires `--expose-public`. |
 | `--port <port>` | `0` | Port `0` means OS-chosen random port. |
 | `--open` | false | Open the tokenized URL in the default browser. |
@@ -62,12 +61,15 @@ CLI                 Server              Browser              Runtime
   and [21-browser-terminal-public-exposure-design.md](./21-browser-terminal-public-exposure-design.md)
   validation succeeds.
 - CLI arguments crossing trust boundaries are validated before server startup.
-- `--session` is a tmux session name, not a shell command.
+- `--session` is a termstage session id that maps to a backend session reference.
+- `--backend rmux` is the preferred default for shared browser/API/native attach
+  sessions.
 - `--command` is an executable path and `-g` / `--command-arg` is repeatable argv
-  handling, not a string passed through `sh -c`.
-- `--local-command-terminal` requires `--mode shell`. It preserves the existing
-  browser-first shell mode unless the operator explicitly asks to show and
-  control the command PTY in the invoking terminal.
+  handling for backend session creation when supported, not a string passed
+  through `sh -c`.
+- No CLI flag renders the backend command PTY inside the invoking termstage
+  terminal. The invoking terminal remains a supervisor surface for logs, URL,
+  health, status, and errors.
 - Browser URL printed to logs redacts token unless the output is the explicit user
   launch URL.
 - Public mode requires `--public-url` and `--token-env`; local mode rejects both to
