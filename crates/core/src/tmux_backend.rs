@@ -32,6 +32,57 @@ pub struct TmuxBackend {
     tmux: PathBuf,
 }
 
+/// tmux session details used by supervisor CLI commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxSessionInfo {
+    session: SessionName,
+    window: BackendWindowId,
+    pane: BackendPaneId,
+    size: TerminalSize,
+}
+
+impl TmuxSessionInfo {
+    /// Creates tmux session details.
+    #[must_use]
+    pub const fn new(
+        session: SessionName,
+        window: BackendWindowId,
+        pane: BackendPaneId,
+        size: TerminalSize,
+    ) -> Self {
+        Self {
+            session,
+            window,
+            pane,
+            size,
+        }
+    }
+
+    /// Returns the session name.
+    #[must_use]
+    pub const fn session(&self) -> &SessionName {
+        &self.session
+    }
+
+    /// Returns the active window id.
+    #[must_use]
+    pub const fn window(&self) -> &BackendWindowId {
+        &self.window
+    }
+
+    /// Returns the active pane id.
+    #[must_use]
+    pub const fn pane(&self) -> &BackendPaneId {
+        &self.pane
+    }
+
+    /// Returns the active pane size.
+    #[must_use]
+    pub const fn size(&self) -> TerminalSize {
+        self.size
+    }
+}
+
 impl TmuxBackend {
     /// Resolves `tmux` from `PATH`.
     ///
@@ -54,6 +105,71 @@ impl TmuxBackend {
     #[must_use]
     pub fn tmux_path(&self) -> &Path {
         &self.tmux
+    }
+
+    /// Lists tmux sessions whose names are valid termstage session names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when tmux cannot be invoked or reports an
+    /// unexpected failure.
+    pub async fn list_sessions(&self) -> Result<Vec<SessionName>, BackendError> {
+        let output = self
+            .command()
+            .args(["list-sessions", "-F", "#{session_name}"])
+            .output()
+            .await
+            .map_err(BackendError::Io)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8(output.stderr).map_err(BackendError::Utf8)?;
+            if stderr.contains("no server running") {
+                return Ok(Vec::new());
+            }
+            return Err(BackendError::Operation(safe_trimmed_message(
+                &stderr,
+                "tmux list-sessions failed",
+            )?));
+        }
+        let text = String::from_utf8(output.stdout).map_err(BackendError::Utf8)?;
+        let sessions = text
+            .lines()
+            .filter_map(|line| SessionName::new(line.trim()).ok())
+            .collect();
+        Ok(sessions)
+    }
+
+    /// Reads details for a tmux session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when the session cannot be resolved.
+    pub async fn inspect_session(
+        &self,
+        session: &SessionName,
+    ) -> Result<TmuxSessionInfo, BackendError> {
+        let output = self
+            .command()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                session.as_str(),
+                "#{session_name}\t#{window_id}\t#{pane_id}\t#{pane_width}\t#{pane_height}",
+            ])
+            .output()
+            .await
+            .map_err(BackendError::Io)?;
+        let text = Self::success_stdout(output, "tmux display-message failed")?;
+        parse_session_info(&text)
+    }
+
+    /// Kills a tmux session by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when tmux cannot kill the session.
+    pub async fn kill_session_by_name(&self, session: &SessionName) -> Result<(), BackendError> {
+        self.run(["kill-session", "-t", session.as_str()]).await
     }
 
     async fn ensure_session(
@@ -472,12 +588,56 @@ fn default_shell_command() -> OsString {
         .unwrap_or_else(|| OsString::from("/bin/sh"))
 }
 
+fn parse_session_info(text: &str) -> Result<TmuxSessionInfo, BackendError> {
+    let mut parts = text.trim_end().split('\t');
+    let Some(session) = parts.next() else {
+        return Err(BackendError::Operation(SafeMessage::from_static(
+            "tmux did not report session name",
+        )));
+    };
+    let Some(window) = parts.next() else {
+        return Err(BackendError::Operation(SafeMessage::from_static(
+            "tmux did not report window id",
+        )));
+    };
+    let Some(pane) = parts.next() else {
+        return Err(BackendError::Operation(SafeMessage::from_static(
+            "tmux did not report pane id",
+        )));
+    };
+    let Some(cols) = parts.next() else {
+        return Err(BackendError::Operation(SafeMessage::from_static(
+            "tmux did not report pane width",
+        )));
+    };
+    let Some(rows) = parts.next() else {
+        return Err(BackendError::Operation(SafeMessage::from_static(
+            "tmux did not report pane height",
+        )));
+    };
+    if parts.next().is_some() {
+        return Err(BackendError::Operation(SafeMessage::from_static(
+            "tmux reported unexpected session details",
+        )));
+    }
+    Ok(TmuxSessionInfo::new(
+        SessionName::new(session.to_owned())?,
+        BackendWindowId::new(window)?,
+        BackendPaneId::new(pane)?,
+        TerminalSize::new(parse_u16(cols)?, parse_u16(rows)?)?,
+    ))
+}
+
 fn output_message(
     output: std::process::Output,
     fallback: &'static str,
 ) -> Result<SafeMessage, BackendError> {
     let stderr = String::from_utf8(output.stderr).map_err(BackendError::Utf8)?;
-    let trimmed = stderr.trim();
+    safe_trimmed_message(&stderr, fallback)
+}
+
+fn safe_trimmed_message(text: &str, fallback: &'static str) -> Result<SafeMessage, BackendError> {
+    let trimmed = text.trim();
     if trimmed.is_empty() {
         Ok(SafeMessage::from_static(fallback))
     } else {
@@ -487,7 +647,7 @@ fn output_message(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, process::Stdio, time::Duration};
+    use std::{process::Stdio, time::Duration};
 
     use anyhow::Context;
     use tokio::{process::Command as TokioCommand, time::sleep};
@@ -669,6 +829,17 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(BackendError::Io(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_parse_tmux_session_info() -> anyhow::Result<()> {
+        let info = parse_session_info("presentation\t@1\t%2\t120\t40\n")?;
+
+        assert_eq!(info.session().as_str(), "presentation");
+        assert_eq!(info.window().as_str(), "@1");
+        assert_eq!(info.pane().as_str(), "%2");
+        assert_eq!(info.size(), TerminalSize::new(120, 40)?);
         Ok(())
     }
 
