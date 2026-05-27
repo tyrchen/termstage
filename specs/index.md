@@ -18,7 +18,7 @@ to map that order to user-visible milestones.
 | [21-browser-terminal-public-exposure-design.md](./21-browser-terminal-public-exposure-design.md) | Public exposure design | Opt-in pod/internet mode, public URL validation, token-env token source. |
 | [22-browser-terminal-base-path-design.md](./22-browser-terminal-base-path-design.md) | Base-path design | Reverse-proxy path-prefix mounting via `--base-path`. |
 | [23-local-remote-command-lease-design.md](./23-local-remote-command-lease-design.md) | Session backend gateway design | Backend-owned session model, Termstage Protocol layers, semantic API, and operation lock. |
-| [24-runtime-tunnel-architecture-design.md](./24-runtime-tunnel-architecture-design.md) | Runtime tunnel design | Three-layer runtime tunnel architecture for embedded web-to-runtime communication. |
+| [24-runtime-tunnel-architecture-design.md](./24-runtime-tunnel-architecture-design.md) | Retired runtime tunnel design | Retired embedded runtime tunnel architecture, replaced by the backend-session gateway in spec 23. |
 | [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md) | CLI design | Command surface, presentation UX, tmux/new-shell modes. |
 | [61-browser-terminal-crates-and-features.md](./61-browser-terminal-crates-and-features.md) | Crates/features | Workspace placement, dependency versions, feature policy. |
 | [70-browser-terminal-security-design.md](./70-browser-terminal-security-design.md) | Security design | Threat model and mandatory local-service controls. |
