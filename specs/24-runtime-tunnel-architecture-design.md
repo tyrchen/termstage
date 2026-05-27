@@ -21,6 +21,7 @@ keep their current meaning:
 - `--mode shell`
 - `--command`
 - `--command-arg`
+- `--local-command-terminal`
 - `--open`
 - `--base-path`
 - public exposure flags

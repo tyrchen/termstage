@@ -1,431 +1,299 @@
-# Session Gateway and Operation Lease Design
+# Shell Mode Command Terminal Split Design
 
-Status: redesign draft v4
+Status: redesign draft v3
 Last updated: 2026-05-27
 
 ## 1. Problem
 
-The previous shell-mode design modeled sharing as `termstage` owning a command
-PTY and optionally rendering that PTY back into the invoking terminal. That mixes
-two concerns:
+Shell mode runs a configured command inside a runtime-owned PTY. Without local
+terminal participation, the invoking terminal is only the `termstage` supervisor
+console: it can show startup logs, errors, and the browser URL, but it does not
+show or control the command's PTY. This is correct for browser-first operation,
+but it is surprising for commands such as `docker logs -f`, `k9s`, or `claude`
+when the operator expects to see the command in the terminal where `termstage`
+was launched.
 
-- `termstage` as the user-facing command entrypoint, browser gateway, API
-  gateway, and session manager;
-- the terminal multiplexer or PTY backend that owns the actual session, panes,
-  screen state, and native attach behavior.
-
-The revised design makes this separation explicit. `termstage` manages sessions,
-browser WebSocket traffic, semantic API traffic, and operation lease state. The
-actual terminal session is owned by a backend such as `rmux` by default, `tmux`
-as a compatibility backend, or a future backend. `termstage`'s own stdout/stderr
-remain a supervisor surface for logs, URLs, status, health, and errors. Command
-output must not be rendered into the `termstage` supervisor terminal.
+The previous working name `--attach-local-terminal` describes an implementation
+detail, not the user-visible behavior. The feature is better described as
+showing and controlling the command terminal inside the local terminal. When this
+capability is enabled, `termstage` must also separate its own supervisor output
+from command PTY output so logs do not corrupt interactive terminal rendering.
 
 ## 2. Goals
 
 | # | Goal | Measure |
 | --- | --- | --- |
-| G1 | Define `termstage session` as a backend session reference. | A termstage session id maps to backend, backend session id, window id, and pane id. |
-| G2 | Make `rmux` the preferred/default session backend. | Browser/API control uses rmux session/pane APIs rather than a termstage-owned command PTY. |
-| G3 | Keep browser traffic under termstage management. | Browser xterm.js input/output flows through termstage WebSocket and is translated to backend operations/events. |
-| G4 | Add semantic operations for third-party automation. | Agent/API clients can press keys, send text, read screen snapshots, wait for text, and execute command-style request/response operations. |
-| G5 | Enforce Level 1 operation lease in termstage. | Browser and API writes must acquire the termstage-managed lease; non-owners remain read-only. |
-| G6 | Preserve native backend attach. | A user can attach to the same backend session directly, e.g. `rmux attach -t <session>`, and see the same screen. |
-| G7 | Remove local terminal attach/split-TUI behavior. | The invoking terminal prints termstage supervisor output only. |
+| G1 | Make the feature name describe the visible behavior. | CLI help says the flag opens a local command terminal pane, not that it "attaches" an implementation detail. |
+| G2 | Preserve browser-first shell mode by default. | Without the flag, local terminal output contains supervisor logs/URL only; command PTY bytes are visible in the browser. |
+| G3 | Split local display when enabled. | With the flag, the local terminal renders a `termstage` supervisor pane and a separate command terminal pane. |
+| G4 | Preserve PTY semantics for the command. | `docker logs -f`, `k9s`, shells, and TUIs still run in the runtime command PTY, not through piped stdin/stdout. |
+| G5 | Keep browser and local command panes synchronized. | Browser xterm.js and the local command terminal pane observe the same command PTY output and can transfer input ownership through the lease model. |
+| G6 | Prevent log/output corruption. | `termstage` logs never write directly into the command terminal pane while local command terminal mode is active. |
 
-## 3. Non-goals
+## 3. Naming
 
-- This spec does not require `termstage` to own the shared command PTY.
-- This spec does not require `termstage` to render a local command terminal pane.
-- This spec does not make `xterm.js` directly attach to a PTY or multiplexer
-  socket. Browser traffic still goes through `termstage`.
-- This spec does not require Level 2 backend-enforced locking in the first
-  implementation. Direct native attach clients may still write unless the
-  backend supports read-only attach or server-side locks.
-- This spec does not split the embedded web server into a standalone process.
+Candidate CLI names:
 
-## 4. Recommended Model
+| Candidate | Example | Pros | Cons |
+| --- | --- | --- | --- |
+| `--local-command-terminal` | `termstage --mode shell --command k9s --local-command-terminal` | Most explicit: local terminal displays and controls the command terminal. Avoids implying the command owns `termstage` stdout directly. | Longer than the old flag. |
+| `--command-terminal` | `termstage --mode shell --command k9s --command-terminal` | Shorter, focused on the command pane. | Less explicit that it affects the local invoking terminal. |
+| `--local-command-io` | `termstage --mode shell --command k9s --local-command-io` | Precisely says command input/output is connected locally. | More technical and less user-facing than "terminal". |
 
-```mermaid
-flowchart TD
-    Browser["Browser xterm.js"]
-    Agent["Agent / third-party API"]
+Decision: use `--local-command-terminal` as the binding long flag for this
+redesign. It supersedes the working name `--attach-local-terminal` in specs and
+future help text. The short flag remains available for design discussion as
+`-a`, but the long name should carry the meaning in docs and examples.
 
-    subgraph Termstage["termstage"]
-        Registry["session registry"]
-        BrowserGateway["browser WebSocket gateway"]
-        SemanticGateway["semantic API gateway"]
-        Lease["input lease / operation lock"]
-        Adapter["backend adapter"]
-        Supervisor["logs / URL / health / errors"]
-    end
+## 4. Non-goals
 
-    subgraph Backend["rmux / tmux / future backend"]
-        BackendSession["backend session"]
-        Pane["window / pane"]
-        Pty["actual pane PTY"]
-        NativeAttach["native attach support"]
-    end
+- This does not make the command inherit `termstage`'s ordinary stdout/stderr.
+  The command still runs in the runtime-owned command PTY.
+- This does not implement a second command process. Browser and local command
+  terminal views observe one command PTY.
+- This does not add multi-viewer read-only authorization. Existing token, Host,
+  Origin, and peer checks still define browser access.
+- This does not persist a lease across process restarts. Runtime owns lease state
+  in memory.
+- This does not split the embedded web server into a separate process.
 
-    Browser --> BrowserGateway
-    Agent --> SemanticGateway
-    BrowserGateway --> Lease
-    SemanticGateway --> Lease
-    Lease --> Adapter
-    Registry --> Adapter
-    Adapter --> BackendSession
-    BackendSession --> Pane
-    Pane --> Pty
-    NativeAttach --> BackendSession
-    Supervisor --> Termstage
-```
+## 5. Default Shell Mode
 
-The binding concept is:
-
-```text
-termstage session "abc"
-  -> backend: rmux
-  -> backend session: "abc"
-  -> target window/pane: main
-```
-
-Native terminal users attach through the backend:
-
-```bash
-rmux attach -t abc
-```
-
-Browser users attach through `termstage`:
-
-```text
-browser -> termstage WebSocket -> rmux API/session -> same backend pane
-```
-
-API users operate through `termstage` semantic operations:
-
-```text
-agent -> termstage API -> rmux API/session -> same backend pane
-```
-
-All three observe the same backend-owned session. `termstage` is the gateway and
-lease authority for clients that connect through `termstage`; the backend remains
-the owner of session/pane/PTY state.
-
-## 5. Three-Layer Protocol
-
-The protocol is layered so terminal rendering, session lifecycle, and automation
-do not collapse into one raw byte stream.
+Without `--local-command-terminal`, shell mode remains browser-first:
 
 ```mermaid
 flowchart TB
-    Transport["Layer 1: Transport<br/>WebSocket / HTTP / future gRPC"]
-    SessionControl["Layer 2: Session Control<br/>attach, subscribe, lease, replay, close"]
-    SemanticOps["Layer 3: Semantic Operations<br/>press key, send text, read screen, exec command"]
-    BackendAdapter["Backend adapter<br/>rmux default / tmux compatibility / future"]
+    UserTTY["Invoking terminal\ntermstage supervisor console"]
+    Termstage["termstage main process"]
+    Runtime["RuntimeSession / SessionActor\nowns command PTY"]
+    Command["command child\nk9s / docker logs -f / claude"]
+    Browser["Browser xterm.js\ncommand terminal UI"]
+    Logs["supervisor logs\nURL / status / errors"]
 
-    Transport --> SessionControl
-    SessionControl --> SemanticOps
-    SemanticOps --> BackendAdapter
+    UserTTY --> Termstage
+    Termstage --> Logs
+    Termstage --> Runtime
+    Runtime --> Command
+    Browser <--> Termstage
+    Termstage <--> Runtime
+
+    Logs --> UserTTY
+    Runtime -. "command PTY bytes not rendered locally" .-> Browser
 ```
 
-### 5.1 Transport Layer
+Behavior:
 
-Transport is only the carrier. Initial transports:
+- The command starts in a PTY owned by `RuntimeSession`.
+- Local terminal does not display command PTY bytes.
+- Local terminal can safely show `termstage` startup status, tokenized launch
+  URL, and non-sensitive logs.
+- Browser remains the command terminal UI.
 
-- Browser WebSocket for interactive UI updates and input.
-- HTTP or WebSocket API for agent/third-party semantic operations.
-- Future gRPC/QUIC/TCP transports may carry the same protocol messages.
+## 6. Local Command Terminal Mode
 
-Transport must validate token, Host, Origin, peer, body/frame size, and rate
-limits before protocol messages enter the session layer.
+With `--local-command-terminal`, the invoking terminal becomes a full-screen
+local UI owned by `termstage`. It must not directly print logs to stdout/stderr
+after entering raw/full-screen mode. Instead, `termstage` routes supervisor logs
+to a log pane and command PTY rendering to a separate command pane.
 
-### 5.2 Session Control Layer
+```mermaid
+flowchart TD
+    subgraph LocalTerminal["Local terminal window"]
+        LogPane["Supervisor pane<br/>logs, URL, status"]
+        CommandPane["Command pane<br/>local command terminal"]
+    end
 
-Session control manages who is connected, what backend session they target, and
-who is allowed to write.
+    subgraph TermstageProcess["termstage process"]
+        LocalUI["Local TUI renderer"]
+        LogBuffer["bounded log/event buffer"]
+        Parser["terminal parser/screen buffer"]
+        Runtime["RuntimeSession / SessionActor"]
+        Web["embedded web server"]
+    end
 
-Core messages:
+    Browser["Browser xterm.js"]
+    Command["command child<br/>runtime command PTY"]
 
-| Message | Direction | Meaning |
+    LogBuffer --> LocalUI
+    LocalUI --> LogPane
+
+    Runtime --> Parser
+    Parser --> LocalUI
+    LocalUI --> CommandPane
+
+    CommandPane --> LocalUI
+    LocalUI --> Runtime
+
+    Browser --> Web
+    Web --> Runtime
+    Runtime --> Web
+    Web --> Browser
+
+    Runtime --> Command
+    Command --> Runtime
+```
+
+Input and output direction is intentionally shown with simple one-way edges so
+GitHub's Mermaid renderer can lay out the graph reliably. The command pane sends
+keyboard input through the local TUI renderer when local terminal owns the input
+lease; browser input flows through the embedded web server; both eventually reach
+`RuntimeSession`.
+
+Important distinction:
+
+- `termstage`'s own supervisor console and the command terminal are separate
+  panes rendered into the same invoking terminal.
+- The command does not write to `termstage` stdout/stderr.
+- `termstage` reads command PTY bytes, updates a terminal screen buffer, and
+  redraws the command pane.
+- Logs go through `tracing`/event channels into the log pane or an optional log
+  file. They never interleave with raw command PTY bytes.
+
+## 7. Rendering Strategy
+
+The local UI needs two responsibilities:
+
+1. Draw `termstage` UI panes and status/log content.
+2. Render the command PTY byte stream inside a pane.
+
+Ratatui is suitable for the pane layout and full-screen TUI shell. It is not, by
+itself, a terminal emulator for arbitrary child-process output. The command pane
+therefore needs a terminal parser/screen buffer such as `vt100`, or a Ratatui
+terminal widget such as `tui-term` if it proves mature enough for the required
+semantics.
+
+Current ecosystem check:
+
+- `ratatui` latest docs show version `0.30.0`; use it as the candidate TUI
+  layout/rendering crate. It is a TUI library, not a terminal emulator.
+- `vt100` latest docs show version `0.16.2`; it parses a terminal byte stream
+  and provides an in-memory rendered screen.
+- `tui-term` provides a pseudoterminal widget for Ratatui. Treat it as a
+  candidate integration layer, not a hard dependency until implementation
+  validates compatibility with `k9s`, shells, and Claude-style TUIs.
+
+Implementation may choose:
+
+| Option | Shape | Use when |
 | --- | --- | --- |
-| `CreateSession` | client -> termstage | Create or ensure a backend session reference. |
-| `AttachSession` | client -> termstage | Attach browser/API stream to a termstage session. |
-| `DetachSession` | client -> termstage | Detach one client. |
-| `ListSessions` | client -> termstage | List known termstage/backend session mappings. |
-| `ListPanes` | client -> termstage | Return backend windows/panes for a session. |
-| `SubscribeScreen` | client -> termstage | Subscribe to screen updates for a pane. |
-| `AcquireInputLease` | client -> termstage | Request write ownership for browser/API operations. |
-| `ReleaseInputLease` | client -> termstage | Release write ownership. |
-| `LeaseChanged` | termstage -> clients | Broadcast current lease owner and epoch. |
-| `ReplayStarted` / `ReplayFinished` | termstage -> client | Bound replay/snapshot delivery. |
-| `CloseSession` | client -> termstage | Close termstage session mapping and optionally backend session. |
-| `Heartbeat` | both | Keep connection liveness. |
+| Ratatui + `vt100` | Own layout and render parsed screen cells manually or through a small adapter. | Maximum control, fewer widget assumptions. |
+| Ratatui + `tui-term` | Use existing pseudoterminal widget around a parser screen. | Widget behavior handles enough terminal features and passes smoke tests. |
+| Fallback passthrough | Preserve current raw local terminal attach behavior behind a development flag only. | Needed temporarily while the split TUI is incomplete; not the final design. |
 
-### 5.3 Semantic Operations Layer
+## 8. Lease State Machine
 
-Semantic operations are backend-neutral. The rmux adapter should map them to
-rmux SDK/API calls directly where possible. tmux and future adapters translate
-the same operations to their own commands/APIs.
-
-Interactive operations:
-
-| Operation | Meaning |
-| --- | --- |
-| `PressKey { pane_id, key, modifiers }` | Press one logical key such as `h`, `Enter`, `Ctrl-C`, or `PageDown`. |
-| `SendText { pane_id, text }` | Send text without implicit newline. |
-| `PasteText { pane_id, text }` | Send bracketed paste when backend supports it; otherwise send safe text input. |
-| `MouseEvent { pane_id, x, y, action }` | Send click, drag, or wheel when backend supports mouse input. |
-| `ScrollViewport { pane_id, direction, lines }` | Move the browser/API view over captured scrollback without changing app state. |
-| `ReadScreen { pane_id, format }` | Return a structured screen snapshot. |
-| `WaitForText { pane_id, pattern, timeout }` | Resolve when the rendered screen/scrollback contains text. |
-| `WaitForScreenChange { pane_id, timeout }` | Resolve when the screen changes. |
-
-Request/response command operations:
-
-| Operation | Meaning |
-| --- | --- |
-| `ExecCommand { pane_id, command, timeout }` | Execute a shell-like command and return one result. |
-| `ExecResult { request_id, status, output, exit_code }` | Result for `ExecCommand`. |
-| `CancelExec { request_id }` | Cancel a pending command request when backend supports cancellation. |
-
-`ExecCommand` is only valid for shell-like panes. It is not a substitute for
-interacting with full-screen TUIs such as editors, dashboards, Claude Code, k9s,
-or Zellij/rmux UI surfaces.
-
-## 6. Screen Model
-
-`ReadScreen` and `SubscribeScreen` should return structured screen state rather
-than an opaque text blob.
-
-```json
-{
-  "type": "screenSnapshot",
-  "sessionId": "abc",
-  "paneId": "main",
-  "size": { "cols": 120, "rows": 40 },
-  "cursor": { "row": 12, "col": 4 },
-  "alternateScreen": true,
-  "title": "k9s",
-  "rows": [
-    { "text": "Pods", "attrs": [] }
-  ]
-}
-```
-
-The snapshot model should preserve enough terminal semantics for browser
-rendering and agent reasoning:
-
-- text cells;
-- cursor position;
-- colors/styles when available;
-- alternate-screen state when available;
-- title when available;
-- scrollback/window viewport boundaries when available.
-
-The rmux backend is preferred because it already exposes session/window/pane
-handles, snapshots, send text/keys, wait primitives, and event subscriptions in
-the direction this protocol needs.
-
-## 7. Raw Terminal Stream Compatibility
-
-The three-layer protocol does not remove raw terminal semantics. Backends and
-browser renderers must still account for the underlying VT/ANSI terminal model:
-
-```text
-VT/ANSI byte stream
-  text
-  cursor movement
-  colors / styles
-  alternate screen
-  scroll regions
-  mouse protocol
-  terminal queries/responses
-  title / hyperlink / clipboard OSC
-```
-
-In the rmux-first design, termstage should prefer structured screen snapshots
-and semantic input operations over owning a raw PTY. For compatibility backends
-or fallback flows, raw bytes can still be carried as an implementation detail,
-but raw byte ownership is not the default termstage session model.
-
-## 8. Operation Lease
-
-`termstage` is the Level 1 lease authority for clients that connect through
-termstage.
+The runtime remains the only authority for input ownership. UI panes can display
+readonly state, but only runtime state decides whether input bytes are written to
+the command PTY.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> ReadOnly
-    ReadOnly --> BrowserOwner: browser AcquireInputLease
-    ReadOnly --> AgentOwner: agent AcquireInputLease
+    [*] --> LocalTerminal: local command terminal enabled
+    [*] --> Browser: browser-first shell mode
 
-    BrowserOwner --> ReadOnly: ReleaseInputLease / timeout / disconnect
-    AgentOwner --> ReadOnly: ReleaseInputLease / timeout / disconnect
+    LocalTerminal --> Browser: first browser input bytes
+    Browser --> LocalTerminal: first local command pane input bytes
 
-    BrowserOwner --> AgentOwner: forced takeover policy
-    AgentOwner --> BrowserOwner: forced takeover policy
+    LocalTerminal --> LocalTerminal: local resize / heartbeat / output
+    Browser --> Browser: browser resize / heartbeat / output
+
+    LocalTerminal --> Closed: command exits
+    Browser --> Closed: command exits
 ```
 
-Level 1 rules:
+Events:
 
-- Browser and API write operations must include or resolve to a lease owner.
-- If a client does not own the lease, `PressKey`, `SendText`, `PasteText`,
-  `MouseEvent`, and `ExecCommand` are rejected or queued according to explicit
-  policy.
-- Read operations such as `ReadScreen`, `SubscribeScreen`, `ListPanes`, and
-  `WaitForText` remain available to non-owners.
-- Lease changes are broadcast to browser/API clients as `LeaseChanged`.
-- Lease state is in-memory for the first implementation.
-- Lease timeout and disconnect release ownership.
+- Local command pane input transfers ownership to local terminal if the current
+  owner is browser, then writes bytes to the command PTY.
+- Browser input transfers ownership to browser if the current owner is local
+  terminal, then writes bytes to the command PTY.
+- Resize, heartbeat, reconnect, and attach are not ownership events.
+- Browser attach receives current `LeaseChanged(owner, epoch)` and replay.
+- Command exit closes browser and local command terminal clients according to
+  exit policy.
 
-Level 1 limitation:
+## 9. Resize Semantics
 
-- A user who directly runs `rmux attach -t abc` may still type into the backend
-  session outside termstage's control. Level 1 only constrains clients whose
-  writes pass through termstage.
+In split TUI mode, the command PTY size must match the command pane, not the full
+invoking terminal size.
 
-Level 2 TODO:
+```mermaid
+sequenceDiagram
+    participant TTY as Invoking terminal
+    participant UI as Local TUI renderer
+    participant Runtime as RuntimeSession
+    participant Command as Command PTY
 
-- Backend-enforced locks/read-only native attach should be designed later.
-- The backend should enforce that only the termstage lease owner can mutate the
-  pane, including native attached clients.
-- This depends on rmux or another backend exposing server-side client write
-  control, read-only attach, or a lock API.
+    TTY->>UI: SIGWINCH / terminal resize
+    UI->>UI: recompute layout
+    UI->>Runtime: RuntimeCommand::Resize(command pane cols, rows)
+    Runtime->>Command: resize PTY
+    Runtime-->>UI: SizeChanged(command pane cols, rows)
+    Runtime-->>Browser: SizeChanged(command pane cols, rows)
+```
 
-## 9. Backend Translation
+Browser resize remains independent. The runtime lease/resize policy decides
+which frontend's size is authoritative at a given time. When local terminal owns
+the lease, local command pane dimensions should be preferred; when browser owns
+the lease, browser dimensions should be preferred.
 
-### 9.1 rmux Backend
+## 10. Logging and Output Rules
 
-rmux is the recommended default because its direction matches the desired
-semantic layer:
+- Before entering local TUI mode, `termstage` may print startup diagnostics and
+  launch URL using existing conventions.
+- After entering local TUI mode, `termstage` must not write ordinary logs to the
+  command pane or raw stdout/stderr.
+- Logs are sent to a bounded log/event channel consumed by the local TUI log
+  pane.
+- If the log pane overflows, it drops oldest entries or uses a bounded ring
+  buffer. It must not block command PTY output.
+- Sensitive data rules from
+  [70-browser-terminal-security-design.md](./70-browser-terminal-security-design.md)
+  still apply: tokens, terminal bytes, and secrets are never logged.
 
-- session/window/pane handles;
-- screen snapshots;
-- send text / send keys;
-- wait for text/output;
-- pane event subscription;
-- native attach support.
+## 11. Implementation Notes
 
-Expected mappings:
+- Follow `AGENTS.md` for Rust 2024, no unsafe, no production `unwrap()`/`expect()`,
+  structured errors, actor-owned mutable state, strict protocol validation, and
+  bounded channels.
+- Add a local TUI actor in `apps/server`; do not duplicate PTY ownership outside
+  `RuntimeSession`.
+- The local TUI actor owns raw mode, alternate-screen entry/exit, panic-safe
+  terminal restoration, layout, and keyboard focus routing.
+- The runtime actor still owns command PTY lifecycle, replay, lease state, and
+  shutdown.
+- Prefer message passing between runtime, local TUI, and log/event producer.
+- Do not use ordinary `Command::stdin(Stdio::piped())` for the child. The child
+  continues to spawn through `portable-pty`.
 
-| Termstage operation | rmux mapping |
-| --- | --- |
-| `CreateSession` / `AttachSession` | connect or start daemon, ensure session exists. |
-| `ListPanes` | rmux session/window/pane listing. |
-| `SubscribeScreen` | rmux pane event subscription. |
-| `ReadScreen` | rmux pane snapshot. |
-| `PressKey` | rmux pane key action. |
-| `SendText` / `PasteText` | rmux pane text input. |
-| `WaitForText` | rmux wait primitive. |
-| `ExecCommand` | marker-based shell command wrapper, or rmux native exec if it grows one. |
+## 12. Verification Plan
 
-### 9.2 tmux Compatibility Backend
+- CLI parser tests:
+  - accepts `--local-command-terminal` only with `--mode shell`;
+  - rejects it outside shell mode;
+  - documents or rejects the old `--attach-local-terminal` name according to the
+    final compatibility decision.
+- Local TUI unit tests:
+  - command pane size calculation excludes log pane height;
+  - log ring buffer is bounded;
+  - keyboard focus routes ordinary input to command pane by default.
+- Runtime integration tests:
+  - local command pane input emits `RuntimeCommand::TerminalInput`;
+  - browser input transfers lease to browser;
+  - local pane input transfers lease back to local terminal;
+  - command exit restores terminal mode and shuts down per exit policy.
+- E2E smoke tests:
+  - `docker logs -f` style continuous output does not corrupt log pane;
+  - `k9s` or a TUI fixture runs in the command pane;
+  - browser and local command pane see the same command output.
 
-tmux can remain as a compatibility backend, but it has weaker semantic APIs:
-
-| Termstage operation | tmux mapping |
-| --- | --- |
-| `CreateSession` / `AttachSession` | `tmux new-session` / `tmux attach-session` semantics. |
-| `ListPanes` | `tmux list-panes`. |
-| `ReadScreen` | `tmux capture-pane`. |
-| `PressKey` / `SendText` | `tmux send-keys`. |
-| `SubscribeScreen` | polling `capture-pane`, or fallback raw attach mode. |
-| `ExecCommand` | marker + `send-keys` + `capture-pane` parsing. |
-
-### 9.3 Plain PTY Fallback
-
-A plain PTY backend may remain for simple local-only demos, but it is no longer
-the default shared-session model. It cannot provide native attach unless
-termstage implements its own mux/server or launches an external multiplexer.
-
-## 10. Implementation Phases
-
-### Phase 1 - Remove Local Terminal Attach
-
-Goal: delete the old attach-local-terminal/local split TUI direction so the code
-and docs stop implying that termstage should render the command PTY locally.
-
-Tasks:
-
-1. Remove `--attach-local-terminal` and any replacement local terminal attach
-   flag from the CLI surface.
-2. Remove local terminal frontend code that places the invoking terminal in raw
-   mode or alternate screen.
-3. Ensure termstage stdout/stderr stay supervisor-only: logs, URL, health,
-   status, and errors.
-4. Keep existing browser terminal behavior working through the current runtime
-   until Phase 2 replaces the backend model.
-5. Update README/docs/spec references away from local terminal attach.
-
-Exit criteria:
-
-- No CLI flag attaches or renders the command PTY in the invoking terminal.
-- `termstage` terminal output is supervisor-only.
-- Existing browser mode still starts and accepts browser input.
-- Tests cover removal/rejection of the old local attach flag.
-
-### Phase 2 - Implement Session Gateway Architecture
-
-Goal: introduce backend session management and semantic operations with rmux as
-the preferred default backend.
-
-Tasks:
-
-1. Add a session registry that maps termstage session ids to backend session
-   references.
-2. Add a backend adapter trait for session control and semantic operations.
-3. Implement rmux backend adapter first.
-4. Add browser WebSocket gateway that subscribes to backend screen events and
-   sends browser input through termstage semantic operations.
-5. Add semantic API endpoints for `ReadScreen`, `PressKey`, `SendText`,
-   `PasteText`, `WaitForText`, and `ExecCommand`.
-6. Add Level 1 lease enforcement across browser/API write operations.
-7. Add tmux compatibility adapter after rmux basics are stable.
-
-Exit criteria:
-
-- `termstage` can create/attach a rmux-backed session.
-- `rmux attach -t <session>` and browser view observe the same backend session.
-- Browser input goes through termstage and mutates the rmux session.
-- API `PressKey`/`SendText` mutations are reflected in browser and native rmux
-  attach views.
-- Non-owner browser/API writes are rejected while another termstage client owns
-  the lease.
-- `ReadScreen` and `ExecCommand` have request/response tests.
-
-## 11. Verification Plan
-
-- CLI tests:
-  - old local attach flag is rejected or absent;
-  - session/backend flags validate into a backend session reference.
-- Session registry tests:
-  - create, attach, detach, list sessions;
-  - reject invalid session ids and backend ids.
-- Lease tests:
-  - browser acquires lease and API write is rejected;
-  - API acquires lease and browser write is rejected;
-  - disconnect/timeout releases lease.
-- rmux backend tests:
-  - create/ensure session;
-  - send text/key to pane;
-  - read screen snapshot;
-  - wait for text;
-  - subscribe screen change.
-- Browser/API integration tests:
-  - browser input mutates backend and screen update returns to browser;
-  - API `SendText` mutates backend and update returns to browser;
-  - `ExecCommand` returns command output and exit status for shell-like pane.
-
-## 12. Cross-references
+## 13. Cross-references
 
 - Depends on [10-browser-terminal-protocol-design.md](./10-browser-terminal-protocol-design.md)
-  for existing WebSocket control conventions that will be replaced or extended.
-- Depends on [20-browser-terminal-web-design.md](./20-browser-terminal-web-design.md)
-  for browser gateway routing.
+  for WebSocket control frame conventions.
+- Depends on [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md)
+  for actor ownership and PTY lifecycle.
 - Extends [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md)
-  with backend session defaults and removal of local attach flags.
+  with shell-mode local command terminal naming and behavior.
 - Extends [70-browser-terminal-security-design.md](./70-browser-terminal-security-design.md)
-  with API write authorization and lease enforcement.
-- Should update [90-browser-terminal-roadmap.md](./90-browser-terminal-roadmap.md)
-  and [91-browser-terminal-impl-plan.md](./91-browser-terminal-impl-plan.md)
-  after this design is accepted.
+  without changing the trust boundary.
