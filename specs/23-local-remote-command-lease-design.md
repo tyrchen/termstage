@@ -97,37 +97,47 @@ after entering raw/full-screen mode. Instead, `termstage` routes supervisor logs
 to a log pane and command PTY rendering to a separate command pane.
 
 ```mermaid
-flowchart TB
-    subgraph UserTTY["Invoking terminal controlled by termstage"]
-        LogPane["Top pane\ntermstage supervisor logs / URL / status"]
-        CommandPane["Bottom pane\nlocal command terminal"]
+flowchart TD
+    subgraph LocalTerminal["Local terminal window"]
+        LogPane["Supervisor pane<br/>logs, URL, status"]
+        CommandPane["Command pane<br/>local command terminal"]
     end
 
-    subgraph Termstage["termstage main process"]
-        LocalUI["Local TUI renderer\nlayout, focus, key routing"]
+    subgraph TermstageProcess["termstage process"]
+        LocalUI["Local TUI renderer"]
         LogBuffer["bounded log/event buffer"]
         Parser["terminal parser/screen buffer"]
         Runtime["RuntimeSession / SessionActor"]
         Web["embedded web server"]
     end
 
-    Command["command child\nruntime command PTY"]
     Browser["Browser xterm.js"]
+    Command["command child<br/>runtime command PTY"]
 
-    LogBuffer --> LogPane
-    Runtime --> Parser
-    Parser --> CommandPane
+    LogBuffer --> LocalUI
     LocalUI --> LogPane
+
+    Runtime --> Parser
+    Parser --> LocalUI
     LocalUI --> CommandPane
 
-    CommandPane -- "keyboard input when local owns lease" --> LocalUI
-    LocalUI -- "TerminalInput" --> Runtime
-    Browser -- "browser input" --> Web
-    Web -- "RuntimeCommand::Input / BrowserResize" --> Runtime
-    Runtime -- "PTY bytes / controls" --> Web
+    CommandPane --> LocalUI
+    LocalUI --> Runtime
+
+    Browser --> Web
+    Web --> Runtime
+    Runtime --> Web
     Web --> Browser
-    Runtime <--> Command
+
+    Runtime --> Command
+    Command --> Runtime
 ```
+
+Input and output direction is intentionally shown with simple one-way edges so
+GitHub's Mermaid renderer can lay out the graph reliably. The command pane sends
+keyboard input through the local TUI renderer when local terminal owns the input
+lease; browser input flows through the embedded web server; both eventually reach
+`RuntimeSession`.
 
 Important distinction:
 
