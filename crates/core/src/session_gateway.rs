@@ -10,7 +10,7 @@ use bytes::Bytes;
 use thiserror::Error;
 
 use crate::{
-    backend::{BackendAdapter, BackendError, BackendScreenSnapshot},
+    backend::{BackendAdapter, BackendError, BackendScreenSnapshot, BackendScrollDirection},
     operation_lock::{ControllerRef, OperationLease, OperationLockError, OperationLockTable},
     protocol::{SessionName, TerminalSize},
     session_registry::{SessionRecord, SessionRegistry, SessionRegistryError},
@@ -173,6 +173,28 @@ where
             .map_err(Into::into)
     }
 
+    /// Scrolls backend-visible pane history when `controller` owns the lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionGatewayError`] when the session is missing, the
+    /// controller is not the current owner, or the backend scroll fails.
+    pub async fn scroll(
+        &mut self,
+        session: &SessionName,
+        controller: ControllerRef,
+        direction: BackendScrollDirection,
+        amount: u16,
+        now: Instant,
+    ) -> Result<OperationLease, SessionGatewayError> {
+        let record = self.registry.get(session)?.clone();
+        let lease = self.locks.validate_owner(session, controller, now)?;
+        self.backend
+            .scroll(record.backend(), direction, amount)
+            .await?;
+        Ok(lease)
+    }
+
     /// Closes a registered backend session and removes it from the registry.
     ///
     /// # Errors
@@ -213,7 +235,9 @@ where
 mod tests {
     use super::*;
     use crate::{
-        backend::{BackendKind, BackendPaneId, BackendSessionRef, BackendWindowId},
+        backend::{
+            BackendKind, BackendPaneId, BackendScrollDirection, BackendSessionRef, BackendWindowId,
+        },
         operation_lock::{ControllerId, ControllerKind},
         protocol::SafeMessage,
     };
@@ -223,6 +247,7 @@ mod tests {
         created: Vec<SessionName>,
         writes: Vec<Bytes>,
         resizes: Vec<TerminalSize>,
+        scrolls: Vec<(BackendScrollDirection, u16)>,
         closed: Vec<SessionName>,
         fail_close: bool,
     }
@@ -276,6 +301,16 @@ mod tests {
                 0,
                 vec![format!("session={}", target.session().as_str())],
             ))
+        }
+
+        async fn scroll(
+            &mut self,
+            _target: &BackendSessionRef,
+            direction: BackendScrollDirection,
+            amount: u16,
+        ) -> Result<(), BackendError> {
+            self.scrolls.push((direction, amount));
+            Ok(())
         }
 
         async fn close_session(&mut self, target: &BackendSessionRef) -> Result<(), BackendError> {
@@ -365,6 +400,23 @@ mod tests {
         let snapshot = gateway.read_screen(&SessionName::new("demo")?).await?;
 
         assert_eq!(snapshot.lines(), ["session=backend-demo"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_scroll_when_controller_owns_lease() -> anyhow::Result<()> {
+        let mut gateway = gateway().await?;
+        let session = SessionName::new("demo")?;
+        let owner = browser(1)?;
+        let now = Instant::now();
+        gateway.acquire_controller(&session, owner, now)?;
+
+        gateway
+            .scroll(&session, owner, BackendScrollDirection::Up, 3, now)
+            .await?;
+
+        let backend = gateway.into_backend();
+        assert_eq!(backend.scrolls, [(BackendScrollDirection::Up, 3)]);
         Ok(())
     }
 
