@@ -61,6 +61,7 @@ Versions verified on 2026-05-19. Phase 0 validation evidence is in
 | `@xterm/addon-fit` | `0.11.0` | frontend | Fit terminal to browser viewport. |
 | `@xterm/addon-web-links` | `0.12.0` | frontend | Link detection. |
 | `@xterm/addon-webgl` | `0.19.0` | frontend optional | Optional renderer feature, not required for M0. |
+| `rmux-sdk` | `0.3` | `termstage-core` optional | Optional `backend-rmux` feature for the rmux-native backend adapter in [25-rmux-backend-adapter-design.md](./25-rmux-backend-adapter-design.md). |
 
 ### 3.1 Validated API Shapes
 

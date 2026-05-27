@@ -149,7 +149,7 @@ Maps to roadmap: closes M6.
 | # | Task | Spec | Effort |
 | --- | --- | --- | --- |
 | 8.1 | Add a session registry that maps `termstage` session ids to backend session/window/pane references. | [23](./23-local-remote-command-lease-design.md), [11](./11-browser-terminal-runtime-design.md) | 1 day |
-| 8.2 | Define the backend adapter trait and implement the first rmux/tmux adapter path for create/find, stream output, write input, resize, and read-screen. | [23](./23-local-remote-command-lease-design.md), [61](./61-browser-terminal-crates-and-features.md) | 2 days |
+| 8.2 | Define the backend adapter trait and implement the first tmux adapter path for create/find, write input, resize, and read-screen. Start rmux-specific follow-up work from the dedicated rmux adapter spec. | [23](./23-local-remote-command-lease-design.md), [25](./25-rmux-backend-adapter-design.md), [61](./61-browser-terminal-crates-and-features.md) | 2 days |
 | 8.3 | Route browser WebSocket traffic through Termstage Protocol into the backend adapter. | [10](./10-browser-terminal-protocol-design.md), [20](./20-browser-terminal-web-design.md), [23](./23-local-remote-command-lease-design.md) | 1.5 days |
 | 8.4 | Add Semantic Operations API for press-key, write-text, run-command, read-screen, and scroll. | [23](./23-local-remote-command-lease-design.md), [70](./70-browser-terminal-security-design.md) | 2 days |
 | 8.5 | Implement Level 1 operation lock with owner kind, owner id, epoch, TTL, and conflict responses. | [23](./23-local-remote-command-lease-design.md), [72](./72-browser-terminal-verification-plan.md) | 1 day |

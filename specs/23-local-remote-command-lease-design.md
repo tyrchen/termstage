@@ -278,4 +278,6 @@ Exit criteria:
   [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md).
 - Updates [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md)
   by removing the local attach flag.
+- Extended by [25-rmux-backend-adapter-design.md](./25-rmux-backend-adapter-design.md)
+  with the concrete rmux SDK adapter mapping.
 - Must be verified through [72-browser-terminal-verification-plan.md](./72-browser-terminal-verification-plan.md).
