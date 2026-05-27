@@ -1,13 +1,14 @@
 //! Axum routes and WebSocket bridge for browser terminal mode.
 
 use std::{
-    fmt::{self, Debug, Formatter},
+    fmt::{self, Debug, Formatter, Write as FmtWrite},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -25,15 +26,19 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use termstage_core::{
+    backend::BackendScreenSnapshot,
+    operation_lock::{ControllerId, ControllerKind, ControllerRef, OperationLockError},
     protocol::{
-        AccessToken, ClientControlMessage, ErrorCode, SafeMessage, ServerControlMessage,
-        TerminalSize,
+        AccessToken, ClientControlMessage, ErrorCode, LeaseOwner, SafeMessage,
+        ServerControlMessage, SessionName, TerminalSize,
     },
     runtime::{ClientId, RuntimeCommand, RuntimeConfig},
     security::{
         AllowedHost, AllowedOrigin, BasePath, ExposurePolicy, PublicBaseUrl, SecurityError,
         validate_access_token, validate_peer_for_policy,
     },
+    session_gateway::{SessionGateway, SessionGatewayError},
+    tmux_backend::TmuxBackend,
     tunnel::{
         RuntimeTunnelBridge, RuntimeTunnelBridgeOutcome, TunnelCloseReason, TunnelError,
         TunnelFrame, TunnelRuntimeControl, TunnelTerminalPayload, TunnelTransport,
@@ -41,9 +46,9 @@ use termstage_core::{
 };
 use tokio::{
     net::TcpListener,
-    sync::{mpsc, oneshot},
+    sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
-    time::{self, Duration, Instant},
+    time,
 };
 use tracing::debug;
 
@@ -57,6 +62,7 @@ const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 const CLIENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 const CLIENT_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const SERVER_PING_INTERVAL: Duration = Duration::from_secs(25);
+const GATEWAY_SCREEN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SERVER_PING_PAYLOAD: &[u8] = b"termstage";
 const TUNNEL_CHANNEL_CAPACITY: usize = 32;
 const CLOSE_REASON_SESSION_ENDED: &str = "session ended";
@@ -114,10 +120,8 @@ pub struct WebConfig {
     pub exposure: WebExposure,
     /// Per-server access token.
     pub token: AccessToken,
-    /// Runtime command sender.
-    pub commands: mpsc::Sender<RuntimeCommand>,
-    /// Runtime session configuration.
-    pub runtime: RuntimeConfig,
+    /// Browser terminal session backend.
+    pub session: WebSession,
     /// Browser presentation settings.
     pub presentation: PresentationSettings,
     /// Optional reverse-proxy base path. When set, all routes mount under it.
@@ -130,19 +134,53 @@ impl WebConfig {
     pub fn local(
         token: AccessToken,
         commands: mpsc::Sender<RuntimeCommand>,
-        runtime: RuntimeConfig,
+        _runtime: RuntimeConfig,
     ) -> Self {
         Self {
             host: DEFAULT_BIND_HOST,
             port: 0,
             exposure: WebExposure::Local,
             token,
-            commands,
-            runtime,
+            session: WebSession::Runtime { commands },
             presentation: PresentationSettings::default(),
             base_path: None,
         }
     }
+
+    /// Creates a local config backed by a tmux session gateway.
+    #[must_use]
+    pub fn local_tmux_gateway(
+        token: AccessToken,
+        gateway: Arc<Mutex<SessionGateway<TmuxBackend>>>,
+        session: SessionName,
+    ) -> Self {
+        Self {
+            host: DEFAULT_BIND_HOST,
+            port: 0,
+            exposure: WebExposure::Local,
+            token,
+            session: WebSession::TmuxGateway { gateway, session },
+            presentation: PresentationSettings::default(),
+            base_path: None,
+        }
+    }
+}
+
+/// Browser terminal session backend.
+#[derive(Debug, Clone)]
+pub enum WebSession {
+    /// Existing PTY runtime actor path used by shell mode.
+    Runtime {
+        /// Runtime command sender.
+        commands: mpsc::Sender<RuntimeCommand>,
+    },
+    /// Backend-owned tmux session gateway path.
+    TmuxGateway {
+        /// Shared session gateway.
+        gateway: Arc<Mutex<SessionGateway<TmuxBackend>>>,
+        /// Termstage session id to expose in this web server.
+        session: SessionName,
+    },
 }
 
 /// Browser terminal exposure mode.
@@ -255,8 +293,7 @@ struct AppState {
 struct AppStateInner {
     exposure: ExposurePolicy,
     token: AccessToken,
-    commands: mpsc::Sender<RuntimeCommand>,
-    runtime: RuntimeConfig,
+    session: WebSession,
     presentation: PresentationSettings,
     base_path: Option<BasePath>,
     next_client_id: AtomicU64,
@@ -268,7 +305,7 @@ impl Debug for AppState {
             .debug_struct("AppState")
             .field("exposure", &self.inner.exposure)
             .field("token", &self.inner.token)
-            .field("runtime", &self.inner.runtime)
+            .field("session", &self.inner.session)
             .field("presentation", &self.inner.presentation)
             .field("base_path", &self.inner.base_path)
             .finish_non_exhaustive()
@@ -285,8 +322,7 @@ impl AppState {
             inner: Arc::new(AppStateInner {
                 exposure,
                 token: config.token,
-                commands: config.commands,
-                runtime: config.runtime,
+                session: config.session,
                 presentation: config.presentation,
                 base_path: config.base_path,
                 next_client_id: AtomicU64::new(1),
@@ -410,13 +446,23 @@ async fn ws(
 }
 
 async fn bridge_socket(state: AppState, socket: WebSocket) {
+    match state.inner.session.clone() {
+        WebSession::Runtime { commands } => bridge_runtime_socket(state, socket, commands).await,
+        WebSession::TmuxGateway { gateway, session } => {
+            bridge_gateway_socket(state, socket, gateway, session).await;
+        }
+    }
+}
+
+async fn bridge_runtime_socket(
+    state: AppState,
+    socket: WebSocket,
+    commands: mpsc::Sender<RuntimeCommand>,
+) {
     let client_id = state.client_id();
     let (mut sender, mut receiver) = socket.split();
     let (mut tunnel, transport) = in_process_tunnel_pair();
-    let mut bridge_task = tokio::spawn(RuntimeTunnelBridge::run(
-        transport,
-        state.inner.commands.clone(),
-    ));
+    let mut bridge_task = tokio::spawn(RuntimeTunnelBridge::run(transport, commands));
     let mut bridge_finished = false;
     if tunnel
         .send_frame(TunnelFrame::AttachBrowser { client_id })
@@ -481,6 +527,82 @@ async fn bridge_socket(state: AppState, socket: WebSocket) {
             Err(error) => {
                 debug!(%error, "runtime tunnel bridge task panicked during browser detach");
             }
+        }
+    }
+}
+
+async fn bridge_gateway_socket(
+    state: AppState,
+    socket: WebSocket,
+    gateway: Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: SessionName,
+) {
+    let client_id = state.client_id();
+    let controller = match controller_from_client(client_id) {
+        Ok(controller) => controller,
+        Err(error) => {
+            debug!(%error, "failed to create browser controller id");
+            return;
+        }
+    };
+    let (mut sender, mut receiver) = socket.split();
+    let owns_lease = match attach_gateway_browser(&gateway, &session, controller, &mut sender).await
+    {
+        Ok(lease_state) => lease_state,
+        Err(error) => {
+            debug!(%error, "gateway browser attach failed");
+            let _result = sender
+                .send(Message::Close(Some(runtime_unavailable_close())))
+                .await;
+            return;
+        }
+    };
+
+    let mut last_client_message = Instant::now();
+    let mut last_screen = Bytes::new();
+    let mut heartbeat_check = time::interval(CLIENT_HEARTBEAT_CHECK_INTERVAL);
+    let mut server_ping = time::interval(SERVER_PING_INTERVAL);
+    let mut screen_poll = time::interval(GATEWAY_SCREEN_POLL_INTERVAL);
+    loop {
+        tokio::select! {
+            Some(message) = receiver.next() => {
+                if handle_gateway_browser_message(
+                    message,
+                    &gateway,
+                    &session,
+                    controller,
+                    owns_lease,
+                    &mut sender,
+                    &mut last_client_message,
+                ).await.should_close() {
+                    break;
+                }
+            }
+            _ = screen_poll.tick() => {
+                if send_gateway_screen_if_changed(&gateway, &session, &mut sender, &mut last_screen).await.should_close() {
+                    break;
+                }
+            }
+            _ = heartbeat_check.tick() => {
+                if last_client_message.elapsed() >= CLIENT_HEARTBEAT_TIMEOUT {
+                    debug!(client_id = client_id.get(), "closing stale gateway browser terminal websocket");
+                    let _result = sender.send(Message::Close(Some(client_timeout_close()))).await;
+                    break;
+                }
+            }
+            _ = server_ping.tick() => {
+                if send_server_ping(&mut sender).await.is_err() {
+                    break;
+                }
+            }
+            else => break,
+        }
+    }
+
+    if owns_lease {
+        let mut gateway = gateway.lock().await;
+        if let Err(error) = gateway.release_controller(&session, controller, Instant::now()) {
+            debug!(%error, "failed to release gateway browser controller");
         }
     }
 }
@@ -566,6 +688,197 @@ async fn handle_browser_message(
             debug!(%error, "websocket receive error");
             BrowserSocketAction::Close
         }
+    }
+}
+
+async fn attach_gateway_browser(
+    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: &SessionName,
+    controller: ControllerRef,
+    sender: &mut BrowserSocketSender,
+) -> Result<bool, SessionGatewayError> {
+    let (owns_lease, lease_owner, lease_epoch, snapshot) = {
+        let mut gateway = gateway.lock().await;
+        let (owns_lease, lease_owner, lease_epoch) =
+            match gateway.acquire_controller(session, controller, Instant::now()) {
+                Ok(lease) => (true, LeaseOwner::Browser, lease.epoch()),
+                Err(SessionGatewayError::Lock(OperationLockError::LeaseConflict { .. })) => {
+                    (false, LeaseOwner::Terminal, 0)
+                }
+                Err(error) => return Err(error),
+            };
+        let snapshot = gateway.read_screen(session).await?;
+        (owns_lease, lease_owner, lease_epoch, snapshot)
+    };
+    send_server_control(
+        sender,
+        ServerControlMessage::LeaseChanged {
+            owner: lease_owner,
+            epoch: lease_epoch,
+        },
+    )
+    .await;
+    send_server_control(
+        sender,
+        ServerControlMessage::Ready {
+            session: session.clone(),
+        },
+    )
+    .await;
+    send_server_control(
+        sender,
+        ServerControlMessage::SizeChanged {
+            size: snapshot.size(),
+        },
+    )
+    .await;
+    let bytes = screen_snapshot_bytes(&snapshot);
+    let _result = sender.send(Message::Binary(bytes)).await;
+    Ok(owns_lease)
+}
+
+async fn handle_gateway_browser_message(
+    message: Result<Message, axum::Error>,
+    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: &SessionName,
+    controller: ControllerRef,
+    owns_lease: bool,
+    sender: &mut BrowserSocketSender,
+    last_client_message: &mut Instant,
+) -> BrowserSocketAction {
+    match message {
+        Ok(Message::Binary(bytes)) => {
+            *last_client_message = Instant::now();
+            handle_gateway_binary(bytes, gateway, session, controller, owns_lease, sender).await
+        }
+        Ok(Message::Text(text)) => {
+            *last_client_message = Instant::now();
+            handle_gateway_text(&text, gateway, session, controller, owns_lease, sender).await
+        }
+        Ok(Message::Close(_frame)) => BrowserSocketAction::Close,
+        Ok(Message::Ping(bytes)) => {
+            *last_client_message = Instant::now();
+            if sender.send(Message::Pong(bytes)).await.is_err() {
+                BrowserSocketAction::Close
+            } else {
+                BrowserSocketAction::Continue
+            }
+        }
+        Ok(Message::Pong(_bytes)) => {
+            *last_client_message = Instant::now();
+            BrowserSocketAction::Continue
+        }
+        Err(error) => {
+            debug!(%error, "gateway websocket receive error");
+            BrowserSocketAction::Close
+        }
+    }
+}
+
+async fn handle_gateway_binary(
+    bytes: Bytes,
+    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: &SessionName,
+    controller: ControllerRef,
+    owns_lease: bool,
+    sender: &mut BrowserSocketSender,
+) -> BrowserSocketAction {
+    if !owns_lease {
+        let _result = send_forbidden_error(sender).await;
+        return BrowserSocketAction::Continue;
+    }
+    let bytes = match TunnelTerminalPayload::new(bytes) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            debug!(%error, "closing websocket after oversized gateway input frame");
+            let _result = send_control_error(sender).await;
+            let _result = sender.send(Message::Close(Some(protocol_close()))).await;
+            return BrowserSocketAction::Close;
+        }
+    };
+    let result = {
+        let mut gateway = gateway.lock().await;
+        gateway
+            .write_input(session, controller, bytes.into_bytes(), Instant::now())
+            .await
+    };
+    if let Err(error) = result {
+        debug!(%error, "gateway input failed");
+        let _result = send_runtime_error(sender).await;
+    }
+    BrowserSocketAction::Continue
+}
+
+async fn handle_gateway_text(
+    text: &str,
+    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: &SessionName,
+    controller: ControllerRef,
+    owns_lease: bool,
+    sender: &mut BrowserSocketSender,
+) -> BrowserSocketAction {
+    let message = match serde_json::from_str::<ClientControlMessage>(text) {
+        Ok(message) => message,
+        Err(error) => {
+            debug!(%error, "closing gateway websocket after invalid control frame");
+            let _result = send_control_error(sender).await;
+            let _result = sender.send(Message::Close(Some(protocol_close()))).await;
+            return BrowserSocketAction::Close;
+        }
+    };
+    match message {
+        ClientControlMessage::Resize { cols, rows } => {
+            if !owns_lease {
+                let _result = send_forbidden_error(sender).await;
+                return BrowserSocketAction::Continue;
+            }
+            let size = TerminalSize { cols, rows };
+            let result = {
+                let mut gateway = gateway.lock().await;
+                gateway
+                    .resize(session, controller, size, Instant::now())
+                    .await
+            };
+            if let Err(error) = result {
+                debug!(%error, "gateway resize failed");
+                let _result = send_runtime_error(sender).await;
+            } else {
+                send_server_control(sender, ServerControlMessage::SizeChanged { size }).await;
+            }
+        }
+        ClientControlMessage::Heartbeat { .. } => {}
+    }
+    BrowserSocketAction::Continue
+}
+
+async fn send_gateway_screen_if_changed(
+    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: &SessionName,
+    sender: &mut BrowserSocketSender,
+    last_screen: &mut Bytes,
+) -> BrowserSocketAction {
+    let snapshot = {
+        let mut gateway = gateway.lock().await;
+        match gateway.read_screen(session).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                debug!(%error, "gateway screen read failed");
+                let _result = sender
+                    .send(Message::Close(Some(runtime_unavailable_close())))
+                    .await;
+                return BrowserSocketAction::Close;
+            }
+        }
+    };
+    let bytes = screen_snapshot_bytes(&snapshot);
+    if bytes == *last_screen {
+        return BrowserSocketAction::Continue;
+    }
+    *last_screen = bytes.clone();
+    if sender.send(Message::Binary(bytes)).await.is_err() {
+        BrowserSocketAction::Close
+    } else {
+        BrowserSocketAction::Continue
     }
 }
 
@@ -821,12 +1134,74 @@ async fn send_control_error(
     sender.send(Message::Text(text.into())).await
 }
 
+async fn send_runtime_error(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+) -> Result<(), axum::Error> {
+    let message = ServerControlMessage::Error {
+        code: ErrorCode::Runtime,
+        message: SafeMessage::from_static("backend operation failed"),
+    };
+    send_server_control_result(sender, &message).await
+}
+
+async fn send_forbidden_error(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+) -> Result<(), axum::Error> {
+    let message = ServerControlMessage::Error {
+        code: ErrorCode::Forbidden,
+        message: SafeMessage::from_static("controller does not own input lease"),
+    };
+    send_server_control_result(sender, &message).await
+}
+
+async fn send_server_control(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: ServerControlMessage,
+) {
+    let _result = send_server_control_result(sender, &message).await;
+}
+
+async fn send_server_control_result(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: &ServerControlMessage,
+) -> Result<(), axum::Error> {
+    let text = match serde_json::to_string(message) {
+        Ok(text) => text,
+        Err(error) => {
+            debug!(%error, "failed to serialize server control message");
+            return Ok(());
+        }
+    };
+    sender.send(Message::Text(text.into())).await
+}
+
 async fn send_server_ping(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
 ) -> Result<(), axum::Error> {
     sender
         .send(Message::Ping(Bytes::from_static(SERVER_PING_PAYLOAD)))
         .await
+}
+
+fn controller_from_client(client_id: ClientId) -> Result<ControllerRef, OperationLockError> {
+    Ok(ControllerRef::new(
+        ControllerKind::Browser,
+        ControllerId::new(client_id.get())?,
+    ))
+}
+
+fn screen_snapshot_bytes(snapshot: &BackendScreenSnapshot) -> Bytes {
+    let mut text = String::from("\x1b[H\x1b[2J");
+    for (index, line) in snapshot.lines().iter().enumerate() {
+        if index > 0 {
+            text.push_str("\r\n");
+        }
+        text.push_str(line);
+    }
+    let cursor_row = snapshot.cursor_row().saturating_add(1);
+    let cursor_col = snapshot.cursor_col().saturating_add(1);
+    let _result = write!(text, "\x1b[{cursor_row};{cursor_col}H");
+    Bytes::from(text)
 }
 
 fn protocol_error_message() -> SafeMessage {
@@ -947,6 +1322,8 @@ mod tests {
     use std::{
         ffi::OsString,
         net::{IpAddr, Ipv4Addr},
+        path::PathBuf,
+        process::Stdio,
     };
 
     use anyhow::Context;
@@ -961,6 +1338,8 @@ mod tests {
         runtime::{
             ExitPolicy, ReconnectPolicy, RuntimeSession, SessionMode, ShellCommand, ShutdownReason,
         },
+        session_gateway::SessionGateway,
+        tmux_backend::TmuxBackend,
     };
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::{
@@ -992,6 +1371,41 @@ mod tests {
         let mut config = WebConfig::local(token.clone(), commands, runtime);
         config.port = 49152;
         Ok((config, token))
+    }
+
+    #[derive(Debug)]
+    struct TmuxSessionCleanup {
+        tmux: PathBuf,
+        session: SessionName,
+        active: bool,
+    }
+
+    impl TmuxSessionCleanup {
+        fn new(tmux: PathBuf, session: SessionName) -> Self {
+            Self {
+                tmux,
+                session,
+                active: true,
+            }
+        }
+    }
+
+    impl Drop for TmuxSessionCleanup {
+        #[allow(
+            clippy::disallowed_types,
+            reason = "test cleanup runs from Drop and cannot await tokio::process::Command"
+        )]
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            let _result = std::process::Command::new(&self.tmux)
+                .env_remove("TMUX")
+                .args(["kill-session", "-t", self.session.as_str()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
     }
 
     async fn request(path: &str, host: &str, config: WebConfig) -> anyhow::Result<StatusCode> {
@@ -1265,6 +1679,40 @@ mod tests {
         assert!(found);
         server.shutdown().await?;
         session.shutdown(ShutdownReason::Supervisor).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_bridge_websocket_to_tmux_gateway() -> anyhow::Result<()> {
+        let backend = TmuxBackend::from_path().context("tmux unavailable")?;
+        let tmux = backend.tmux_path().to_path_buf();
+        let token = AccessToken::from_bytes([17; 32]);
+        let session = SessionName::new(format!("termstage-gateway-ws-{}", std::process::id()))?;
+        let _cleanup = TmuxSessionCleanup::new(tmux, session.clone());
+        let mut gateway = SessionGateway::new(backend, Duration::from_secs(90));
+        gateway
+            .create_or_find_session(session.clone(), session.clone(), TerminalSize::new(80, 24)?)
+            .await?;
+        let config = WebConfig::local_tmux_gateway(
+            token.clone(),
+            Arc::new(Mutex::new(gateway)),
+            session.clone(),
+        );
+        let server = serve(config).await?;
+        let mut socket = connect_test_socket(server.address(), &token).await?;
+
+        socket
+            .send(TungsteniteMessage::Binary(Bytes::from_static(
+                b"printf gateway-ws-ok\\n\n",
+            )))
+            .await?;
+
+        assert!(
+            read_socket_until(&mut socket, b"gateway-ws-ok").await?,
+            "gateway websocket did not receive tmux backend output"
+        );
+        socket.close(None).await?;
+        server.shutdown().await?;
         Ok(())
     }
 

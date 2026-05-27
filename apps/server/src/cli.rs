@@ -18,7 +18,10 @@ use termstage_core::{
         ShutdownReason,
     },
     security::{BasePath, PublicBaseUrl},
+    session_gateway::SessionGateway,
+    tmux_backend::TmuxBackend,
 };
+use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::web::{PresentationSettings, PresentationTheme, WebConfig, WebExposure, serve};
@@ -29,6 +32,7 @@ const MIN_FONT_SIZE: u16 = 12;
 const MAX_FONT_SIZE: u16 = 96;
 const TOKEN_ENV_MAX_BYTES: usize = 128;
 const ACTOR_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const GATEWAY_LEASE_TTL: Duration = Duration::from_secs(90);
 
 /// Browser terminal command-line arguments.
 #[derive(Debug, Parser)]
@@ -190,6 +194,13 @@ pub async fn run() -> anyhow::Result<()> {
 /// Returns an error when runtime or server startup fails.
 pub async fn run_with_config(config: ValidatedCliConfig) -> anyhow::Result<()> {
     reject_root_user()?;
+    match config.runtime.mode.clone() {
+        SessionMode::Tmux { session } => run_gateway_tmux(config, session).await,
+        SessionMode::NewShell { .. } => run_legacy_runtime(config).await,
+    }
+}
+
+async fn run_legacy_runtime(config: ValidatedCliConfig) -> anyhow::Result<()> {
     let session = RuntimeSession::start(config.runtime.clone())
         .context("failed to start browser terminal runtime")?;
     let mut web_config = WebConfig::local(config.token, session.command_sender(), config.runtime);
@@ -221,6 +232,48 @@ pub async fn run_with_config(config: ValidatedCliConfig) -> anyhow::Result<()> {
         .shutdown(shutdown_reason)
         .await
         .context("failed to shutdown browser terminal runtime")
+}
+
+async fn run_gateway_tmux(config: ValidatedCliConfig, session: SessionName) -> anyhow::Result<()> {
+    let backend = TmuxBackend::from_path().context("failed to resolve tmux backend")?;
+    let mut gateway = SessionGateway::new(backend, GATEWAY_LEASE_TTL);
+    gateway
+        .create_or_find_session(
+            session.clone(),
+            session.clone(),
+            config.runtime.initial_size,
+        )
+        .await
+        .context("failed to create or find tmux backend session")?;
+    let mut web_config = WebConfig::local_tmux_gateway(
+        config.token,
+        std::sync::Arc::new(Mutex::new(gateway)),
+        session,
+    );
+    web_config.host = config.host;
+    web_config.port = config.port;
+    web_config.presentation = config.presentation;
+    web_config.exposure = config.exposure;
+    web_config.base_path = config.base_path;
+
+    let server = serve(web_config)
+        .await
+        .context("failed to start browser terminal server")?;
+    let launch_url = server.launch_url();
+    if config.open {
+        if let Err(error) = open::that_detached(&launch_url) {
+            eprintln!("{launch_url}");
+            info!(%error, "failed to open browser; printed launch URL");
+        }
+    } else {
+        eprintln!("{launch_url}");
+    }
+    info!(address = %server.address(), "browser terminal server started");
+    wait_for_gateway_shutdown().await;
+    server
+        .shutdown()
+        .await
+        .context("failed to shutdown browser terminal server")
 }
 
 fn shell_mode_command(path: Option<PathBuf>, args: Vec<OsString>) -> anyhow::Result<ShellCommand> {
@@ -317,6 +370,10 @@ async fn wait_for_shutdown_or_runtime_exit(session: &RuntimeSession) -> Shutdown
             }
         }
     }
+}
+
+async fn wait_for_gateway_shutdown() {
+    let _result = tokio::signal::ctrl_c().await;
 }
 
 fn init_tracing() {
