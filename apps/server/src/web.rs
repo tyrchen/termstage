@@ -35,8 +35,8 @@ use termstage_core::{
         validate_access_token, validate_peer_for_policy,
     },
     tunnel::{
-        JsonTunnelCodec, RuntimeTunnelBridge, RuntimeTunnelBridgeOutcome, TunnelCloseReason,
-        TunnelError, TunnelFrame, TunnelRuntimeControl, TunnelTerminalPayload, TunnelTransport,
+        RuntimeTunnelBridge, RuntimeTunnelBridgeOutcome, TunnelCloseReason, TunnelError,
+        TunnelFrame, TunnelRuntimeControl, TunnelTerminalPayload, TunnelTransport,
     },
 };
 use tokio::{
@@ -47,10 +47,7 @@ use tokio::{
 };
 use tracing::debug;
 
-use crate::{
-    assets::{asset_response, index_response},
-    tunnel_ws::AxumWebSocketTunnelTransport,
-};
+use crate::assets::{asset_response, index_response};
 
 type BrowserSocketSender = futures_util::stream::SplitSink<WebSocket, Message>;
 
@@ -316,7 +313,6 @@ pub fn router(config: WebConfig) -> Result<Router, SecurityError> {
         .route(&format!("{prefix}/"), get(index))
         .route(&format!("{prefix}/assets/{{*path}}"), get(asset))
         .route(&format!("{prefix}/ws"), get(ws))
-        .route(&format!("{prefix}/tunnel/ws"), get(tunnel_ws_endpoint))
         .route(&format!("{prefix}/healthz"), get(healthz));
     if !prefix.is_empty() {
         router = router.route(prefix, get(index));
@@ -411,28 +407,6 @@ async fn ws(
         .max_message_size(MAX_MESSAGE_SIZE)
         .on_upgrade(move |socket| bridge_socket(state, socket))
         .into_response())
-}
-
-async fn tunnel_ws_endpoint(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Query(query): Query<TokenQuery>,
-    upgrade: WebSocketUpgrade,
-) -> Result<Response, WebError> {
-    validate_http_request(&state, peer, &headers, &query, true)?;
-    Ok(upgrade
-        .max_frame_size(MAX_FRAME_SIZE)
-        .max_message_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| tunnel_socket(state, socket))
-        .into_response())
-}
-
-async fn tunnel_socket(state: AppState, socket: WebSocket) {
-    let transport = AxumWebSocketTunnelTransport::new(socket, JsonTunnelCodec);
-    if let Err(error) = RuntimeTunnelBridge::run(transport, state.inner.commands.clone()).await {
-        debug!(%error, "runtime tunnel websocket closed with error");
-    }
 }
 
 async fn bridge_socket(state: AppState, socket: WebSocket) {
@@ -983,11 +957,10 @@ mod tests {
     use bytes::Bytes;
     use http_body_util::BodyExt;
     use termstage_core::{
-        protocol::{AccessToken, HeartbeatSequence, SessionName, TerminalSize},
+        protocol::{AccessToken, SessionName, TerminalSize},
         runtime::{
             ExitPolicy, ReconnectPolicy, RuntimeSession, SessionMode, ShellCommand, ShutdownReason,
         },
-        tunnel::{JsonTunnelCodec, TunnelCodec, TunnelFrame, TunnelPayload, TunnelTerminalPayload},
     };
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::{
@@ -1233,83 +1206,6 @@ mod tests {
             ),
             Err(WebError(SecurityError::InvalidOrigin))
         ));
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_should_accept_tunnel_websocket_and_forward_frame_to_runtime() -> anyhow::Result<()>
-    {
-        let token = AccessToken::from_bytes([15; 32]);
-        let (commands, mut command_rx) = mpsc::channel(8);
-        let runtime = RuntimeConfig {
-            mode: SessionMode::NewShell {
-                shell: test_shell_command()?,
-            },
-            initial_size: TerminalSize::new(80, 24)?,
-            reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
-            exit_policy: ExitPolicy::Hold,
-        };
-        let server = serve(WebConfig::local(token.clone(), commands, runtime)).await?;
-        let mut socket = connect_tunnel_socket(server.address(), "/tunnel/ws", &token).await?;
-        let frame = TunnelFrame::BrowserInput {
-            client_id: ClientId::new(31),
-            bytes: TunnelTerminalPayload::new(Bytes::from_static(b"tunnel-input"))?,
-        };
-        let TunnelPayload::Text(text) = JsonTunnelCodec.encode(&frame)? else {
-            anyhow::bail!("expected JSON text tunnel frame");
-        };
-
-        socket.send(TungsteniteMessage::Text(text.into())).await?;
-        let command = timeout(Duration::from_secs(5), command_rx.recv())
-            .await?
-            .context("runtime command channel closed")?;
-
-        let RuntimeCommand::Input { client_id, bytes } = command else {
-            anyhow::bail!("expected browser input runtime command");
-        };
-        assert_eq!(client_id, ClientId::new(31));
-        assert_eq!(bytes, Bytes::from_static(b"tunnel-input"));
-        socket.close(None).await?;
-        server.shutdown().await?;
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_should_reject_tunnel_websocket_with_invalid_token() -> anyhow::Result<()> {
-        let (config, _token) = test_config()?;
-        let server = serve(config).await?;
-        let url = format!("ws://{}/tunnel/ws?token=bad", server.address());
-        let mut request = url.into_client_request()?;
-        let origin = format!("http://{}", server.address());
-        request
-            .headers_mut()
-            .insert(header::ORIGIN, origin.parse()?);
-
-        assert!(connect_async(request).await.is_err());
-        server.shutdown().await?;
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_should_mount_tunnel_websocket_under_base_path() -> anyhow::Result<()> {
-        let (mut config, token) = test_config()?;
-        config.port = 0;
-        config.base_path = Some(BasePath::parse("/p/sess-3/")?);
-        let server = serve(config).await?;
-        let mut socket =
-            connect_tunnel_socket(server.address(), "/p/sess-3/tunnel/ws", &token).await?;
-        let frame = TunnelFrame::Heartbeat {
-            sequence: HeartbeatSequence::new(1),
-        };
-        let TunnelPayload::Text(text) = JsonTunnelCodec.encode(&frame)? else {
-            anyhow::bail!("expected JSON text tunnel frame");
-        };
-        socket.send(TungsteniteMessage::Text(text.into())).await?;
-        socket.close(None).await?;
-
-        let root_result = connect_tunnel_socket(server.address(), "/tunnel/ws", &token).await;
-        assert!(root_result.is_err());
-        server.shutdown().await?;
         Ok(())
     }
 
@@ -1804,25 +1700,6 @@ mod tests {
         >,
     > {
         let url = format!("ws://{address}/ws?token={}", token.to_url_token());
-        let mut request = url.into_client_request()?;
-        let origin = format!("http://{address}");
-        request
-            .headers_mut()
-            .insert(header::ORIGIN, origin.parse()?);
-        let (socket, _response) = connect_async(request).await?;
-        Ok(socket)
-    }
-
-    async fn connect_tunnel_socket(
-        address: SocketAddr,
-        path: &str,
-        token: &AccessToken,
-    ) -> anyhow::Result<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    > {
-        let url = format!("ws://{address}{path}?token={}", token.to_url_token());
         let mut request = url.into_client_request()?;
         let origin = format!("http://{address}");
         request
