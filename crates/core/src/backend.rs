@@ -192,6 +192,12 @@ pub enum BackendError {
     /// Backend IO failed.
     #[error("backend io failed")]
     Io(#[source] std::io::Error),
+    /// Backend output was not valid UTF-8.
+    #[error("backend output was not valid utf-8")]
+    Utf8(#[source] std::string::FromUtf8Error),
+    /// Terminal input bytes could not be represented for this backend.
+    #[error("backend input bytes are unsupported")]
+    UnsupportedInput,
     /// Backend operation failed with a safe message.
     #[error("backend operation failed: {0:?}")]
     Operation(SafeMessage),
