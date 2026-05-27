@@ -1749,7 +1749,10 @@ mod tests {
         session_gateway::SessionGateway,
         tmux_backend::TmuxBackend,
     };
-    use tokio::time::{Duration, timeout};
+    use tokio::{
+        process::Command as TokioCommand,
+        time::{Duration, timeout},
+    };
     use tokio_tungstenite::{
         connect_async,
         tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest},
@@ -2300,6 +2303,153 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_sync_agent_api_output_to_read_only_browser() -> anyhow::Result<()> {
+        let backend = TmuxBackend::from_path().context("tmux unavailable")?;
+        let tmux = backend.tmux_path().to_path_buf();
+        let token = AccessToken::from_bytes([20; 32]);
+        let session = SessionName::new(format!(
+            "termstage-agent-browser-sync-{}",
+            std::process::id()
+        ))?;
+        let _cleanup = TmuxSessionCleanup::new(tmux, session.clone());
+        let mut gateway = SessionGateway::new(backend, Duration::from_secs(90));
+        gateway
+            .create_or_find_session(session.clone(), session.clone(), TerminalSize::new(80, 24)?)
+            .await?;
+        let shared_gateway = Arc::new(Mutex::new(gateway));
+        let mut app_config = WebConfig::local_tmux_gateway(
+            token.clone(),
+            Arc::clone(&shared_gateway),
+            session.clone(),
+        );
+        app_config.port = 49152;
+        let app = router(app_config)?;
+        let server_config =
+            WebConfig::local_tmux_gateway(token.clone(), shared_gateway, session.clone());
+        let server = serve(server_config).await?;
+        let base = format!("/api/sessions/{}", session.as_str());
+
+        let response = api_post_json(
+            &app,
+            &format!("{base}/acquire-lock"),
+            &token,
+            json!({ "controllerId": 77 }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = api_post_json(
+            &app,
+            &format!("{base}/run-command"),
+            &token,
+            json!({ "controllerId": 77, "command": "printf agent-to-browser-sync-ok" }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut socket = connect_test_socket(server.address(), &token).await?;
+        assert!(
+            read_socket_until(&mut socket, b"agent-to-browser-sync-ok").await?,
+            "read-only browser did not receive Agent API output"
+        );
+        socket
+            .send(TungsteniteMessage::Binary(Bytes::from_static(
+                b"printf forbidden-browser-write\\n\n",
+            )))
+            .await?;
+        assert!(
+            read_socket_text_until(&mut socket, "\"code\":\"forbidden\"").await?,
+            "read-only browser write did not receive forbidden control error"
+        );
+        socket.close(None).await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_reject_agent_lock_when_browser_owns_gateway() -> anyhow::Result<()> {
+        let backend = TmuxBackend::from_path().context("tmux unavailable")?;
+        let tmux = backend.tmux_path().to_path_buf();
+        let token = AccessToken::from_bytes([21; 32]);
+        let session = SessionName::new(format!(
+            "termstage-browser-agent-lock-{}",
+            std::process::id()
+        ))?;
+        let _cleanup = TmuxSessionCleanup::new(tmux, session.clone());
+        let mut gateway = SessionGateway::new(backend, Duration::from_secs(90));
+        gateway
+            .create_or_find_session(session.clone(), session.clone(), TerminalSize::new(80, 24)?)
+            .await?;
+        let shared_gateway = Arc::new(Mutex::new(gateway));
+        let mut app_config = WebConfig::local_tmux_gateway(
+            token.clone(),
+            Arc::clone(&shared_gateway),
+            session.clone(),
+        );
+        app_config.port = 49152;
+        let app = router(app_config)?;
+        let server_config =
+            WebConfig::local_tmux_gateway(token.clone(), shared_gateway, session.clone());
+        let server = serve(server_config).await?;
+        let mut socket = connect_test_socket(server.address(), &token).await?;
+        assert!(
+            read_socket_text_until(&mut socket, "\"type\":\"leaseChanged\"").await?,
+            "browser did not acquire a gateway lease"
+        );
+
+        let base = format!("/api/sessions/{}", session.as_str());
+        let response = api_post_json(
+            &app,
+            &format!("{base}/acquire-lock"),
+            &token,
+            json!({ "controllerId": 88 }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        socket.close(None).await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_sync_native_tmux_writes_to_browser_and_api() -> anyhow::Result<()> {
+        let backend = TmuxBackend::from_path().context("tmux unavailable")?;
+        let tmux = backend.tmux_path().to_path_buf();
+        let token = AccessToken::from_bytes([22; 32]);
+        let session = SessionName::new(format!("termstage-native-sync-{}", std::process::id()))?;
+        let _cleanup = TmuxSessionCleanup::new(tmux.clone(), session.clone());
+        let mut gateway = SessionGateway::new(backend, Duration::from_secs(90));
+        gateway
+            .create_or_find_session(session.clone(), session.clone(), TerminalSize::new(80, 24)?)
+            .await?;
+        let shared_gateway = Arc::new(Mutex::new(gateway));
+        let mut app_config = WebConfig::local_tmux_gateway(
+            token.clone(),
+            Arc::clone(&shared_gateway),
+            session.clone(),
+        );
+        app_config.port = 49152;
+        let app = router(app_config)?;
+        let server_config =
+            WebConfig::local_tmux_gateway(token.clone(), shared_gateway, session.clone());
+        let server = serve(server_config).await?;
+        let mut socket = connect_test_socket(server.address(), &token).await?;
+
+        send_native_tmux_input(&tmux, &session, "printf native-tmux-sync-ok\\n\n").await?;
+        assert!(
+            read_socket_until(&mut socket, b"native-tmux-sync-ok").await?,
+            "browser did not receive output written through native tmux path"
+        );
+        let base = format!("/api/sessions/{}", session.as_str());
+        assert!(
+            read_semantic_screen_until(&app, &base, &token, "native-tmux-sync-ok").await?,
+            "semantic API did not read output written through native tmux path"
+        );
+        socket.close(None).await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_forward_websocket_resize_through_tunnel_bridge() -> anyhow::Result<()> {
         let token = AccessToken::from_bytes([16; 32]);
         let (commands, mut command_rx) = mpsc::channel(8);
@@ -2816,6 +2966,23 @@ mod tests {
             }
         })
         .await?
+    }
+
+    async fn send_native_tmux_input(
+        tmux: &PathBuf,
+        session: &SessionName,
+        input: &str,
+    ) -> anyhow::Result<()> {
+        let status = TokioCommand::new(tmux)
+            .env_remove("TMUX")
+            .args(["send-keys", "-t", session.as_str(), "-l", "--", input])
+            .status()
+            .await
+            .context("failed to send native tmux input")?;
+        if !status.success() {
+            anyhow::bail!("native tmux send-keys exited with {status}");
+        }
+        Ok(())
     }
 
     async fn read_socket_close_reason(

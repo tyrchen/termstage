@@ -1,0 +1,3 @@
+[submodule "vendors/rmux"]
+	path = vendors/rmux
+	url = https://github.com/Helvesec/rmux
