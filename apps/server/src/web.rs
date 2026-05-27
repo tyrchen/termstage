@@ -29,13 +29,14 @@ use termstage_core::{
         AccessToken, ClientControlMessage, ErrorCode, SafeMessage, ServerControlMessage,
         TerminalSize,
     },
-    runtime::{
-        ClientId, ClientOutput, ClientOutputTx, RuntimeCommand, RuntimeConfig, RuntimeSession,
-        ShutdownReason,
-    },
+    runtime::{ClientId, RuntimeCommand, RuntimeConfig},
     security::{
         AllowedHost, AllowedOrigin, BasePath, ExposurePolicy, PublicBaseUrl, SecurityError,
         validate_access_token, validate_peer_for_policy,
+    },
+    tunnel::{
+        JsonTunnelCodec, RuntimeTunnelBridge, RuntimeTunnelBridgeOutcome, TunnelCloseReason,
+        TunnelError, TunnelFrame, TunnelRuntimeControl, TunnelTerminalPayload, TunnelTransport,
     },
 };
 use tokio::{
@@ -46,7 +47,12 @@ use tokio::{
 };
 use tracing::debug;
 
-use crate::assets::{asset_response, index_response};
+use crate::{
+    assets::{asset_response, index_response},
+    tunnel_ws::AxumWebSocketTunnelTransport,
+};
+
+type BrowserSocketSender = futures_util::stream::SplitSink<WebSocket, Message>;
 
 const DEFAULT_BIND_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const MAX_FRAME_SIZE: usize = 16 * 1024;
@@ -55,6 +61,7 @@ const CLIENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 const CLIENT_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const SERVER_PING_INTERVAL: Duration = Duration::from_secs(25);
 const SERVER_PING_PAYLOAD: &[u8] = b"termstage";
+const TUNNEL_CHANNEL_CAPACITY: usize = 32;
 const CLOSE_REASON_SESSION_ENDED: &str = "session ended";
 const CLOSE_REASON_SERVER_SHUTDOWN: &str = "server shutting down";
 const CLOSE_REASON_CLIENT_DISCONNECTED: &str = "client disconnected";
@@ -309,6 +316,7 @@ pub fn router(config: WebConfig) -> Result<Router, SecurityError> {
         .route(&format!("{prefix}/"), get(index))
         .route(&format!("{prefix}/assets/{{*path}}"), get(asset))
         .route(&format!("{prefix}/ws"), get(ws))
+        .route(&format!("{prefix}/tunnel/ws"), get(tunnel_ws_endpoint))
         .route(&format!("{prefix}/healthz"), get(healthz));
     if !prefix.is_empty() {
         router = router.route(prefix, get(index));
@@ -405,79 +413,71 @@ async fn ws(
         .into_response())
 }
 
+async fn tunnel_ws_endpoint(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<TokenQuery>,
+    upgrade: WebSocketUpgrade,
+) -> Result<Response, WebError> {
+    validate_http_request(&state, peer, &headers, &query, true)?;
+    Ok(upgrade
+        .max_frame_size(MAX_FRAME_SIZE)
+        .max_message_size(MAX_MESSAGE_SIZE)
+        .on_upgrade(move |socket| tunnel_socket(state, socket))
+        .into_response())
+}
+
+async fn tunnel_socket(state: AppState, socket: WebSocket) {
+    let transport = AxumWebSocketTunnelTransport::new(socket, JsonTunnelCodec);
+    if let Err(error) = RuntimeTunnelBridge::run(transport, state.inner.commands.clone()).await {
+        debug!(%error, "runtime tunnel websocket closed with error");
+    }
+}
+
 async fn bridge_socket(state: AppState, socket: WebSocket) {
     let client_id = state.client_id();
-    let (output_tx, output_rx) = RuntimeSession::client_mailbox();
-    let mut socket = socket;
-    if attach_runtime_client(&state, client_id, output_tx)
+    let (mut sender, mut receiver) = socket.split();
+    let (mut tunnel, transport) = in_process_tunnel_pair();
+    let mut bridge_task = tokio::spawn(RuntimeTunnelBridge::run(
+        transport,
+        state.inner.commands.clone(),
+    ));
+    let mut bridge_finished = false;
+    if tunnel
+        .send_frame(TunnelFrame::AttachBrowser { client_id })
         .await
         .is_err()
     {
-        let _result = socket
+        let _result = sender
             .send(Message::Close(Some(runtime_unavailable_close())))
             .await;
         return;
     }
 
-    let (mut sender, mut receiver) = socket.split();
-    let mut output_rx = output_rx;
     let mut last_client_message = Instant::now();
     let mut heartbeat_check = time::interval(CLIENT_HEARTBEAT_CHECK_INTERVAL);
     let mut server_ping = time::interval(SERVER_PING_INTERVAL);
     loop {
         tokio::select! {
+            result = &mut bridge_task, if !bridge_finished => {
+                bridge_finished = true;
+                handle_bridge_completion(result, &mut tunnel, &mut sender).await;
+                break;
+            }
             Some(message) = receiver.next() => {
-                match message {
-                    Ok(Message::Binary(bytes)) => {
-                        last_client_message = Instant::now();
-                        if send_runtime(&state.inner.commands, RuntimeCommand::Input { client_id, bytes }).await.is_err() {
-                            let _result = sender.send(Message::Close(Some(runtime_unavailable_close()))).await;
-                            break;
-                        }
-                    }
-                    Ok(Message::Text(text)) => {
-                        last_client_message = Instant::now();
-                        match serde_json::from_str::<ClientControlMessage>(&text) {
-                            Ok(ClientControlMessage::Resize { cols, rows }) => {
-                                let size = TerminalSize { cols, rows };
-                                if send_runtime(&state.inner.commands, RuntimeCommand::BrowserResize { client_id, size }).await.is_err() {
-                                    let _result = sender.send(Message::Close(Some(runtime_unavailable_close()))).await;
-                                    break;
-                                }
-                            }
-                            Ok(ClientControlMessage::Heartbeat { .. }) => {}
-                            Err(error) => {
-                                debug!(%error, "closing websocket after invalid control frame");
-                                let _result = send_control_error(&mut sender).await;
-                                let _result = sender.send(Message::Close(Some(protocol_close()))).await;
-                                break;
-                            }
-                        }
-                    }
-                    Ok(Message::Close(_frame)) => break,
-                    Ok(Message::Ping(bytes)) => {
-                        last_client_message = Instant::now();
-                        if sender.send(Message::Pong(bytes)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(Message::Pong(_bytes)) => {
-                        last_client_message = Instant::now();
-                    }
-                    Err(error) => {
-                        debug!(%error, "websocket receive error");
-                        break;
-                    }
+                if handle_browser_message(
+                    message,
+                    client_id,
+                    &mut tunnel,
+                    &mut sender,
+                    &mut last_client_message,
+                ).await.should_close() {
+                    break;
                 }
             }
-            output = output_rx.recv() => {
-                if let Some(output) = output {
-                    let result = send_client_output(&mut sender, output).await;
-                    if result.should_close() || result.is_err() {
-                        break;
-                    }
-                } else {
-                    let _result = sender.send(Message::Close(Some(runtime_unavailable_close()))).await;
+            frame = tunnel.receive_frame() => {
+                if handle_tunnel_frame(frame, &mut sender).await.should_close() {
                     break;
                 }
             }
@@ -497,20 +497,255 @@ async fn bridge_socket(state: AppState, socket: WebSocket) {
         }
     }
 
-    let _result = send_runtime(
-        &state.inner.commands,
-        RuntimeCommand::DetachClient { client_id },
-    )
-    .await;
+    drop(tunnel);
+    if !bridge_finished {
+        match bridge_task.await {
+            Ok(Ok(_outcome)) => {}
+            Ok(Err(error)) => {
+                debug!(%error, "runtime tunnel bridge closed during browser detach");
+            }
+            Err(error) => {
+                debug!(%error, "runtime tunnel bridge task panicked during browser detach");
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
-enum SendClientOutputResult {
+enum BrowserSocketAction {
+    Continue,
+    Close,
+}
+
+impl BrowserSocketAction {
+    const fn should_close(self) -> bool {
+        matches!(self, Self::Close)
+    }
+}
+
+async fn handle_bridge_completion(
+    result: Result<Result<RuntimeTunnelBridgeOutcome, TunnelError>, tokio::task::JoinError>,
+    tunnel: &mut BrowserTunnelPeer,
+    sender: &mut BrowserSocketSender,
+) {
+    match result {
+        Ok(Ok(_outcome)) => {
+            let mut closed = false;
+            while let Some(frame) = tunnel.try_receive_frame() {
+                let result = send_tunnel_frame_to_browser(sender, frame).await;
+                if result.should_close() || result.is_err() {
+                    closed = true;
+                    break;
+                }
+            }
+            if !closed {
+                let _result = sender
+                    .send(Message::Close(Some(runtime_unavailable_close())))
+                    .await;
+            }
+        }
+        Ok(Err(error)) => {
+            debug!(%error, "runtime tunnel bridge closed with error");
+            let _result = sender
+                .send(Message::Close(Some(runtime_unavailable_close())))
+                .await;
+        }
+        Err(error) => {
+            debug!(%error, "runtime tunnel bridge task panicked");
+            let _result = sender
+                .send(Message::Close(Some(runtime_unavailable_close())))
+                .await;
+        }
+    }
+}
+
+async fn handle_browser_message(
+    message: Result<Message, axum::Error>,
+    client_id: ClientId,
+    tunnel: &mut BrowserTunnelPeer,
+    sender: &mut BrowserSocketSender,
+    last_client_message: &mut Instant,
+) -> BrowserSocketAction {
+    match message {
+        Ok(Message::Binary(bytes)) => {
+            *last_client_message = Instant::now();
+            handle_browser_binary(bytes, client_id, tunnel, sender).await
+        }
+        Ok(Message::Text(text)) => {
+            *last_client_message = Instant::now();
+            handle_browser_text(&text, client_id, tunnel, sender).await
+        }
+        Ok(Message::Close(_frame)) => BrowserSocketAction::Close,
+        Ok(Message::Ping(bytes)) => {
+            *last_client_message = Instant::now();
+            if sender.send(Message::Pong(bytes)).await.is_err() {
+                BrowserSocketAction::Close
+            } else {
+                BrowserSocketAction::Continue
+            }
+        }
+        Ok(Message::Pong(_bytes)) => {
+            *last_client_message = Instant::now();
+            BrowserSocketAction::Continue
+        }
+        Err(error) => {
+            debug!(%error, "websocket receive error");
+            BrowserSocketAction::Close
+        }
+    }
+}
+
+async fn handle_browser_binary(
+    bytes: Bytes,
+    client_id: ClientId,
+    tunnel: &BrowserTunnelPeer,
+    sender: &mut BrowserSocketSender,
+) -> BrowserSocketAction {
+    let bytes = match TunnelTerminalPayload::new(bytes) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            debug!(%error, "closing websocket after oversized tunnel input frame");
+            let _result = send_control_error(sender).await;
+            let _result = sender.send(Message::Close(Some(protocol_close()))).await;
+            return BrowserSocketAction::Close;
+        }
+    };
+    if tunnel
+        .send_frame(TunnelFrame::BrowserInput { client_id, bytes })
+        .await
+        .is_err()
+    {
+        let _result = sender
+            .send(Message::Close(Some(runtime_unavailable_close())))
+            .await;
+        BrowserSocketAction::Close
+    } else {
+        BrowserSocketAction::Continue
+    }
+}
+
+async fn handle_browser_text(
+    text: &str,
+    client_id: ClientId,
+    tunnel: &BrowserTunnelPeer,
+    sender: &mut BrowserSocketSender,
+) -> BrowserSocketAction {
+    let frame = match serde_json::from_str::<ClientControlMessage>(text) {
+        Ok(ClientControlMessage::Resize { cols, rows }) => TunnelFrame::BrowserResize {
+            client_id,
+            size: TerminalSize { cols, rows },
+        },
+        Ok(ClientControlMessage::Heartbeat { sequence }) => TunnelFrame::Heartbeat { sequence },
+        Err(error) => {
+            debug!(%error, "closing websocket after invalid control frame");
+            let _result = send_control_error(sender).await;
+            let _result = sender.send(Message::Close(Some(protocol_close()))).await;
+            return BrowserSocketAction::Close;
+        }
+    };
+    if tunnel.send_frame(frame).await.is_err() {
+        let _result = sender
+            .send(Message::Close(Some(runtime_unavailable_close())))
+            .await;
+        BrowserSocketAction::Close
+    } else {
+        BrowserSocketAction::Continue
+    }
+}
+
+async fn handle_tunnel_frame(
+    frame: Result<Option<TunnelFrame>, TunnelError>,
+    sender: &mut BrowserSocketSender,
+) -> BrowserSocketAction {
+    match frame {
+        Ok(Some(frame)) => {
+            let result = send_tunnel_frame_to_browser(sender, frame).await;
+            if result.should_close() || result.is_err() {
+                BrowserSocketAction::Close
+            } else {
+                BrowserSocketAction::Continue
+            }
+        }
+        Ok(None) => {
+            let _result = sender
+                .send(Message::Close(Some(runtime_unavailable_close())))
+                .await;
+            BrowserSocketAction::Close
+        }
+        Err(error) => {
+            debug!(%error, "runtime tunnel receive failed");
+            let _result = sender
+                .send(Message::Close(Some(runtime_unavailable_close())))
+                .await;
+            BrowserSocketAction::Close
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BrowserTunnelPeer {
+    inbound: mpsc::Receiver<TunnelFrame>,
+    outbound: mpsc::Sender<TunnelFrame>,
+}
+
+impl BrowserTunnelPeer {
+    async fn send_frame(&self, frame: TunnelFrame) -> Result<(), TunnelError> {
+        self.outbound
+            .send(frame)
+            .await
+            .map_err(|_error| TunnelError::TransportClosed)
+    }
+
+    async fn receive_frame(&mut self) -> Result<Option<TunnelFrame>, TunnelError> {
+        Ok(self.inbound.recv().await)
+    }
+
+    fn try_receive_frame(&mut self) -> Option<TunnelFrame> {
+        self.inbound.try_recv().ok()
+    }
+}
+
+#[derive(Debug)]
+struct InProcessTunnelTransport {
+    inbound: mpsc::Receiver<TunnelFrame>,
+    outbound: mpsc::Sender<TunnelFrame>,
+}
+
+impl TunnelTransport for InProcessTunnelTransport {
+    async fn send_frame(&mut self, frame: TunnelFrame) -> Result<(), TunnelError> {
+        self.outbound
+            .send(frame)
+            .await
+            .map_err(|_error| TunnelError::TransportClosed)
+    }
+
+    async fn receive_frame(&mut self) -> Result<Option<TunnelFrame>, TunnelError> {
+        Ok(self.inbound.recv().await)
+    }
+}
+
+fn in_process_tunnel_pair() -> (BrowserTunnelPeer, InProcessTunnelTransport) {
+    let (browser_to_runtime_tx, browser_to_runtime_rx) = mpsc::channel(TUNNEL_CHANNEL_CAPACITY);
+    let (runtime_to_browser_tx, runtime_to_browser_rx) = mpsc::channel(TUNNEL_CHANNEL_CAPACITY);
+    (
+        BrowserTunnelPeer {
+            inbound: runtime_to_browser_rx,
+            outbound: browser_to_runtime_tx,
+        },
+        InProcessTunnelTransport {
+            inbound: browser_to_runtime_rx,
+            outbound: runtime_to_browser_tx,
+        },
+    )
+}
+
+#[derive(Debug)]
+enum SendBrowserFrameResult {
     Continue(Result<(), axum::Error>),
     Closed(Result<(), axum::Error>),
 }
 
-impl SendClientOutputResult {
+impl SendBrowserFrameResult {
     fn is_err(&self) -> bool {
         match self {
             Self::Continue(result) | Self::Closed(result) => result.is_err(),
@@ -522,32 +757,58 @@ impl SendClientOutputResult {
     }
 }
 
-async fn send_client_output(
+async fn send_tunnel_frame_to_browser(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    output: ClientOutput,
-) -> SendClientOutputResult {
-    match output {
-        ClientOutput::Bytes(bytes) => {
-            SendClientOutputResult::Continue(sender.send(Message::Binary(bytes)).await)
+    frame: TunnelFrame,
+) -> SendBrowserFrameResult {
+    match frame {
+        TunnelFrame::PtyOutput { bytes } => {
+            SendBrowserFrameResult::Continue(sender.send(Message::Binary(bytes.into_bytes())).await)
         }
-        ClientOutput::Control(control) => {
-            let text = match serde_json::to_string(&control) {
+        TunnelFrame::RuntimeControl { control, .. } => match control {
+            TunnelRuntimeControl::Server { message } => {
+                let text = match serde_json::to_string(&message) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        debug!(%error, "failed to serialize control frame");
+                        return SendBrowserFrameResult::Continue(Ok(()));
+                    }
+                };
+                SendBrowserFrameResult::Continue(sender.send(Message::Text(text.into())).await)
+            }
+            TunnelRuntimeControl::Closed { reason } => {
+                if reason == TunnelCloseReason::ChildExit {
+                    let _result = send_process_exited(sender).await;
+                }
+                SendBrowserFrameResult::Closed(
+                    sender
+                        .send(Message::Close(Some(close_frame_for_tunnel_reason(reason))))
+                        .await,
+                )
+            }
+        },
+        TunnelFrame::Heartbeat { .. } => SendBrowserFrameResult::Continue(Ok(())),
+        TunnelFrame::RegisterSession { .. }
+        | TunnelFrame::AttachBrowser { .. }
+        | TunnelFrame::DetachBrowser { .. }
+        | TunnelFrame::BrowserInput { .. }
+        | TunnelFrame::BrowserResize { .. } => {
+            let message = ServerControlMessage::Error {
+                code: ErrorCode::Protocol,
+                message: protocol_error_message(),
+            };
+            let text = match serde_json::to_string(&message) {
                 Ok(text) => text,
                 Err(error) => {
-                    debug!(%error, "failed to serialize control frame");
-                    return SendClientOutputResult::Continue(Ok(()));
+                    debug!(%error, "failed to serialize invalid tunnel direction error");
+                    return SendBrowserFrameResult::Continue(Ok(()));
                 }
             };
-            SendClientOutputResult::Continue(sender.send(Message::Text(text.into())).await)
-        }
-        ClientOutput::Closed(reason) => {
-            if reason == ShutdownReason::ChildExit {
-                let _result = send_process_exited(sender).await;
+            if let Err(error) = sender.send(Message::Text(text.into())).await {
+                return SendBrowserFrameResult::Closed(Err(error));
             }
-            SendClientOutputResult::Closed(
-                sender
-                    .send(Message::Close(Some(close_frame_for_shutdown(reason))))
-                    .await,
+            SendBrowserFrameResult::Closed(
+                sender.send(Message::Close(Some(protocol_close()))).await,
             )
         }
     }
@@ -622,37 +883,18 @@ fn client_timeout_close() -> CloseFrame {
     }
 }
 
-fn close_frame_for_shutdown(reason: ShutdownReason) -> CloseFrame {
+fn close_frame_for_tunnel_reason(reason: TunnelCloseReason) -> CloseFrame {
     let reason = match reason {
-        ShutdownReason::Supervisor => CLOSE_REASON_SERVER_SHUTDOWN,
-        ShutdownReason::ClientDisconnect => CLOSE_REASON_CLIENT_DISCONNECTED,
-        ShutdownReason::ControllerReplaced => CLOSE_REASON_CONTROLLER_REPLACED,
-        ShutdownReason::ChildExit => CLOSE_REASON_SESSION_ENDED,
-        ShutdownReason::RuntimeError(_error) => CLOSE_REASON_RUNTIME_ERROR,
+        TunnelCloseReason::Supervisor => CLOSE_REASON_SERVER_SHUTDOWN,
+        TunnelCloseReason::ClientDisconnect => CLOSE_REASON_CLIENT_DISCONNECTED,
+        TunnelCloseReason::ControllerReplaced => CLOSE_REASON_CONTROLLER_REPLACED,
+        TunnelCloseReason::ChildExit => CLOSE_REASON_SESSION_ENDED,
+        TunnelCloseReason::RuntimeError(_error) => CLOSE_REASON_RUNTIME_ERROR,
     };
     CloseFrame {
         code: close_code::NORMAL,
         reason: reason.into(),
     }
-}
-
-async fn send_runtime(
-    commands: &mpsc::Sender<RuntimeCommand>,
-    command: RuntimeCommand,
-) -> Result<(), ()> {
-    commands.send(command).await.map_err(|_error| ())
-}
-
-async fn attach_runtime_client(
-    state: &AppState,
-    client_id: ClientId,
-    output: ClientOutputTx,
-) -> Result<(), ()> {
-    send_runtime(
-        &state.inner.commands,
-        RuntimeCommand::AttachClient { client_id, output },
-    )
-    .await
 }
 
 fn validate_http_request(
@@ -741,10 +983,11 @@ mod tests {
     use bytes::Bytes;
     use http_body_util::BodyExt;
     use termstage_core::{
-        protocol::{AccessToken, SessionName, TerminalSize},
+        protocol::{AccessToken, HeartbeatSequence, SessionName, TerminalSize},
         runtime::{
             ExitPolicy, ReconnectPolicy, RuntimeSession, SessionMode, ShellCommand, ShutdownReason,
         },
+        tunnel::{JsonTunnelCodec, TunnelCodec, TunnelFrame, TunnelPayload, TunnelTerminalPayload},
     };
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::{
@@ -994,6 +1237,83 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_accept_tunnel_websocket_and_forward_frame_to_runtime() -> anyhow::Result<()>
+    {
+        let token = AccessToken::from_bytes([15; 32]);
+        let (commands, mut command_rx) = mpsc::channel(8);
+        let runtime = RuntimeConfig {
+            mode: SessionMode::NewShell {
+                shell: test_shell_command()?,
+            },
+            initial_size: TerminalSize::new(80, 24)?,
+            reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::Hold,
+        };
+        let server = serve(WebConfig::local(token.clone(), commands, runtime)).await?;
+        let mut socket = connect_tunnel_socket(server.address(), "/tunnel/ws", &token).await?;
+        let frame = TunnelFrame::BrowserInput {
+            client_id: ClientId::new(31),
+            bytes: TunnelTerminalPayload::new(Bytes::from_static(b"tunnel-input"))?,
+        };
+        let TunnelPayload::Text(text) = JsonTunnelCodec.encode(&frame)? else {
+            anyhow::bail!("expected JSON text tunnel frame");
+        };
+
+        socket.send(TungsteniteMessage::Text(text.into())).await?;
+        let command = timeout(Duration::from_secs(5), command_rx.recv())
+            .await?
+            .context("runtime command channel closed")?;
+
+        let RuntimeCommand::Input { client_id, bytes } = command else {
+            anyhow::bail!("expected browser input runtime command");
+        };
+        assert_eq!(client_id, ClientId::new(31));
+        assert_eq!(bytes, Bytes::from_static(b"tunnel-input"));
+        socket.close(None).await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_reject_tunnel_websocket_with_invalid_token() -> anyhow::Result<()> {
+        let (config, _token) = test_config()?;
+        let server = serve(config).await?;
+        let url = format!("ws://{}/tunnel/ws?token=bad", server.address());
+        let mut request = url.into_client_request()?;
+        let origin = format!("http://{}", server.address());
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, origin.parse()?);
+
+        assert!(connect_async(request).await.is_err());
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_mount_tunnel_websocket_under_base_path() -> anyhow::Result<()> {
+        let (mut config, token) = test_config()?;
+        config.port = 0;
+        config.base_path = Some(BasePath::parse("/p/sess-3/")?);
+        let server = serve(config).await?;
+        let mut socket =
+            connect_tunnel_socket(server.address(), "/p/sess-3/tunnel/ws", &token).await?;
+        let frame = TunnelFrame::Heartbeat {
+            sequence: HeartbeatSequence::new(1),
+        };
+        let TunnelPayload::Text(text) = JsonTunnelCodec.encode(&frame)? else {
+            anyhow::bail!("expected JSON text tunnel frame");
+        };
+        socket.send(TungsteniteMessage::Text(text.into())).await?;
+        socket.close(None).await?;
+
+        let root_result = connect_tunnel_socket(server.address(), "/tunnel/ws", &token).await;
+        assert!(root_result.is_err());
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_bridge_websocket_binary_input_to_runtime_output() -> anyhow::Result<()> {
         let token = AccessToken::from_bytes([5; 32]);
         let runtime = RuntimeConfig {
@@ -1049,6 +1369,48 @@ mod tests {
         assert!(found);
         server.shutdown().await?;
         session.shutdown(ShutdownReason::Supervisor).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_forward_websocket_resize_through_tunnel_bridge() -> anyhow::Result<()> {
+        let token = AccessToken::from_bytes([16; 32]);
+        let (commands, mut command_rx) = mpsc::channel(8);
+        let runtime = RuntimeConfig {
+            mode: SessionMode::NewShell {
+                shell: test_shell_command()?,
+            },
+            initial_size: TerminalSize::new(80, 24)?,
+            reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::Hold,
+        };
+        let server = serve(WebConfig::local(token.clone(), commands, runtime)).await?;
+        let mut socket = connect_test_socket(server.address(), &token).await?;
+        let Some(RuntimeCommand::AttachClient { client_id, output }) =
+            timeout(Duration::from_secs(5), command_rx.recv()).await?
+        else {
+            anyhow::bail!("expected attach command");
+        };
+        let size = TerminalSize::new(101, 33)?;
+        let text = serde_json::to_string(&ClientControlMessage::Resize {
+            cols: size.cols,
+            rows: size.rows,
+        })?;
+
+        socket.send(TungsteniteMessage::Text(text.into())).await?;
+        let Some(RuntimeCommand::BrowserResize {
+            client_id: resized_id,
+            size: resized_size,
+        }) = timeout(Duration::from_secs(5), command_rx.recv()).await?
+        else {
+            anyhow::bail!("expected browser resize command");
+        };
+
+        assert_eq!(resized_id, client_id);
+        assert_eq!(resized_size, size);
+        drop(output);
+        socket.close(None).await?;
+        server.shutdown().await?;
         Ok(())
     }
 
@@ -1442,6 +1804,25 @@ mod tests {
         >,
     > {
         let url = format!("ws://{address}/ws?token={}", token.to_url_token());
+        let mut request = url.into_client_request()?;
+        let origin = format!("http://{address}");
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, origin.parse()?);
+        let (socket, _response) = connect_async(request).await?;
+        Ok(socket)
+    }
+
+    async fn connect_tunnel_socket(
+        address: SocketAddr,
+        path: &str,
+        token: &AccessToken,
+    ) -> anyhow::Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    > {
+        let url = format!("ws://{address}{path}?token={}", token.to_url_token());
         let mut request = url.into_client_request()?;
         let origin = format!("http://{address}");
         request
