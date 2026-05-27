@@ -50,6 +50,18 @@ a PTY so Chrome and a native terminal can attach to the same demo state.
 A fresh local shell spawned in a PTY. Useful for smoke tests and simple demos, but it
 does not attach to an existing Terminal.app window.
 
+## Local command terminal
+
+The optional split TUI rendered inside the invoking terminal when shell mode is
+started with `--local-command-terminal`. It contains a `termstage` supervisor/log
+pane and a separate command terminal pane backed by the runtime command PTY.
+
+## Command terminal pane
+
+The local TUI pane that renders parsed command PTY output and forwards keyboard
+input to the runtime when local terminal owns the input lease. It is distinct from
+`termstage`'s supervisor/log pane.
+
 ## Local-only
 
 The server binds and accepts only loopback traffic, validates token/Host/Origin/peer,
