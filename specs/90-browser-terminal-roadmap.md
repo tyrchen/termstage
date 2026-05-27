@@ -94,6 +94,46 @@ Exit criteria:
 
 Estimate: 0.5-1 focused week.
 
+### M5 - Remove Local Attach and Stabilize Browser-First Shell Mode
+
+User-visible outcome: shell mode no longer exposes the obsolete local PTY
+passthrough flag. The invoking terminal is only the
+`termstage` supervisor console; command interaction remains in the browser until
+the backend-session gateway lands.
+
+Specs touched: 11, 23, 50, 70, 72, 80.
+
+Exit criteria:
+
+- Obsolete local attach symbols are removed from code and docs.
+- CLI rejects `-a` and has no local command terminal flag.
+- Shell mode with `--command` still starts a browser-accessible command.
+- Local terminal output contains supervisor logs/URL/status only.
+
+Estimate: 0.5 focused week.
+
+### M6 - Session Backend Gateway and Level 1 Operation Lock
+
+User-visible outcome: a `termstage` session maps to a backend session/pane owned
+by rmux/tmux/future backends. A local operator can attach through the backend's
+native attach command, while browser and Agent API clients operate the same
+session through `termstage` with one active writer at a time.
+
+Specs touched: 10, 11, 20, 23, 50, 70, 72, 80.
+
+Exit criteria:
+
+- `termstage` maintains a session registry of backend session references.
+- Browser WebSocket traffic flows through a backend adapter instead of a
+  termstage-owned local command PTY abstraction.
+- Semantic API operations can write input and read screen state through the same
+  backend session.
+- Level 1 `termstage` lock allows one write controller and read-only observers.
+- Backend-native local attach remains independent of `termstage` stdout/stderr.
+
+Estimate: 1-2 focused weeks after the runtime tunnel and shell lease foundations
+are stable.
+
 ## 3. Deferred Milestones
 
 - Read-only mirror clients.

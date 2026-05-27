@@ -8,6 +8,7 @@ Last updated: 2026-05-19
 | Document | Purpose |
 | --- | --- |
 | [browser-terminal-phase-0-validation.md](./research/browser-terminal-phase-0-validation.md) | Phase 0 validation of PTY, xterm/Vite, Axum WebSocket, and asset bundling assumptions. |
+| [study-rmux-sdk-alignment.md](./research/study-rmux-sdk-alignment.md) | Alignment check between termstage's backend gateway design and rmux SDK/protocol capabilities. |
 
 ## Guides
 
@@ -32,3 +33,4 @@ Last updated: 2026-05-19
 | 文档 | 内容 |
 | --- | --- |
 | [Phase 0 验证记录](./research/browser-terminal-phase-0-validation.md) | 记录 PTY、xterm/Vite、Axum WebSocket 和资源构建方案的前期验证结果。 |
+| [rmux SDK 对齐研究](./research/study-rmux-sdk-alignment.md) | 检查 termstage backend gateway 设计与 rmux SDK/protocol 能力的对齐程度。 |

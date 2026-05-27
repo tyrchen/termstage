@@ -1,157 +1,281 @@
-# Shell Mode Local/Remote Lease Design
+# Session Backend Gateway and Operation Lease Design
 
-Status: draft v2
-Last updated: 2026-05-26
+Status: redesign draft v4
+Last updated: 2026-05-27
 
 ## 1. Problem
 
-`termstage` currently starts a browser terminal whose primary controller is the
-browser. That works for presentation-first flows, but shell mode also needs an
-operator-local shape where the shell process feels native in the invoking terminal
-while also being visible and controllable from the browser.
+The previous local attach direction modeled the shared command
+terminal as a PTY owned directly by `termstage`, then tried to mirror that PTY
+into both the invoking terminal and the browser. That model mixed two
+responsibilities:
 
-The new mode must preserve TTY semantics for interactive CLIs. The child process
-must run inside a PTY, not through ordinary piped stdin/stdout, so color, raw mode,
-cursor movement, Ctrl-C, paste, and resize behavior remain compatible with native
-terminal execution. This is an extension of `--mode shell`, not a separate
-positional subcommand mode.
+- `termstage` as supervisor, web gateway, auth boundary, and session registry;
+- the actual terminal multiplexer/session backend that owns panes, PTYs,
+  screen state, and native local attach.
 
-## 2. Goals
+That is the wrong long-term boundary. Local viewing should not require
+`termstage` to render command bytes into its own stdout. A user should be able to
+attach locally with the backend's native tool, for example `rmux attach -t abc`
+or `tmux attach -t abc`, while browser and API clients reach the same backend
+session through `termstage`.
+
+## 2. Recommendation
+
+Model a `termstage` session as a reference to a backend session/pane, not as a
+local command PTY owned by `termstage`.
+
+```text
+Browser xterm.js / Agent API
+        │
+        │ Termstage Protocol
+        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ termstage                                                   │
+│                                                             │
+│  ┌────────────────────┐   ┌──────────────────────────────┐  │
+│  │ session registry   │   │ browser WebSocket gateway    │  │
+│  │ - termstage id     │   │ - token/auth boundary        │  │
+│  │ - backend ref      │   │ - xterm byte stream bridge   │  │
+│  └─────────┬──────────┘   └──────────────┬───────────────┘  │
+│            │                             │                  │
+│  ┌─────────▼──────────┐   ┌──────────────▼───────────────┐  │
+│  │ semantic API       │   │ input lease / operation lock │  │
+│  │ gateway            │   │ - one writer at a time       │  │
+│  │ - press-key        │   │ - other clients read-only    │  │
+│  │ - run-command      │   │ - bounded lease timeout      │  │
+│  │ - read-screen      │   └──────────────┬───────────────┘  │
+│  └─────────┬──────────┘                  │                  │
+│            │                 ┌───────────▼──────────────┐   │
+│            └────────────────▶│ backend adapter          │   │
+│                              │ - rmux first             │   │
+│                              │ - tmux/future backends   │   │
+│                              └───────────┬──────────────┘   │
+└──────────────────────────────────────────┼──────────────────┘
+                                           │ backend-native API
+                                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│ rmux / tmux / future backend                                │
+│ - owns actual session/window/pane/PTY                       │
+│ - owns terminal screen state                                │
+│ - supports native local attach                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+Concrete default model:
+
+```text
+termstage session "abc"
+        │ registry entry
+        ▼
+rmux session "abc" / window / pane
+        │ native attach
+        ├── local operator: rmux attach -t abc
+        │
+        │ gateway attach
+        └── browser: browser -> termstage -> rmux API -> pane
+```
+
+`termstage` still remains the command entry point and policy owner. It creates or
+locates backend sessions, exposes browser and API gateways, enforces auth and
+input ownership, and forwards terminal operations to the backend adapter.
+
+## 3. Goals
 
 | # | Goal | Measure |
 | --- | --- | --- |
-| G1 | Launch shell-mode commands with argv support. | `termstage --mode shell --command claude --attach-local-terminal` and `termstage --mode shell --command codemax -g claude --attach-local-terminal` run the requested command in the local terminal frontend. |
-| G2 | Keep `termstage` lifecycle coupled to explicit shell-mode commands. | When the configured command exits or is killed, the web server shuts down unless the operator explicitly sets `--exit-policy hold`. |
-| G3 | Make remote browser readonly at startup. | Browser attach receives a lease state where `terminal` owns input until browser sends terminal bytes. |
-| G4 | Support explicit input takeover. | First real browser input transfers ownership to browser; first real local terminal input transfers ownership back to terminal. |
-| G5 | Notify both sides about control changes. | Runtime emits a lease control frame to browser clients and local terminal frontend on each ownership epoch change. |
+| G1 | Remove the old local attach model. | No CLI flag, module, runtime command, or docs reference the obsolete local attach feature. |
+| G2 | Keep `termstage`'s invoking terminal as a supervisor surface. | Local stdout/stderr show logs, URL, health, and errors only. |
+| G3 | Make backend sessions the source of truth. | Session state points to backend session/window/pane ids; backend owns the PTY. |
+| G4 | Support browser and API control through one protocol boundary. | Browser xterm.js and Agent API clients use Termstage Protocol over their transports. |
+| G5 | Enforce one writer at a time in Level 1. | `termstage` tracks the active controller and rejects or queues conflicting write operations. |
+| G6 | Leave backend-enforced locks for Level 2. | Backend-native lock integration is deferred until the backend adapter supports it. |
 
-## 3. Non-goals
+## 4. Non-goals
 
-- This does not add multi-viewer read-only authorization. Existing token, Host,
-  Origin, and peer checks still define access.
-- This does not persist a lease across process restarts. The runtime owns lease
-  state in memory.
-- This does not multiplex multiple browser controllers. The latest browser
-  connection remains the active browser endpoint; previous browser controllers are
-  closed as before.
+- Do not implement a split local TUI inside `termstage`.
+- Do not mirror the command PTY into `termstage`'s own stdout/stderr.
+- Do not make `termstage` attach to a `/dev/tty` device owned by tmux/rmux.
+- Do not split the embedded web server into a standalone process in this spec.
+- Do not implement OIDC/Okta in this spec; the gateway/auth boundary must remain
+  compatible with a future OIDC layer.
 
-## 4. Shell Mode Local Terminal Attachment
+## 5. Protocol Layers
 
-The CLI extends existing shell mode instead of adding a new positional
-subcommand. `--attach-local-terminal` is valid only with `--mode shell`. When present,
-the configured shell-mode command becomes the PTY child process and the
-invoking terminal becomes a local frontend.
-
-```bash
-termstage --mode shell --command claude --attach-local-terminal
-termstage --mode shell --command codemax -g claude --attach-local-terminal
-termstage --mode shell --command cargo -g test --attach-local-terminal
-```
-
-Without `--attach-local-terminal`, shell mode keeps the existing browser-first behavior.
-With `--attach-local-terminal`, the local terminal is placed into raw mode and becomes a
-first-class runtime client. The server still starts in the background and prints
-or opens the tokenized browser URL before raw mode starts.
+The protocol has three conceptual layers. The first implementation can keep them
+inside one process and one crate boundary; the separation is still part of the
+contract so web, API, and backend adapters do not grow direct dependencies on
+each other.
 
 ```text
-Terminal process
-  │
-  │ termstage --mode shell --command claude --attach-local-terminal
-  ▼
-┌────────────────────────────────────────────────────────────────────┐
-│ termstage wrapper                                                  │
-│                                                                    │
-│  ┌──────────────────────┐      RuntimeCommand::TerminalInput       │
-│  │ local terminal input │ ──────────────────────────────────────┐  │
-│  └──────────────────────┘                                      │  │
-│                                                                ▼  │
-│  ┌──────────────────────┐      ClientOutput::Bytes       ┌──────────────┐
-│  │ local terminal output│ ◀────────────────────────────── │ runtime actor│
-│  └──────────────────────┘                                │ owns PTY     │
-│                                                          │ owns lease   │
-│  ┌──────────────────────┐      WebSocket binary/control  │ owns replay  │
-│  │ browser xterm.js     │ ◀══════════════════════════════▶│              │
-│  └──────────────────────┘                                └──────┬───────┘
-│                                                                 │ PTY
-└─────────────────────────────────────────────────────────────────┼───────┘
-                                                                  ▼
-                                                           shell-mode child
+┌────────────────────────────────────────────────────────────┐
+│ Layer 3: Semantic Operations                              │
+│ - press-key                                               │
+│ - write-text                                              │
+│ - run-command                                             │
+│ - read-screen                                             │
+│ - scroll                                                  │
+│ - acquire/release operation lock                          │
+└──────────────────────────────┬─────────────────────────────┘
+                               │ maps to
+┌──────────────────────────────▼─────────────────────────────┐
+│ Layer 2: Terminal Byte Stream                              │
+│ - VT/ANSI output bytes                                     │
+│ - input bytes                                              │
+│ - resize                                                   │
+│ - replay                                                   │
+│ - close/error/control frames                               │
+└──────────────────────────────┬─────────────────────────────┘
+                               │ carried by
+┌──────────────────────────────▼─────────────────────────────┐
+│ Layer 1: Transport                                          │
+│ - browser WebSocket                                         │
+│ - future TCP/gRPC/QUIC                                      │
+│ - in-process channels for embedded mode                     │
+└────────────────────────────────────────────────────────────┘
 ```
 
-## 5. Lease State Machine
+Layer 2 must faithfully carry the terminal byte stream:
 
-The runtime is the only authority for input ownership. Frontends can display
-readonly state, but they cannot enforce correctness independently.
+- text and UTF-8 bytes;
+- cursor movement, colors, and alternate screen;
+- mouse protocols;
+- terminal query/response traffic;
+- title, hyperlink, and clipboard OSC sequences;
+- resize and close events.
+
+Layer 3 adds request/response semantics for agents. Example operations:
+
+- `pressKey(session, key = "h")`;
+- `writeText(session, text)`;
+- `runCommand(session, command = "echo hello", waitFor = "hello", capture = true)
+  -> { matched, screen }`;
+- `readScreen(session) -> screen snapshot`;
+- `scroll(session, direction, amount)`;
+- `acquireLock(session, controller, ttl)`.
+
+Semantic operations must be observable by browser and backend viewers because
+they ultimately mutate the same backend session/pane.
+
+`runCommand` is a request/response operation, not just an input write. The first
+implementation submits the command through backend-native command entry, then
+optionally waits for visible screen text and optionally returns a captured screen
+snapshot. Backends with stronger primitives, such as rmux, should implement this
+with `send_text`, `send_key`, output waits, and structured snapshots instead of
+forcing everything through raw bytes.
+
+## 6. Level 1 Lock
+
+Level 1 lock is managed by `termstage`.
 
 ```text
-States:
-  Terminal(owner_epoch)
-  Browser(client_id, owner_epoch)
-
-Initial state:
-  Terminal(epoch = 0)
-
-Events:
-  browser terminal bytes from active browser client
-    if owner != Browser(client_id):
-      owner = Browser(client_id)
-      epoch += 1
-      notify all clients LeaseChanged(browser, epoch)
-    write bytes to PTY
-
-  local terminal bytes
-    if owner != Terminal:
-      owner = Terminal
-      epoch += 1
-      notify all clients LeaseChanged(terminal, epoch)
-    write bytes to PTY
-
-  browser attach
-    replace previous browser controller
-    send Ready
-    send current LeaseChanged(owner, epoch)
-    replay recent PTY bytes
-
-  child exit
-    close all clients
-    local-terminal shell-mode supervisor shuts down the web server
+Controller A              termstage lock table              Backend pane
+     │                            │                              │
+     │ 1. acquire(session) ──────▶│                              │
+     │                            │ 2. grant lease               │
+     │◀───────────────────────────│                              │
+     │                            │                              │
+     │ 3. input bytes / op ──────▶│ 4. validate owner            │
+     │                            │ 5. forward operation ───────▶│
+     │                            │                              │
+Controller B              termstage lock table              Backend pane
+     │                            │                              │
+     │ 6. input bytes / op ──────▶│                              │
+     │                            │ 7. reject read-only/conflict │
+     │◀───────────────────────────│                              │
 ```
 
-Resize, heartbeat, reconnect, and attach are not input ownership events. Only bytes
-that are about to be written to the PTY can change the lease owner.
+Rules:
 
-## 6. Protocol
+- A session has at most one write controller.
+- Browser xterm.js, Agent API clients, and future transports are all controllers.
+- Non-owners may read screen/output but cannot write input.
+- Lock state includes owner id, owner kind, epoch, and expiration time.
+- Expired locks can be reclaimed by another controller.
+- Ctrl-C and other write operations require ownership.
 
-Server-to-client control messages add:
+## 7. Level 2 Deferred Lock
 
-```json
-{ "type": "leaseChanged", "owner": "terminal", "epoch": 0 }
-{ "type": "leaseChanged", "owner": "browser", "epoch": 1 }
-```
+Level 2 is backend-enforced locking. It is intentionally deferred.
 
-`epoch` is monotonic within one runtime session. Browser clients treat `owner:
-"terminal"` as readonly presentation state, but still send the first input bytes so
-the runtime can transfer the lease.
+Examples:
 
-## 7. Implementation Notes
+- rmux or tmux exposes an explicit pane/session write lock;
+- backend rejects writes from non-owner clients;
+- backend emits authoritative lease changes.
 
-- Follow `AGENTS.md` for Rust 2024, no unsafe, no production `unwrap()`/`expect()`,
-  structured errors, actor-owned mutable state, strict protocol validation, and
-  bounded channels.
-- Reuse the existing `RuntimeSession`, PTY reader, replay buffer, and WebSocket
-  bridge.
-- Add a local terminal frontend in `apps/server` rather than duplicating PTY logic.
-- Avoid ordinary `Command::stdin(Stdio::piped())` for the child. The child must
-  continue to spawn through `portable-pty`.
+`termstage` must keep the Level 1 lock boundary explicit so Level 2 can replace
+or reinforce it without changing browser/API semantics.
 
-## 8. Cross-references
+## 8. Backend Adapter Contract
 
-- Depends on [10-browser-terminal-protocol-design.md](./10-browser-terminal-protocol-design.md)
-  for WebSocket control frame conventions.
-- Depends on [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md)
-  for actor ownership and PTY lifecycle.
-- Extends [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md)
-  with shell-mode local terminal attachment and shell argv support.
-- Extends [70-browser-terminal-security-design.md](./70-browser-terminal-security-design.md)
-  without changing the trust boundary.
+The backend adapter hides rmux/tmux/future-specific APIs behind a small
+session-oriented interface.
+
+Required capabilities:
+
+- create or find a backend session by validated name;
+- resolve a session to window/pane identity;
+- stream VT/ANSI output bytes to `termstage`;
+- write input bytes to the pane;
+- send literal text, key tokens, and submitted commands as backend-native
+  semantic operations;
+- resize the pane when the active controller size changes;
+- read a screen snapshot for semantic API operations;
+- close, detach, or keep the backend session according to exit policy.
+
+The first backend should prefer rmux if its API exposes screen read/write
+semantics cleanly. tmux remains a compatibility backend because native local
+attach is well understood.
+
+## 9. Migration Plan
+
+### Phase 1 - Remove Local Attach
+
+Remove the incorrect local attach implementation:
+
+- delete the obsolete local attach flag and any replacement split-TUI flag;
+- delete the server-side local terminal passthrough module;
+- remove runtime commands that attach or write from a local terminal frontend;
+- remove tests and docs that describe local terminal ownership;
+- keep shell mode browser-first until the backend gateway lands.
+
+Exit criteria:
+
+- repository search finds no obsolete local attach symbols;
+- CLI rejects `-a` because it is no longer defined;
+- shell mode with `--command` still starts the command for browser access;
+- standard Rust quality gates pass, except environment-specific tmux tests may
+  remain skipped or documented if tmux is unavailable.
+
+### Phase 2 - Implement Session Backend Gateway
+
+Implement the new architecture:
+
+- add session registry keyed by termstage session id;
+- add backend adapter trait and rmux/tmux implementation path;
+- route browser WebSocket traffic through Termstage Protocol into the adapter;
+- add semantic API gateway for request/response operations;
+- add Level 1 operation lock with owner/epoch/TTL;
+- update browser toolbar from `control by terminal/browser` to controller-aware
+  status;
+- add tests for lock conflict, browser/API synchronization, backend attach, and
+  semantic read/write operations.
+
+Exit criteria:
+
+- local attach uses backend-native command such as `rmux attach -t <session>`;
+- browser and Agent API can operate the same backend pane;
+- only the active controller can write;
+- other viewers remain read-only and receive output/screen updates;
+- `termstage` local terminal prints only supervisor information.
+
+## 10. Cross-references
+
+- Extends [10-browser-terminal-protocol-design.md](./10-browser-terminal-protocol-design.md)
+  with semantic operations and transport-independent terminal frames.
+- Replaces the local-terminal ownership portions of
+  [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md).
+- Updates [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md)
+  by removing the local attach flag.
+- Must be verified through [72-browser-terminal-verification-plan.md](./72-browser-terminal-verification-plan.md).

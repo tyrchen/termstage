@@ -1,65 +1,76 @@
 //! Axum routes and WebSocket bridge for browser terminal mode.
 
 use std::{
-    fmt::{self, Debug, Formatter},
+    fmt::{self, Debug, Formatter, Write as FmtWrite},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
 use axum::{
-    Router,
+    Json, Router,
     extract::{
-        ConnectInfo, Path, Query, State,
+        ConnectInfo, DefaultBodyLimit, Path, Query, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
     },
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use termstage_core::{
+    backend::{BackendScreenSnapshot, BackendScrollDirection},
+    operation_lock::{ControllerId, ControllerKind, ControllerRef, OperationLockError},
     protocol::{
-        AccessToken, ClientControlMessage, ErrorCode, SafeMessage, ServerControlMessage,
-        TerminalSize,
+        AccessToken, ClientControlMessage, ErrorCode, LeaseOwner, SafeMessage,
+        ServerControlMessage, SessionName, TerminalSize,
     },
     runtime::{ClientId, RuntimeCommand, RuntimeConfig},
     security::{
         AllowedHost, AllowedOrigin, BasePath, ExposurePolicy, PublicBaseUrl, SecurityError,
         validate_access_token, validate_peer_for_policy,
     },
+    session_gateway::{SessionGateway, SessionGatewayError},
+    tmux_backend::TmuxBackend,
     tunnel::{
-        JsonTunnelCodec, RuntimeTunnelBridge, RuntimeTunnelBridgeOutcome, TunnelCloseReason,
-        TunnelError, TunnelFrame, TunnelRuntimeControl, TunnelTerminalPayload, TunnelTransport,
+        RuntimeTunnelBridge, RuntimeTunnelBridgeOutcome, TunnelCloseReason, TunnelError,
+        TunnelFrame, TunnelRuntimeControl, TunnelTerminalPayload, TunnelTransport,
     },
 };
 use tokio::{
     net::TcpListener,
-    sync::{mpsc, oneshot},
+    sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
-    time::{self, Duration, Instant},
+    time,
 };
 use tracing::debug;
 
-use crate::{
-    assets::{asset_response, index_response},
-    tunnel_ws::AxumWebSocketTunnelTransport,
-};
+use crate::assets::{asset_response, index_response};
 
 type BrowserSocketSender = futures_util::stream::SplitSink<WebSocket, Message>;
 
 const DEFAULT_BIND_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const MAX_FRAME_SIZE: usize = 16 * 1024;
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
+const API_BODY_LIMIT_BYTES: usize = 8 * 1024;
+const SEMANTIC_TEXT_MAX_BYTES: usize = 4096;
+const SEMANTIC_KEY_MAX_BYTES: usize = 32;
+const SEMANTIC_SCROLL_MAX_AMOUNT: u16 = 100;
+const SEMANTIC_WAIT_TEXT_MAX_BYTES: usize = 4096;
+const SEMANTIC_WAIT_TIMEOUT_DEFAULT_MS: u64 = 5_000;
+const SEMANTIC_WAIT_TIMEOUT_MAX_MS: u64 = 60_000;
+const SEMANTIC_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CLIENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 const CLIENT_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const SERVER_PING_INTERVAL: Duration = Duration::from_secs(25);
+const GATEWAY_SCREEN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SERVER_PING_PAYLOAD: &[u8] = b"termstage";
 const TUNNEL_CHANNEL_CAPACITY: usize = 32;
 const CLOSE_REASON_SESSION_ENDED: &str = "session ended";
@@ -117,10 +128,8 @@ pub struct WebConfig {
     pub exposure: WebExposure,
     /// Per-server access token.
     pub token: AccessToken,
-    /// Runtime command sender.
-    pub commands: mpsc::Sender<RuntimeCommand>,
-    /// Runtime session configuration.
-    pub runtime: RuntimeConfig,
+    /// Browser terminal session backend.
+    pub session: WebSession,
     /// Browser presentation settings.
     pub presentation: PresentationSettings,
     /// Optional reverse-proxy base path. When set, all routes mount under it.
@@ -133,19 +142,53 @@ impl WebConfig {
     pub fn local(
         token: AccessToken,
         commands: mpsc::Sender<RuntimeCommand>,
-        runtime: RuntimeConfig,
+        _runtime: RuntimeConfig,
     ) -> Self {
         Self {
             host: DEFAULT_BIND_HOST,
             port: 0,
             exposure: WebExposure::Local,
             token,
-            commands,
-            runtime,
+            session: WebSession::Runtime { commands },
             presentation: PresentationSettings::default(),
             base_path: None,
         }
     }
+
+    /// Creates a local config backed by a tmux session gateway.
+    #[must_use]
+    pub fn local_tmux_gateway(
+        token: AccessToken,
+        gateway: Arc<Mutex<SessionGateway<TmuxBackend>>>,
+        session: SessionName,
+    ) -> Self {
+        Self {
+            host: DEFAULT_BIND_HOST,
+            port: 0,
+            exposure: WebExposure::Local,
+            token,
+            session: WebSession::TmuxGateway { gateway, session },
+            presentation: PresentationSettings::default(),
+            base_path: None,
+        }
+    }
+}
+
+/// Browser terminal session backend.
+#[derive(Debug, Clone)]
+pub enum WebSession {
+    /// Existing PTY runtime actor path used by shell mode.
+    Runtime {
+        /// Runtime command sender.
+        commands: mpsc::Sender<RuntimeCommand>,
+    },
+    /// Backend-owned tmux session gateway path.
+    TmuxGateway {
+        /// Shared session gateway.
+        gateway: Arc<Mutex<SessionGateway<TmuxBackend>>>,
+        /// Termstage session id to expose in this web server.
+        session: SessionName,
+    },
 }
 
 /// Browser terminal exposure mode.
@@ -258,8 +301,7 @@ struct AppState {
 struct AppStateInner {
     exposure: ExposurePolicy,
     token: AccessToken,
-    commands: mpsc::Sender<RuntimeCommand>,
-    runtime: RuntimeConfig,
+    session: WebSession,
     presentation: PresentationSettings,
     base_path: Option<BasePath>,
     next_client_id: AtomicU64,
@@ -271,7 +313,7 @@ impl Debug for AppState {
             .debug_struct("AppState")
             .field("exposure", &self.inner.exposure)
             .field("token", &self.inner.token)
-            .field("runtime", &self.inner.runtime)
+            .field("session", &self.inner.session)
             .field("presentation", &self.inner.presentation)
             .field("base_path", &self.inner.base_path)
             .finish_non_exhaustive()
@@ -288,8 +330,7 @@ impl AppState {
             inner: Arc::new(AppStateInner {
                 exposure,
                 token: config.token,
-                commands: config.commands,
-                runtime: config.runtime,
+                session: config.session,
                 presentation: config.presentation,
                 base_path: config.base_path,
                 next_client_id: AtomicU64::new(1),
@@ -316,12 +357,41 @@ pub fn router(config: WebConfig) -> Result<Router, SecurityError> {
         .route(&format!("{prefix}/"), get(index))
         .route(&format!("{prefix}/assets/{{*path}}"), get(asset))
         .route(&format!("{prefix}/ws"), get(ws))
-        .route(&format!("{prefix}/tunnel/ws"), get(tunnel_ws_endpoint))
+        .route(
+            &format!("{prefix}/api/sessions/{{session}}/acquire-lock"),
+            post(api_acquire_lock),
+        )
+        .route(
+            &format!("{prefix}/api/sessions/{{session}}/release-lock"),
+            post(api_release_lock),
+        )
+        .route(
+            &format!("{prefix}/api/sessions/{{session}}/press-key"),
+            post(api_press_key),
+        )
+        .route(
+            &format!("{prefix}/api/sessions/{{session}}/write-text"),
+            post(api_write_text),
+        )
+        .route(
+            &format!("{prefix}/api/sessions/{{session}}/run-command"),
+            post(api_run_command),
+        )
+        .route(
+            &format!("{prefix}/api/sessions/{{session}}/read-screen"),
+            post(api_read_screen),
+        )
+        .route(
+            &format!("{prefix}/api/sessions/{{session}}/scroll"),
+            post(api_scroll),
+        )
         .route(&format!("{prefix}/healthz"), get(healthz));
     if !prefix.is_empty() {
         router = router.route(prefix, get(index));
     }
-    Ok(router.with_state(state))
+    Ok(router
+        .layer(DefaultBodyLimit::max(API_BODY_LIMIT_BYTES))
+        .with_state(state))
 }
 
 /// Starts the Axum server.
@@ -374,6 +444,92 @@ struct TokenQuery {
     token: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiSessionPath {
+    session: SessionName,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ControllerRequest {
+    controller_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PressKeyRequest {
+    controller_id: u64,
+    key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WriteTextRequest {
+    controller_id: u64,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RunCommandRequest {
+    controller_id: u64,
+    command: String,
+    #[serde(default)]
+    wait_for: Option<String>,
+    #[serde(default)]
+    wait_timeout_ms: Option<u64>,
+    #[serde(default)]
+    capture: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ScrollRequest {
+    controller_id: u64,
+    direction: ScrollDirection,
+    amount: u16,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum ScrollDirection {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LeaseResponse {
+    owner: LeaseOwner,
+    epoch: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationResponse {
+    ok: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunCommandResponse {
+    ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    matched: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    screen: Option<ScreenResponse>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScreenResponse {
+    size: TerminalSize,
+    cursor_col: u16,
+    cursor_row: u16,
+    lines: Vec<String>,
+}
+
 async fn index(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -413,36 +569,187 @@ async fn ws(
         .into_response())
 }
 
-async fn tunnel_ws_endpoint(
+async fn api_acquire_lock(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    Path(path): Path<ApiSessionPath>,
     Query(query): Query<TokenQuery>,
-    upgrade: WebSocketUpgrade,
-) -> Result<Response, WebError> {
-    validate_http_request(&state, peer, &headers, &query, true)?;
-    Ok(upgrade
-        .max_frame_size(MAX_FRAME_SIZE)
-        .max_message_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| tunnel_socket(state, socket))
-        .into_response())
+    Json(request): Json<ControllerRequest>,
+) -> Result<Json<LeaseResponse>, ApiError> {
+    validate_api_request(&state, peer, &headers, &query)?;
+    let controller = agent_controller(request.controller_id)?;
+    let gateway = gateway_for_session(&state, &path.session)?;
+    let mut gateway = gateway.lock().await;
+    let lease = gateway
+        .acquire_controller(&path.session, controller, Instant::now())
+        .map_err(ApiError::from_gateway)?;
+    Ok(Json(LeaseResponse {
+        owner: LeaseOwner::Agent,
+        epoch: lease.epoch(),
+    }))
 }
 
-async fn tunnel_socket(state: AppState, socket: WebSocket) {
-    let transport = AxumWebSocketTunnelTransport::new(socket, JsonTunnelCodec);
-    if let Err(error) = RuntimeTunnelBridge::run(transport, state.inner.commands.clone()).await {
-        debug!(%error, "runtime tunnel websocket closed with error");
+async fn api_release_lock(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<ApiSessionPath>,
+    Query(query): Query<TokenQuery>,
+    Json(request): Json<ControllerRequest>,
+) -> Result<Json<LeaseResponse>, ApiError> {
+    validate_api_request(&state, peer, &headers, &query)?;
+    let controller = agent_controller(request.controller_id)?;
+    let gateway = gateway_for_session(&state, &path.session)?;
+    let mut gateway = gateway.lock().await;
+    let lease = gateway
+        .release_controller(&path.session, controller, Instant::now())
+        .map_err(ApiError::from_gateway)?;
+    Ok(Json(LeaseResponse {
+        owner: LeaseOwner::Terminal,
+        epoch: lease.epoch(),
+    }))
+}
+
+async fn api_press_key(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<ApiSessionPath>,
+    Query(query): Query<TokenQuery>,
+    Json(request): Json<PressKeyRequest>,
+) -> Result<Json<OperationResponse>, ApiError> {
+    validate_api_request(&state, peer, &headers, &query)?;
+    let key = semantic_key_token(&request.key)?;
+    send_semantic_key(&state, &path.session, request.controller_id, &key).await?;
+    Ok(Json(OperationResponse { ok: true }))
+}
+
+async fn api_write_text(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<ApiSessionPath>,
+    Query(query): Query<TokenQuery>,
+    Json(request): Json<WriteTextRequest>,
+) -> Result<Json<OperationResponse>, ApiError> {
+    validate_api_request(&state, peer, &headers, &query)?;
+    let text = bounded_semantic_text(request.text)?;
+    send_semantic_text(&state, &path.session, request.controller_id, &text).await?;
+    Ok(Json(OperationResponse { ok: true }))
+}
+
+async fn api_run_command(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<ApiSessionPath>,
+    Query(query): Query<TokenQuery>,
+    Json(request): Json<RunCommandRequest>,
+) -> Result<Json<RunCommandResponse>, ApiError> {
+    validate_api_request(&state, peer, &headers, &query)?;
+    let command = semantic_command_text(request.command)?;
+    let wait_for = request.wait_for.map(bounded_wait_text).transpose()?;
+    let wait_timeout = semantic_wait_timeout(request.wait_timeout_ms)?;
+    let controller = agent_controller(request.controller_id)?;
+    let gateway = gateway_for_session(&state, &path.session)?;
+    {
+        let mut gateway = gateway.lock().await;
+        gateway
+            .run_command(&path.session, controller, &command, Instant::now())
+            .await
+            .map_err(ApiError::from_gateway)?;
     }
+
+    let mut matched = None;
+    let mut screen = None;
+    if let Some(wait_for) = wait_for.as_deref() {
+        let wait_result =
+            wait_for_screen_text(&gateway, &path.session, wait_for, wait_timeout).await?;
+        matched = Some(wait_result.matched);
+        if request.capture {
+            screen = wait_result.snapshot.as_ref().map(screen_response);
+        }
+    } else if request.capture {
+        screen = Some(read_gateway_screen(&gateway, &path.session).await?);
+    }
+
+    Ok(Json(RunCommandResponse {
+        ok: true,
+        matched,
+        screen,
+    }))
+}
+
+async fn api_read_screen(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<ApiSessionPath>,
+    Query(query): Query<TokenQuery>,
+) -> Result<Json<ScreenResponse>, ApiError> {
+    validate_api_request(&state, peer, &headers, &query)?;
+    let gateway = gateway_for_session(&state, &path.session)?;
+    let snapshot = {
+        let mut gateway = gateway.lock().await;
+        gateway
+            .read_screen(&path.session)
+            .await
+            .map_err(ApiError::from_gateway)?
+    };
+    Ok(Json(screen_response(&snapshot)))
+}
+
+async fn api_scroll(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(path): Path<ApiSessionPath>,
+    Query(query): Query<TokenQuery>,
+    Json(request): Json<ScrollRequest>,
+) -> Result<Json<OperationResponse>, ApiError> {
+    validate_api_request(&state, peer, &headers, &query)?;
+    if request.amount == 0 || request.amount > SEMANTIC_SCROLL_MAX_AMOUNT {
+        return Err(ApiError::BadRequest);
+    }
+    let controller = agent_controller(request.controller_id)?;
+    let direction = match request.direction {
+        ScrollDirection::Up => BackendScrollDirection::Up,
+        ScrollDirection::Down => BackendScrollDirection::Down,
+    };
+    let gateway = gateway_for_session(&state, &path.session)?;
+    let mut gateway = gateway.lock().await;
+    gateway
+        .scroll(
+            &path.session,
+            controller,
+            direction,
+            request.amount,
+            Instant::now(),
+        )
+        .await
+        .map_err(ApiError::from_gateway)?;
+    Ok(Json(OperationResponse { ok: true }))
 }
 
 async fn bridge_socket(state: AppState, socket: WebSocket) {
+    match state.inner.session.clone() {
+        WebSession::Runtime { commands } => bridge_runtime_socket(state, socket, commands).await,
+        WebSession::TmuxGateway { gateway, session } => {
+            bridge_gateway_socket(state, socket, gateway, session).await;
+        }
+    }
+}
+
+async fn bridge_runtime_socket(
+    state: AppState,
+    socket: WebSocket,
+    commands: mpsc::Sender<RuntimeCommand>,
+) {
     let client_id = state.client_id();
     let (mut sender, mut receiver) = socket.split();
     let (mut tunnel, transport) = in_process_tunnel_pair();
-    let mut bridge_task = tokio::spawn(RuntimeTunnelBridge::run(
-        transport,
-        state.inner.commands.clone(),
-    ));
+    let mut bridge_task = tokio::spawn(RuntimeTunnelBridge::run(transport, commands));
     let mut bridge_finished = false;
     if tunnel
         .send_frame(TunnelFrame::AttachBrowser { client_id })
@@ -507,6 +814,82 @@ async fn bridge_socket(state: AppState, socket: WebSocket) {
             Err(error) => {
                 debug!(%error, "runtime tunnel bridge task panicked during browser detach");
             }
+        }
+    }
+}
+
+async fn bridge_gateway_socket(
+    state: AppState,
+    socket: WebSocket,
+    gateway: Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: SessionName,
+) {
+    let client_id = state.client_id();
+    let controller = match controller_from_client(client_id) {
+        Ok(controller) => controller,
+        Err(error) => {
+            debug!(%error, "failed to create browser controller id");
+            return;
+        }
+    };
+    let (mut sender, mut receiver) = socket.split();
+    let owns_lease = match attach_gateway_browser(&gateway, &session, controller, &mut sender).await
+    {
+        Ok(lease_state) => lease_state,
+        Err(error) => {
+            debug!(%error, "gateway browser attach failed");
+            let _result = sender
+                .send(Message::Close(Some(runtime_unavailable_close())))
+                .await;
+            return;
+        }
+    };
+
+    let mut last_client_message = Instant::now();
+    let mut last_screen = Bytes::new();
+    let mut heartbeat_check = time::interval(CLIENT_HEARTBEAT_CHECK_INTERVAL);
+    let mut server_ping = time::interval(SERVER_PING_INTERVAL);
+    let mut screen_poll = time::interval(GATEWAY_SCREEN_POLL_INTERVAL);
+    loop {
+        tokio::select! {
+            Some(message) = receiver.next() => {
+                if handle_gateway_browser_message(
+                    message,
+                    &gateway,
+                    &session,
+                    controller,
+                    owns_lease,
+                    &mut sender,
+                    &mut last_client_message,
+                ).await.should_close() {
+                    break;
+                }
+            }
+            _ = screen_poll.tick() => {
+                if send_gateway_screen_if_changed(&gateway, &session, &mut sender, &mut last_screen).await.should_close() {
+                    break;
+                }
+            }
+            _ = heartbeat_check.tick() => {
+                if last_client_message.elapsed() >= CLIENT_HEARTBEAT_TIMEOUT {
+                    debug!(client_id = client_id.get(), "closing stale gateway browser terminal websocket");
+                    let _result = sender.send(Message::Close(Some(client_timeout_close()))).await;
+                    break;
+                }
+            }
+            _ = server_ping.tick() => {
+                if send_server_ping(&mut sender).await.is_err() {
+                    break;
+                }
+            }
+            else => break,
+        }
+    }
+
+    if owns_lease {
+        let mut gateway = gateway.lock().await;
+        if let Err(error) = gateway.release_controller(&session, controller, Instant::now()) {
+            debug!(%error, "failed to release gateway browser controller");
         }
     }
 }
@@ -592,6 +975,197 @@ async fn handle_browser_message(
             debug!(%error, "websocket receive error");
             BrowserSocketAction::Close
         }
+    }
+}
+
+async fn attach_gateway_browser(
+    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: &SessionName,
+    controller: ControllerRef,
+    sender: &mut BrowserSocketSender,
+) -> Result<bool, SessionGatewayError> {
+    let (owns_lease, lease_owner, lease_epoch, snapshot) = {
+        let mut gateway = gateway.lock().await;
+        let (owns_lease, lease_owner, lease_epoch) =
+            match gateway.acquire_controller(session, controller, Instant::now()) {
+                Ok(lease) => (true, LeaseOwner::Browser, lease.epoch()),
+                Err(SessionGatewayError::Lock(OperationLockError::LeaseConflict { .. })) => {
+                    (false, LeaseOwner::Terminal, 0)
+                }
+                Err(error) => return Err(error),
+            };
+        let snapshot = gateway.read_screen(session).await?;
+        (owns_lease, lease_owner, lease_epoch, snapshot)
+    };
+    send_server_control(
+        sender,
+        ServerControlMessage::LeaseChanged {
+            owner: lease_owner,
+            epoch: lease_epoch,
+        },
+    )
+    .await;
+    send_server_control(
+        sender,
+        ServerControlMessage::Ready {
+            session: session.clone(),
+        },
+    )
+    .await;
+    send_server_control(
+        sender,
+        ServerControlMessage::SizeChanged {
+            size: snapshot.size(),
+        },
+    )
+    .await;
+    let bytes = screen_snapshot_bytes(&snapshot);
+    let _result = sender.send(Message::Binary(bytes)).await;
+    Ok(owns_lease)
+}
+
+async fn handle_gateway_browser_message(
+    message: Result<Message, axum::Error>,
+    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: &SessionName,
+    controller: ControllerRef,
+    owns_lease: bool,
+    sender: &mut BrowserSocketSender,
+    last_client_message: &mut Instant,
+) -> BrowserSocketAction {
+    match message {
+        Ok(Message::Binary(bytes)) => {
+            *last_client_message = Instant::now();
+            handle_gateway_binary(bytes, gateway, session, controller, owns_lease, sender).await
+        }
+        Ok(Message::Text(text)) => {
+            *last_client_message = Instant::now();
+            handle_gateway_text(&text, gateway, session, controller, owns_lease, sender).await
+        }
+        Ok(Message::Close(_frame)) => BrowserSocketAction::Close,
+        Ok(Message::Ping(bytes)) => {
+            *last_client_message = Instant::now();
+            if sender.send(Message::Pong(bytes)).await.is_err() {
+                BrowserSocketAction::Close
+            } else {
+                BrowserSocketAction::Continue
+            }
+        }
+        Ok(Message::Pong(_bytes)) => {
+            *last_client_message = Instant::now();
+            BrowserSocketAction::Continue
+        }
+        Err(error) => {
+            debug!(%error, "gateway websocket receive error");
+            BrowserSocketAction::Close
+        }
+    }
+}
+
+async fn handle_gateway_binary(
+    bytes: Bytes,
+    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: &SessionName,
+    controller: ControllerRef,
+    owns_lease: bool,
+    sender: &mut BrowserSocketSender,
+) -> BrowserSocketAction {
+    if !owns_lease {
+        let _result = send_forbidden_error(sender).await;
+        return BrowserSocketAction::Continue;
+    }
+    let bytes = match TunnelTerminalPayload::new(bytes) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            debug!(%error, "closing websocket after oversized gateway input frame");
+            let _result = send_control_error(sender).await;
+            let _result = sender.send(Message::Close(Some(protocol_close()))).await;
+            return BrowserSocketAction::Close;
+        }
+    };
+    let result = {
+        let mut gateway = gateway.lock().await;
+        gateway
+            .write_input(session, controller, bytes.into_bytes(), Instant::now())
+            .await
+    };
+    if let Err(error) = result {
+        debug!(%error, "gateway input failed");
+        let _result = send_runtime_error(sender).await;
+    }
+    BrowserSocketAction::Continue
+}
+
+async fn handle_gateway_text(
+    text: &str,
+    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: &SessionName,
+    controller: ControllerRef,
+    owns_lease: bool,
+    sender: &mut BrowserSocketSender,
+) -> BrowserSocketAction {
+    let message = match serde_json::from_str::<ClientControlMessage>(text) {
+        Ok(message) => message,
+        Err(error) => {
+            debug!(%error, "closing gateway websocket after invalid control frame");
+            let _result = send_control_error(sender).await;
+            let _result = sender.send(Message::Close(Some(protocol_close()))).await;
+            return BrowserSocketAction::Close;
+        }
+    };
+    match message {
+        ClientControlMessage::Resize { cols, rows } => {
+            if !owns_lease {
+                let _result = send_forbidden_error(sender).await;
+                return BrowserSocketAction::Continue;
+            }
+            let size = TerminalSize { cols, rows };
+            let result = {
+                let mut gateway = gateway.lock().await;
+                gateway
+                    .resize(session, controller, size, Instant::now())
+                    .await
+            };
+            if let Err(error) = result {
+                debug!(%error, "gateway resize failed");
+                let _result = send_runtime_error(sender).await;
+            } else {
+                send_server_control(sender, ServerControlMessage::SizeChanged { size }).await;
+            }
+        }
+        ClientControlMessage::Heartbeat { .. } => {}
+    }
+    BrowserSocketAction::Continue
+}
+
+async fn send_gateway_screen_if_changed(
+    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: &SessionName,
+    sender: &mut BrowserSocketSender,
+    last_screen: &mut Bytes,
+) -> BrowserSocketAction {
+    let snapshot = {
+        let mut gateway = gateway.lock().await;
+        match gateway.read_screen(session).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                debug!(%error, "gateway screen read failed");
+                let _result = sender
+                    .send(Message::Close(Some(runtime_unavailable_close())))
+                    .await;
+                return BrowserSocketAction::Close;
+            }
+        }
+    };
+    let bytes = screen_snapshot_bytes(&snapshot);
+    if bytes == *last_screen {
+        return BrowserSocketAction::Continue;
+    }
+    *last_screen = bytes.clone();
+    if sender.send(Message::Binary(bytes)).await.is_err() {
+        BrowserSocketAction::Close
+    } else {
+        BrowserSocketAction::Continue
     }
 }
 
@@ -847,12 +1421,74 @@ async fn send_control_error(
     sender.send(Message::Text(text.into())).await
 }
 
+async fn send_runtime_error(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+) -> Result<(), axum::Error> {
+    let message = ServerControlMessage::Error {
+        code: ErrorCode::Runtime,
+        message: SafeMessage::from_static("backend operation failed"),
+    };
+    send_server_control_result(sender, &message).await
+}
+
+async fn send_forbidden_error(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+) -> Result<(), axum::Error> {
+    let message = ServerControlMessage::Error {
+        code: ErrorCode::Forbidden,
+        message: SafeMessage::from_static("controller does not own input lease"),
+    };
+    send_server_control_result(sender, &message).await
+}
+
+async fn send_server_control(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: ServerControlMessage,
+) {
+    let _result = send_server_control_result(sender, &message).await;
+}
+
+async fn send_server_control_result(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: &ServerControlMessage,
+) -> Result<(), axum::Error> {
+    let text = match serde_json::to_string(message) {
+        Ok(text) => text,
+        Err(error) => {
+            debug!(%error, "failed to serialize server control message");
+            return Ok(());
+        }
+    };
+    sender.send(Message::Text(text.into())).await
+}
+
 async fn send_server_ping(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
 ) -> Result<(), axum::Error> {
     sender
         .send(Message::Ping(Bytes::from_static(SERVER_PING_PAYLOAD)))
         .await
+}
+
+fn controller_from_client(client_id: ClientId) -> Result<ControllerRef, OperationLockError> {
+    Ok(ControllerRef::new(
+        ControllerKind::Browser,
+        ControllerId::new(client_id.get())?,
+    ))
+}
+
+fn screen_snapshot_bytes(snapshot: &BackendScreenSnapshot) -> Bytes {
+    let mut text = String::from("\x1b[H\x1b[2J");
+    for (index, line) in snapshot.lines().iter().enumerate() {
+        if index > 0 {
+            text.push_str("\r\n");
+        }
+        text.push_str(line);
+    }
+    let cursor_row = snapshot.cursor_row().saturating_add(1);
+    let cursor_col = snapshot.cursor_col().saturating_add(1);
+    let _result = write!(text, "\x1b[{cursor_row};{cursor_col}H");
+    Bytes::from(text)
 }
 
 fn protocol_error_message() -> SafeMessage {
@@ -894,6 +1530,184 @@ fn close_frame_for_tunnel_reason(reason: TunnelCloseReason) -> CloseFrame {
     CloseFrame {
         code: close_code::NORMAL,
         reason: reason.into(),
+    }
+}
+
+fn validate_api_request(
+    state: &AppState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    query: &TokenQuery,
+) -> Result<(), ApiError> {
+    validate_http_request(state, peer, headers, query, false).map_err(ApiError::Security)
+}
+
+fn gateway_for_session(
+    state: &AppState,
+    requested: &SessionName,
+) -> Result<Arc<Mutex<SessionGateway<TmuxBackend>>>, ApiError> {
+    let WebSession::TmuxGateway { gateway, session } = &state.inner.session else {
+        return Err(ApiError::Unsupported);
+    };
+    if session != requested {
+        return Err(ApiError::NotFound);
+    }
+    Ok(Arc::clone(gateway))
+}
+
+fn agent_controller(id: u64) -> Result<ControllerRef, ApiError> {
+    Ok(ControllerRef::new(
+        ControllerKind::Agent,
+        ControllerId::new(id).map_err(|_error| ApiError::BadRequest)?,
+    ))
+}
+
+#[derive(Debug)]
+struct WaitForScreenTextResult {
+    matched: bool,
+    snapshot: Option<BackendScreenSnapshot>,
+}
+
+fn bounded_semantic_text(text: String) -> Result<String, ApiError> {
+    if text.len() > SEMANTIC_TEXT_MAX_BYTES || text.as_bytes().contains(&0) {
+        return Err(ApiError::BadRequest);
+    }
+    Ok(text)
+}
+
+fn semantic_command_text(command: String) -> Result<String, ApiError> {
+    if command.contains(['\r', '\n']) {
+        return Err(ApiError::BadRequest);
+    }
+    bounded_semantic_text(command)
+}
+
+fn bounded_wait_text(text: String) -> Result<String, ApiError> {
+    if text.is_empty() || text.len() > SEMANTIC_WAIT_TEXT_MAX_BYTES || text.as_bytes().contains(&0)
+    {
+        return Err(ApiError::BadRequest);
+    }
+    Ok(text)
+}
+
+fn semantic_wait_timeout(value: Option<u64>) -> Result<Duration, ApiError> {
+    let millis = value.unwrap_or(SEMANTIC_WAIT_TIMEOUT_DEFAULT_MS);
+    if millis == 0 || millis > SEMANTIC_WAIT_TIMEOUT_MAX_MS {
+        return Err(ApiError::BadRequest);
+    }
+    Ok(Duration::from_millis(millis))
+}
+
+fn semantic_key_token(key: &str) -> Result<String, ApiError> {
+    if key.is_empty() || key.len() > SEMANTIC_KEY_MAX_BYTES {
+        return Err(ApiError::BadRequest);
+    }
+    let token = match key {
+        "Enter" => "Enter",
+        "Tab" => "Tab",
+        "Escape" => "Escape",
+        "Backspace" => "BSpace",
+        "CtrlC" => "C-c",
+        "CtrlD" => "C-d",
+        "ArrowUp" => "Up",
+        "ArrowDown" => "Down",
+        "ArrowRight" => "Right",
+        "ArrowLeft" => "Left",
+        _ => {
+            if key.chars().count() != 1 || key.chars().any(char::is_control) {
+                return Err(ApiError::BadRequest);
+            }
+            key
+        }
+    };
+    Ok(token.to_owned())
+}
+
+async fn send_semantic_text(
+    state: &AppState,
+    session: &SessionName,
+    controller_id: u64,
+    text: &str,
+) -> Result<(), ApiError> {
+    let controller = agent_controller(controller_id)?;
+    let gateway = gateway_for_session(state, session)?;
+    let mut gateway = gateway.lock().await;
+    gateway
+        .send_text(session, controller, text, Instant::now())
+        .await
+        .map_err(ApiError::from_gateway)?;
+    Ok(())
+}
+
+async fn send_semantic_key(
+    state: &AppState,
+    session: &SessionName,
+    controller_id: u64,
+    key: &str,
+) -> Result<(), ApiError> {
+    let controller = agent_controller(controller_id)?;
+    let gateway = gateway_for_session(state, session)?;
+    let mut gateway = gateway.lock().await;
+    gateway
+        .send_key(session, controller, key, Instant::now())
+        .await
+        .map_err(ApiError::from_gateway)?;
+    Ok(())
+}
+
+async fn wait_for_screen_text(
+    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: &SessionName,
+    needle: &str,
+    timeout: Duration,
+) -> Result<WaitForScreenTextResult, ApiError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(ApiError::BadRequest)?;
+    loop {
+        let snapshot = {
+            let mut gateway = gateway.lock().await;
+            gateway
+                .read_screen(session)
+                .await
+                .map_err(ApiError::from_gateway)?
+        };
+        if snapshot.lines().iter().any(|line| line.contains(needle)) {
+            return Ok(WaitForScreenTextResult {
+                matched: true,
+                snapshot: Some(snapshot),
+            });
+        }
+        if Instant::now() >= deadline {
+            return Ok(WaitForScreenTextResult {
+                matched: false,
+                snapshot: Some(snapshot),
+            });
+        }
+        time::sleep(SEMANTIC_WAIT_POLL_INTERVAL).await;
+    }
+}
+
+async fn read_gateway_screen(
+    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: &SessionName,
+) -> Result<ScreenResponse, ApiError> {
+    let snapshot = {
+        let mut gateway = gateway.lock().await;
+        gateway
+            .read_screen(session)
+            .await
+            .map_err(ApiError::from_gateway)?
+    };
+    Ok(screen_response(&snapshot))
+}
+
+fn screen_response(snapshot: &BackendScreenSnapshot) -> ScreenResponse {
+    ScreenResponse {
+        size: snapshot.size(),
+        cursor_col: snapshot.cursor_col(),
+        cursor_row: snapshot.cursor_row(),
+        lines: snapshot.lines().to_vec(),
     }
 }
 
@@ -968,28 +1782,107 @@ impl IntoResponse for WebError {
     }
 }
 
+#[derive(Debug)]
+enum ApiError {
+    BadRequest,
+    Conflict,
+    Forbidden,
+    NotFound,
+    Runtime,
+    Security(WebError),
+    Unsupported,
+}
+
+impl ApiError {
+    fn from_gateway(error: SessionGatewayError) -> Self {
+        match error {
+            SessionGatewayError::Lock(OperationLockError::LeaseConflict { .. }) => Self::Conflict,
+            SessionGatewayError::Lock(OperationLockError::NotLeaseOwner { .. }) => Self::Forbidden,
+            SessionGatewayError::Lock(_error) => Self::BadRequest,
+            SessionGatewayError::Registry(_error) => Self::NotFound,
+            SessionGatewayError::Backend(_error) => Self::Runtime,
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Security(error) => error.into_response(),
+            error => {
+                debug!(reason = ?error, "semantic api request failed");
+                let (status, code, message) = match error {
+                    Self::BadRequest => (
+                        StatusCode::BAD_REQUEST,
+                        ErrorCode::Protocol,
+                        SafeMessage::from_static("invalid semantic operation request"),
+                    ),
+                    Self::Conflict => (
+                        StatusCode::CONFLICT,
+                        ErrorCode::Forbidden,
+                        SafeMessage::from_static("operation lease is owned by another controller"),
+                    ),
+                    Self::Forbidden => (
+                        StatusCode::FORBIDDEN,
+                        ErrorCode::Forbidden,
+                        SafeMessage::from_static("controller does not own input lease"),
+                    ),
+                    Self::NotFound => (
+                        StatusCode::NOT_FOUND,
+                        ErrorCode::Runtime,
+                        SafeMessage::from_static("session was not found"),
+                    ),
+                    Self::Runtime => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ErrorCode::Runtime,
+                        SafeMessage::from_static("backend operation failed"),
+                    ),
+                    Self::Unsupported => (
+                        StatusCode::CONFLICT,
+                        ErrorCode::Runtime,
+                        SafeMessage::from_static("semantic api requires a backend session"),
+                    ),
+                    Self::Security(_error) => {
+                        return StatusCode::FORBIDDEN.into_response();
+                    }
+                };
+                let body = ServerControlMessage::Error { code, message };
+                (status, Json(body)).into_response()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         ffi::OsString,
         net::{IpAddr, Ipv4Addr},
+        path::PathBuf,
+        process::Stdio,
     };
 
     use anyhow::Context;
     use axum::{
         body::Body,
-        http::{Request, StatusCode},
+        http::{Method, Request, StatusCode},
     };
     use bytes::Bytes;
     use http_body_util::BodyExt;
+    use serde::de::DeserializeOwned;
+    use serde_json::json;
     use termstage_core::{
-        protocol::{AccessToken, HeartbeatSequence, SessionName, TerminalSize},
+        protocol::{AccessToken, SessionName, TerminalSize},
         runtime::{
             ExitPolicy, ReconnectPolicy, RuntimeSession, SessionMode, ShellCommand, ShutdownReason,
         },
-        tunnel::{JsonTunnelCodec, TunnelCodec, TunnelFrame, TunnelPayload, TunnelTerminalPayload},
+        session_gateway::SessionGateway,
+        tmux_backend::TmuxBackend,
     };
-    use tokio::time::{Duration, timeout};
+    use tokio::{
+        process::Command as TokioCommand,
+        time::{Duration, timeout},
+    };
     use tokio_tungstenite::{
         connect_async,
         tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest},
@@ -1019,6 +1912,41 @@ mod tests {
         let mut config = WebConfig::local(token.clone(), commands, runtime);
         config.port = 49152;
         Ok((config, token))
+    }
+
+    #[derive(Debug)]
+    struct TmuxSessionCleanup {
+        tmux: PathBuf,
+        session: SessionName,
+        active: bool,
+    }
+
+    impl TmuxSessionCleanup {
+        fn new(tmux: PathBuf, session: SessionName) -> Self {
+            Self {
+                tmux,
+                session,
+                active: true,
+            }
+        }
+    }
+
+    impl Drop for TmuxSessionCleanup {
+        #[allow(
+            clippy::disallowed_types,
+            reason = "test cleanup runs from Drop and cannot await tokio::process::Command"
+        )]
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            let _result = std::process::Command::new(&self.tmux)
+                .env_remove("TMUX")
+                .args(["kill-session", "-t", self.session.as_str()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
     }
 
     async fn request(path: &str, host: &str, config: WebConfig) -> anyhow::Result<StatusCode> {
@@ -1052,6 +1980,56 @@ mod tests {
             )
             .await?;
         Ok(response.status())
+    }
+
+    async fn api_post_json(
+        app: &Router,
+        path: &str,
+        token: &AccessToken,
+        body: serde_json::Value,
+    ) -> anyhow::Result<Response> {
+        let uri = format!("{path}?token={}", token.to_url_token());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::HOST, "127.0.0.1:49152")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .extension(ConnectInfo(SocketAddr::from((Ipv4Addr::LOCALHOST, 50000))))
+                    .body(Body::from(serde_json::to_vec(&body)?))?,
+            )
+            .await?;
+        Ok(response)
+    }
+
+    async fn api_post_empty(
+        app: &Router,
+        path: &str,
+        token: &AccessToken,
+    ) -> anyhow::Result<Response> {
+        let uri = format!("{path}?token={}", token.to_url_token());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::HOST, "127.0.0.1:49152")
+                    .extension(ConnectInfo(SocketAddr::from((Ipv4Addr::LOCALHOST, 50000))))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        Ok(response)
+    }
+
+    async fn decode_json<T>(response: Response) -> anyhow::Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let body = response.into_body().collect().await?.to_bytes();
+        serde_json::from_slice(&body).map_err(Into::into)
     }
 
     #[tokio::test]
@@ -1237,83 +2215,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_should_accept_tunnel_websocket_and_forward_frame_to_runtime() -> anyhow::Result<()>
-    {
-        let token = AccessToken::from_bytes([15; 32]);
-        let (commands, mut command_rx) = mpsc::channel(8);
-        let runtime = RuntimeConfig {
-            mode: SessionMode::NewShell {
-                shell: test_shell_command()?,
-            },
-            initial_size: TerminalSize::new(80, 24)?,
-            reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
-            exit_policy: ExitPolicy::Hold,
-        };
-        let server = serve(WebConfig::local(token.clone(), commands, runtime)).await?;
-        let mut socket = connect_tunnel_socket(server.address(), "/tunnel/ws", &token).await?;
-        let frame = TunnelFrame::BrowserInput {
-            client_id: ClientId::new(31),
-            bytes: TunnelTerminalPayload::new(Bytes::from_static(b"tunnel-input"))?,
-        };
-        let TunnelPayload::Text(text) = JsonTunnelCodec.encode(&frame)? else {
-            anyhow::bail!("expected JSON text tunnel frame");
-        };
-
-        socket.send(TungsteniteMessage::Text(text.into())).await?;
-        let command = timeout(Duration::from_secs(5), command_rx.recv())
-            .await?
-            .context("runtime command channel closed")?;
-
-        let RuntimeCommand::Input { client_id, bytes } = command else {
-            anyhow::bail!("expected browser input runtime command");
-        };
-        assert_eq!(client_id, ClientId::new(31));
-        assert_eq!(bytes, Bytes::from_static(b"tunnel-input"));
-        socket.close(None).await?;
-        server.shutdown().await?;
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_should_reject_tunnel_websocket_with_invalid_token() -> anyhow::Result<()> {
-        let (config, _token) = test_config()?;
-        let server = serve(config).await?;
-        let url = format!("ws://{}/tunnel/ws?token=bad", server.address());
-        let mut request = url.into_client_request()?;
-        let origin = format!("http://{}", server.address());
-        request
-            .headers_mut()
-            .insert(header::ORIGIN, origin.parse()?);
-
-        assert!(connect_async(request).await.is_err());
-        server.shutdown().await?;
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_should_mount_tunnel_websocket_under_base_path() -> anyhow::Result<()> {
-        let (mut config, token) = test_config()?;
-        config.port = 0;
-        config.base_path = Some(BasePath::parse("/p/sess-3/")?);
-        let server = serve(config).await?;
-        let mut socket =
-            connect_tunnel_socket(server.address(), "/p/sess-3/tunnel/ws", &token).await?;
-        let frame = TunnelFrame::Heartbeat {
-            sequence: HeartbeatSequence::new(1),
-        };
-        let TunnelPayload::Text(text) = JsonTunnelCodec.encode(&frame)? else {
-            anyhow::bail!("expected JSON text tunnel frame");
-        };
-        socket.send(TungsteniteMessage::Text(text.into())).await?;
-        socket.close(None).await?;
-
-        let root_result = connect_tunnel_socket(server.address(), "/tunnel/ws", &token).await;
-        assert!(root_result.is_err());
-        server.shutdown().await?;
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_should_bridge_websocket_binary_input_to_runtime_output() -> anyhow::Result<()> {
         let token = AccessToken::from_bytes([5; 32]);
         let runtime = RuntimeConfig {
@@ -1369,6 +2270,332 @@ mod tests {
         assert!(found);
         server.shutdown().await?;
         session.shutdown(ShutdownReason::Supervisor).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_bridge_websocket_to_tmux_gateway() -> anyhow::Result<()> {
+        let backend = TmuxBackend::from_path().context("tmux unavailable")?;
+        let tmux = backend.tmux_path().to_path_buf();
+        let token = AccessToken::from_bytes([17; 32]);
+        let session = SessionName::new(format!("termstage-gateway-ws-{}", std::process::id()))?;
+        let _cleanup = TmuxSessionCleanup::new(tmux, session.clone());
+        let mut gateway = SessionGateway::new(backend, Duration::from_secs(90));
+        gateway
+            .create_or_find_session(session.clone(), session.clone(), TerminalSize::new(80, 24)?)
+            .await?;
+        let config = WebConfig::local_tmux_gateway(
+            token.clone(),
+            Arc::new(Mutex::new(gateway)),
+            session.clone(),
+        );
+        let server = serve(config).await?;
+        let mut socket = connect_test_socket(server.address(), &token).await?;
+
+        socket
+            .send(TungsteniteMessage::Binary(Bytes::from_static(
+                b"printf gateway-ws-ok\\n\n",
+            )))
+            .await?;
+
+        assert!(
+            read_socket_until(&mut socket, b"gateway-ws-ok").await?,
+            "gateway websocket did not receive tmux backend output"
+        );
+        socket.close(None).await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_operate_tmux_gateway_with_semantic_api() -> anyhow::Result<()> {
+        let backend = TmuxBackend::from_path().context("tmux unavailable")?;
+        let tmux = backend.tmux_path().to_path_buf();
+        let token = AccessToken::from_bytes([18; 32]);
+        let session = SessionName::new(format!("termstage-semantic-api-{}", std::process::id()))?;
+        let _cleanup = TmuxSessionCleanup::new(tmux, session.clone());
+        let mut gateway = SessionGateway::new(backend, Duration::from_secs(90));
+        gateway
+            .create_or_find_session(session.clone(), session.clone(), TerminalSize::new(80, 24)?)
+            .await?;
+        let mut config = WebConfig::local_tmux_gateway(
+            token.clone(),
+            Arc::new(Mutex::new(gateway)),
+            session.clone(),
+        );
+        config.port = 49152;
+        let app = router(config)?;
+        let base = format!("/api/sessions/{}", session.as_str());
+
+        let response = api_post_json(
+            &app,
+            &format!("{base}/acquire-lock"),
+            &token,
+            json!({ "controllerId": 42 }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let lease: LeaseResponse = decode_json(response).await?;
+        assert_eq!(lease.owner, LeaseOwner::Agent);
+
+        let response = api_post_json(
+            &app,
+            &format!("{base}/write-text"),
+            &token,
+            json!({ "controllerId": 42, "text": "printf semantic-write-ok" }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = api_post_json(
+            &app,
+            &format!("{base}/press-key"),
+            &token,
+            json!({ "controllerId": 42, "key": "Enter" }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            read_semantic_screen_until(&app, &base, &token, "semantic-write-ok").await?,
+            "semantic write-text/press-key output was not visible"
+        );
+
+        let response = api_post_json(
+            &app,
+            &format!("{base}/run-command"),
+            &token,
+            json!({
+                "controllerId": 42,
+                "command": "printf semantic-run-ok",
+                "waitFor": "semantic-run-ok",
+                "capture": true
+            }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let run: RunCommandResponse = decode_json(response).await?;
+        assert_eq!(run.matched, Some(true));
+        assert!(
+            run.screen.as_ref().is_some_and(|screen| screen
+                .lines
+                .iter()
+                .any(|line| line.contains("semantic-run-ok"))),
+            "semantic run-command response did not capture the matched screen"
+        );
+        assert!(
+            read_semantic_screen_until(&app, &base, &token, "semantic-run-ok").await?,
+            "semantic run-command output was not visible"
+        );
+
+        let response = api_post_json(
+            &app,
+            &format!("{base}/scroll"),
+            &token,
+            json!({ "controllerId": 42, "direction": "up", "amount": 1 }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = api_post_json(
+            &app,
+            &format!("{base}/release-lock"),
+            &token,
+            json!({ "controllerId": 42 }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_reject_semantic_write_from_non_owner() -> anyhow::Result<()> {
+        let backend = TmuxBackend::from_path().context("tmux unavailable")?;
+        let tmux = backend.tmux_path().to_path_buf();
+        let token = AccessToken::from_bytes([19; 32]);
+        let session = SessionName::new(format!("termstage-semantic-lock-{}", std::process::id()))?;
+        let _cleanup = TmuxSessionCleanup::new(tmux, session.clone());
+        let mut gateway = SessionGateway::new(backend, Duration::from_secs(90));
+        gateway
+            .create_or_find_session(session.clone(), session.clone(), TerminalSize::new(80, 24)?)
+            .await?;
+        let mut config = WebConfig::local_tmux_gateway(
+            token.clone(),
+            Arc::new(Mutex::new(gateway)),
+            session.clone(),
+        );
+        config.port = 49152;
+        let app = router(config)?;
+        let base = format!("/api/sessions/{}", session.as_str());
+
+        let response = api_post_json(
+            &app,
+            &format!("{base}/acquire-lock"),
+            &token,
+            json!({ "controllerId": 1 }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = api_post_json(
+            &app,
+            &format!("{base}/write-text"),
+            &token,
+            json!({ "controllerId": 2, "text": "blocked" }),
+        )
+        .await?;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_sync_agent_api_output_to_read_only_browser() -> anyhow::Result<()> {
+        let backend = TmuxBackend::from_path().context("tmux unavailable")?;
+        let tmux = backend.tmux_path().to_path_buf();
+        let token = AccessToken::from_bytes([20; 32]);
+        let session = SessionName::new(format!(
+            "termstage-agent-browser-sync-{}",
+            std::process::id()
+        ))?;
+        let _cleanup = TmuxSessionCleanup::new(tmux, session.clone());
+        let mut gateway = SessionGateway::new(backend, Duration::from_secs(90));
+        gateway
+            .create_or_find_session(session.clone(), session.clone(), TerminalSize::new(80, 24)?)
+            .await?;
+        let shared_gateway = Arc::new(Mutex::new(gateway));
+        let mut app_config = WebConfig::local_tmux_gateway(
+            token.clone(),
+            Arc::clone(&shared_gateway),
+            session.clone(),
+        );
+        app_config.port = 49152;
+        let app = router(app_config)?;
+        let server_config =
+            WebConfig::local_tmux_gateway(token.clone(), shared_gateway, session.clone());
+        let server = serve(server_config).await?;
+        let base = format!("/api/sessions/{}", session.as_str());
+
+        let response = api_post_json(
+            &app,
+            &format!("{base}/acquire-lock"),
+            &token,
+            json!({ "controllerId": 77 }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = api_post_json(
+            &app,
+            &format!("{base}/run-command"),
+            &token,
+            json!({
+                "controllerId": 77,
+                "command": "printf agent-to-browser-sync-ok",
+                "waitFor": "agent-to-browser-sync-ok"
+            }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let run: RunCommandResponse = decode_json(response).await?;
+        assert_eq!(run.matched, Some(true));
+
+        let mut socket = connect_test_socket(server.address(), &token).await?;
+        assert!(
+            read_socket_until(&mut socket, b"agent-to-browser-sync-ok").await?,
+            "read-only browser did not receive Agent API output"
+        );
+        socket
+            .send(TungsteniteMessage::Binary(Bytes::from_static(
+                b"printf forbidden-browser-write\\n\n",
+            )))
+            .await?;
+        assert!(
+            read_socket_text_until(&mut socket, "\"code\":\"forbidden\"").await?,
+            "read-only browser write did not receive forbidden control error"
+        );
+        socket.close(None).await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_reject_agent_lock_when_browser_owns_gateway() -> anyhow::Result<()> {
+        let backend = TmuxBackend::from_path().context("tmux unavailable")?;
+        let tmux = backend.tmux_path().to_path_buf();
+        let token = AccessToken::from_bytes([21; 32]);
+        let session = SessionName::new(format!(
+            "termstage-browser-agent-lock-{}",
+            std::process::id()
+        ))?;
+        let _cleanup = TmuxSessionCleanup::new(tmux, session.clone());
+        let mut gateway = SessionGateway::new(backend, Duration::from_secs(90));
+        gateway
+            .create_or_find_session(session.clone(), session.clone(), TerminalSize::new(80, 24)?)
+            .await?;
+        let shared_gateway = Arc::new(Mutex::new(gateway));
+        let mut app_config = WebConfig::local_tmux_gateway(
+            token.clone(),
+            Arc::clone(&shared_gateway),
+            session.clone(),
+        );
+        app_config.port = 49152;
+        let app = router(app_config)?;
+        let server_config =
+            WebConfig::local_tmux_gateway(token.clone(), shared_gateway, session.clone());
+        let server = serve(server_config).await?;
+        let mut socket = connect_test_socket(server.address(), &token).await?;
+        assert!(
+            read_socket_text_until(&mut socket, "\"type\":\"leaseChanged\"").await?,
+            "browser did not acquire a gateway lease"
+        );
+
+        let base = format!("/api/sessions/{}", session.as_str());
+        let response = api_post_json(
+            &app,
+            &format!("{base}/acquire-lock"),
+            &token,
+            json!({ "controllerId": 88 }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        socket.close(None).await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_sync_native_tmux_writes_to_browser_and_api() -> anyhow::Result<()> {
+        let backend = TmuxBackend::from_path().context("tmux unavailable")?;
+        let tmux = backend.tmux_path().to_path_buf();
+        let token = AccessToken::from_bytes([22; 32]);
+        let session = SessionName::new(format!("termstage-native-sync-{}", std::process::id()))?;
+        let _cleanup = TmuxSessionCleanup::new(tmux.clone(), session.clone());
+        let mut gateway = SessionGateway::new(backend, Duration::from_secs(90));
+        gateway
+            .create_or_find_session(session.clone(), session.clone(), TerminalSize::new(80, 24)?)
+            .await?;
+        let shared_gateway = Arc::new(Mutex::new(gateway));
+        let mut app_config = WebConfig::local_tmux_gateway(
+            token.clone(),
+            Arc::clone(&shared_gateway),
+            session.clone(),
+        );
+        app_config.port = 49152;
+        let app = router(app_config)?;
+        let server_config =
+            WebConfig::local_tmux_gateway(token.clone(), shared_gateway, session.clone());
+        let server = serve(server_config).await?;
+        let mut socket = connect_test_socket(server.address(), &token).await?;
+
+        send_native_tmux_input(&tmux, &session, "printf native-tmux-sync-ok\\n\n").await?;
+        assert!(
+            read_socket_until(&mut socket, b"native-tmux-sync-ok").await?,
+            "browser did not receive output written through native tmux path"
+        );
+        let base = format!("/api/sessions/{}", session.as_str());
+        assert!(
+            read_semantic_screen_until(&app, &base, &token, "native-tmux-sync-ok").await?,
+            "semantic API did not read output written through native tmux path"
+        );
+        socket.close(None).await?;
+        server.shutdown().await?;
         Ok(())
     }
 
@@ -1813,25 +3040,6 @@ mod tests {
         Ok(socket)
     }
 
-    async fn connect_tunnel_socket(
-        address: SocketAddr,
-        path: &str,
-        token: &AccessToken,
-    ) -> anyhow::Result<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    > {
-        let url = format!("ws://{address}{path}?token={}", token.to_url_token());
-        let mut request = url.into_client_request()?;
-        let origin = format!("http://{address}");
-        request
-            .headers_mut()
-            .insert(header::ORIGIN, origin.parse()?);
-        let (socket, _response) = connect_async(request).await?;
-        Ok(socket)
-    }
-
     async fn read_socket_until(
         socket: &mut tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -1886,6 +3094,45 @@ mod tests {
             anyhow::Ok(false)
         })
         .await?
+    }
+
+    async fn read_semantic_screen_until(
+        app: &Router,
+        base: &str,
+        token: &AccessToken,
+        needle: &str,
+    ) -> anyhow::Result<bool> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let response = api_post_empty(app, &format!("{base}/read-screen"), token).await?;
+                if response.status() != StatusCode::OK {
+                    return anyhow::Ok(false);
+                }
+                let screen: ScreenResponse = decode_json(response).await?;
+                if screen.lines.iter().any(|line| line.contains(needle)) {
+                    return anyhow::Ok(true);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await?
+    }
+
+    async fn send_native_tmux_input(
+        tmux: &PathBuf,
+        session: &SessionName,
+        input: &str,
+    ) -> anyhow::Result<()> {
+        let status = TokioCommand::new(tmux)
+            .env_remove("TMUX")
+            .args(["send-keys", "-t", session.as_str(), "-l", "--", input])
+            .status()
+            .await
+            .context("failed to send native tmux input")?;
+        if !status.success() {
+            anyhow::bail!("native tmux send-keys exited with {status}");
+        }
+        Ok(())
     }
 
     async fn read_socket_close_reason(

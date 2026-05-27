@@ -50,6 +50,18 @@ a PTY so Chrome and a native terminal can attach to the same demo state.
 A fresh local shell spawned in a PTY. Useful for smoke tests and simple demos, but it
 does not attach to an existing Terminal.app window.
 
+## Backend session
+
+A session/window/pane owned by a backend such as tmux, rmux, or a future terminal
+backend. `termstage` stores a reference to it and reaches it through a backend
+adapter; the backend owns the actual PTY and native local attach behavior.
+
+## Operation lock
+
+The `termstage`-managed write lease for a backend session. At Level 1 it allows
+one browser or API controller to write at a time while other clients remain
+read-only observers.
+
 ## Local-only
 
 The server binds and accepts only loopback traffic, validates token/Host/Origin/peer,

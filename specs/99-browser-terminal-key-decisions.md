@@ -89,3 +89,21 @@ after implementation begins.
   [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md),
   [70-browser-terminal-security-design.md](./70-browser-terminal-security-design.md).
 - Date: 2026-05-19.
+
+## D8 - Termstage Manages Session References, Not Local Attach PTYs
+
+- Context: The old shell-mode local attach plan made `termstage` own a command
+  PTY and mirror it into the invoking terminal and browser.
+- Alternatives considered: keep local passthrough behavior,
+  replace it with a split local TUI, or move shared terminal ownership to a
+  backend session such as rmux/tmux.
+- Decision: Remove the local attach flag and model `termstage` sessions as
+  backend session references. `termstage` owns the registry, gateways, auth, and
+  Level 1 operation lock; rmux/tmux/future backends own actual panes, PTYs,
+  screen state, and native local attach.
+- Why: Backend-native attach is the right abstraction for local viewing.
+  `termstage` should not mix supervisor logs with command output or implement a
+  second terminal multiplexer inside its own stdout/stderr.
+- Pinned by: [23-local-remote-command-lease-design.md](./23-local-remote-command-lease-design.md),
+  [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md).
+- Date: 2026-05-27.
