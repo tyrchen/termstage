@@ -18,6 +18,7 @@ to map that order to user-visible milestones.
 | [21-browser-terminal-public-exposure-design.md](./21-browser-terminal-public-exposure-design.md) | Public exposure design | Opt-in pod/internet mode, public URL validation, token-env token source. |
 | [22-browser-terminal-base-path-design.md](./22-browser-terminal-base-path-design.md) | Base-path design | Reverse-proxy path-prefix mounting via `--base-path`. |
 | [23-local-remote-command-lease-design.md](./23-local-remote-command-lease-design.md) | Shell lease design | Shell-mode local terminal attachment and terminal/browser input lease handoff. |
+| [24-runtime-tunnel-architecture-design.md](./24-runtime-tunnel-architecture-design.md) | Runtime tunnel design | Three-layer runtime tunnel architecture for embedded web-to-runtime communication. |
 | [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md) | CLI design | Command surface, presentation UX, tmux/new-shell modes. |
 | [61-browser-terminal-crates-and-features.md](./61-browser-terminal-crates-and-features.md) | Crates/features | Workspace placement, dependency versions, feature policy. |
 | [70-browser-terminal-security-design.md](./70-browser-terminal-security-design.md) | Security design | Threat model and mandatory local-service controls. |
@@ -64,8 +65,14 @@ to map that order to user-visible milestones.
         | 21 Public Mode |     | 50 CLI UX     |
         | pod exposure   |     | commands      |
         +-------+--------+     +-------+-------+
-                |                      |
-                +----------+-----------+
+                |                      ^
+                v                      |
+        +----------------+             |
+        | 24 Runtime     |-------------+
+        | Tunnel Layers  |
+        +-------+--------+
+                |
+                +----------------------+
                            |
                            v
                     +----------------+

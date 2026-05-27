@@ -16,6 +16,7 @@ use std::{
 
 use bytes::Bytes;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, SlavePty, native_pty_system};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc::{self as tokio_mpsc, error::TrySendError};
 use tracing::warn;
@@ -73,7 +74,7 @@ pub enum RuntimeError {
 }
 
 /// Browser/client identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct ClientId(u64);
 
 impl ClientId {
@@ -1630,9 +1631,11 @@ mod tests {
             })
             .context("missing replay finished marker")?;
         assert!(replay_started_index < replay_finished_index);
+        let replay_contents = messages
+            .get(replay_started_index + 1..replay_finished_index)
+            .context("invalid replay marker range")?;
         assert!(
-            messages[replay_started_index + 1..replay_finished_index]
-                .iter()
+            replay_contents.iter()
                 .any(|message| matches!(message, ClientOutput::Bytes(bytes) if bytes.windows(b"replay-marker".len()).any(|window| window == b"replay-marker")))
         );
         session.shutdown(ShutdownReason::Supervisor).await?;
