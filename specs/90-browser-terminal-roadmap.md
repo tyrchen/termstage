@@ -94,6 +94,30 @@ Exit criteria:
 
 Estimate: 0.5-1 focused week.
 
+### M5 - Local Command Terminal Split UI
+
+User-visible outcome: an operator can run `termstage --mode shell --command k9s
+--local-command-terminal` and see a split local terminal: `termstage` logs/status
+in one pane and the command's PTY UI in another pane, while the browser remains
+connected to the same command PTY.
+
+Specs touched: 11, 23, 50, 70, 72, 80.
+
+Exit criteria:
+
+- `--local-command-terminal` is accepted only in shell mode.
+- Without the flag, the invoking terminal shows supervisor output only and does
+  not render command PTY bytes.
+- With the flag, local terminal renders a log/status pane and a command terminal
+  pane without interleaving logs into command output.
+- Command pane size drives the command PTY size while local terminal owns the
+  input lease.
+- Browser input and local command pane input transfer lease ownership correctly.
+- E2E smoke covers a continuous-output command and a TUI command fixture.
+
+Estimate: 1-2 focused weeks after the runtime tunnel and shell lease foundations
+are stable.
+
 ## 3. Deferred Milestones
 
 - Read-only mirror clients.

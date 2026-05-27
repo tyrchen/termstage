@@ -127,7 +127,23 @@ Maps to roadmap: closes M4.
 Exit criteria: M4 roadmap criteria pass; local loopback tests still pass; standard
 Cargo quality gates remain green.
 
-## 11. Cross-References
+## 11. Phase 7 - Local Command Terminal Split UI
+
+Maps to roadmap: closes M5.
+
+| # | Task | Spec | Effort |
+| --- | --- | --- | --- |
+| 7.1 | Rename the long CLI flag from the working `--attach-local-terminal` name to `--local-command-terminal`, with parser tests for shell-mode-only validation. | [23](./23-local-remote-command-lease-design.md), [50](./50-browser-terminal-cli-design.md) | 0.5 day |
+| 7.2 | Add a local TUI actor that owns raw mode, alternate screen, layout, panic-safe restore, and keyboard routing. | [23](./23-local-remote-command-lease-design.md), [72](./72-browser-terminal-verification-plan.md) | 1.5 days |
+| 7.3 | Route `tracing`/supervisor events into a bounded log pane rather than stdout/stderr while local command terminal mode is active. | [23](./23-local-remote-command-lease-design.md), [70](./70-browser-terminal-security-design.md) | 1 day |
+| 7.4 | Render command PTY output in a command pane using Ratatui plus a validated terminal parser/widget choice. | [23](./23-local-remote-command-lease-design.md), [61](./61-browser-terminal-crates-and-features.md) | 2 days |
+| 7.5 | Make local command pane dimensions drive runtime resize while local terminal owns the lease. | [11](./11-browser-terminal-runtime-design.md), [23](./23-local-remote-command-lease-design.md) | 1 day |
+| 7.6 | Add E2E smoke for continuous output and a TUI command fixture, plus lease handoff between browser and local command pane. | [23](./23-local-remote-command-lease-design.md), [72](./72-browser-terminal-verification-plan.md) | 1.5 days |
+
+Exit criteria: M5 roadmap criteria pass; logs never interleave with command PTY
+bytes in local command terminal mode; standard Cargo quality gates remain green.
+
+## 12. Cross-References
 
 - Depends on: all numbered browser terminal specs.
 - Pairs with: [90-browser-terminal-roadmap.md](./90-browser-terminal-roadmap.md).
