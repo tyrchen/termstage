@@ -94,29 +94,29 @@ Exit criteria:
 
 Estimate: 0.5-1 focused week.
 
-### M5 - Local Command Terminal Split UI
+### M5 - rmux Session Gateway and Semantic Operations
 
-User-visible outcome: an operator can run `termstage --mode shell --command k9s
---local-command-terminal` and see a split local terminal: `termstage` logs/status
-in one pane and the command's PTY UI in another pane, while the browser remains
-connected to the same command PTY.
+User-visible outcome: an operator can create a termstage session backed by rmux,
+open that session in the browser, and also attach natively with
+`rmux attach -t <session>`. Browser and API operations mutate the same backend
+session through termstage, while termstage's own terminal remains supervisor-only
+logs/status/URL output.
 
-Specs touched: 11, 23, 50, 70, 72, 80.
+Specs touched: 20, 23, 50, 70, 72, 80.
 
 Exit criteria:
 
-- `--local-command-terminal` is accepted only in shell mode.
-- Without the flag, the invoking terminal shows supervisor output only and does
-  not render command PTY bytes.
-- With the flag, local terminal renders a log/status pane and a command terminal
-  pane without interleaving logs into command output.
-- Command pane size drives the command PTY size while local terminal owns the
-  input lease.
-- Browser input and local command pane input transfer lease ownership correctly.
-- E2E smoke covers a continuous-output command and a TUI command fixture.
+- The old local terminal attach/split-TUI path is removed.
+- Termstage session ids map to backend session references.
+- rmux is the default backend for shared sessions.
+- Browser input is translated into backend semantic operations and reflected in
+  browser screen updates.
+- API `PressKey`, `SendText`, `ReadScreen`, `WaitForText`, and `ExecCommand`
+  are available.
+- Level 1 lease rejects browser/API write operations from non-owners.
+- Native `rmux attach -t <session>` observes the same backend session.
 
-Estimate: 1-2 focused weeks after the runtime tunnel and shell lease foundations
-are stable.
+Estimate: 2-4 focused weeks after the runtime tunnel foundation is stable.
 
 ## 3. Deferred Milestones
 
