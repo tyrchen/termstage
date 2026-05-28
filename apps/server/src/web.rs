@@ -36,29 +36,38 @@ use termstage_core::{
         ViewportOrigin,
     },
     rmux_backend::RmuxBackend,
-    runtime::{ClientId, RuntimeCommand, RuntimeConfig},
+    runtime::ClientId,
     security::{
         AllowedHost, AllowedOrigin, BasePath, ExposurePolicy, PublicBaseUrl, SecurityError,
         validate_access_token, validate_peer_for_policy,
     },
     session_gateway::{SessionGateway, SessionGatewayError},
     tmux_backend::TmuxBackend,
+    tunnel::TunnelTerminalPayload,
+};
+#[cfg(test)]
+use termstage_core::{
+    runtime::{RuntimeCommand, RuntimeConfig},
     tunnel::{
         RuntimeTunnelBridge, RuntimeTunnelBridgeOutcome, TunnelCloseReason, TunnelError,
-        TunnelFrame, TunnelRuntimeControl, TunnelTerminalPayload, TunnelTransport,
+        TunnelFrame, TunnelRuntimeControl, TunnelTransport,
     },
 };
+#[cfg(test)]
+use tokio::sync::mpsc;
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, oneshot},
     task::JoinHandle,
     time,
 };
 use tracing::debug;
 
+#[cfg(test)]
+use crate::settings::runtime_tunnel;
 use crate::{
     assets::{asset_response, index_response},
-    settings::{backend_gateway, browser_socket, http_server, runtime_tunnel, semantic_api},
+    settings::{backend_gateway, browser_socket, http_server, semantic_api},
 };
 
 type BrowserSocketSender = futures_util::stream::SplitSink<WebSocket, Message>;
@@ -348,6 +357,7 @@ pub struct WebConfig {
 
 impl WebConfig {
     /// Creates a config that binds to `127.0.0.1:0`.
+    #[cfg(test)]
     #[must_use]
     pub fn local(
         token: AccessToken,
@@ -399,6 +409,7 @@ impl WebConfig {
 #[derive(Debug, Clone)]
 pub enum WebSession {
     /// Existing PTY runtime actor path used by shell mode.
+    #[cfg(test)]
     Runtime {
         /// Runtime command sender.
         commands: mpsc::Sender<RuntimeCommand>,
@@ -1007,6 +1018,7 @@ async fn bridge_socket(
     browser_viewport: Option<GatewayViewport>,
 ) {
     match state.inner.session.clone() {
+        #[cfg(test)]
         WebSession::Runtime { commands } => bridge_runtime_socket(state, socket, commands).await,
         WebSession::BackendGateway { gateway, session } => {
             bridge_gateway_socket(state, socket, gateway, session, browser_viewport).await;
@@ -1014,6 +1026,7 @@ async fn bridge_socket(
     }
 }
 
+#[cfg(test)]
 async fn bridge_runtime_socket(
     state: AppState,
     socket: WebSocket,
@@ -1238,6 +1251,7 @@ impl BrowserSocketAction {
     }
 }
 
+#[cfg(test)]
 async fn handle_bridge_completion(
     result: Result<Result<RuntimeTunnelBridgeOutcome, TunnelError>, tokio::task::JoinError>,
     tunnel: &mut BrowserTunnelPeer,
@@ -1274,6 +1288,7 @@ async fn handle_bridge_completion(
     }
 }
 
+#[cfg(test)]
 async fn handle_browser_message(
     message: Result<Message, axum::Error>,
     client_id: ClientId,
@@ -1679,6 +1694,7 @@ async fn send_gateway_screen_if_changed(
     }
 }
 
+#[cfg(test)]
 async fn handle_browser_binary(
     bytes: Bytes,
     client_id: ClientId,
@@ -1708,6 +1724,7 @@ async fn handle_browser_binary(
     }
 }
 
+#[cfg(test)]
 async fn handle_browser_text(
     text: &str,
     client_id: ClientId,
@@ -1741,6 +1758,7 @@ async fn handle_browser_text(
     }
 }
 
+#[cfg(test)]
 async fn handle_tunnel_frame(
     frame: Result<Option<TunnelFrame>, TunnelError>,
     sender: &mut BrowserSocketSender,
@@ -1771,11 +1789,13 @@ async fn handle_tunnel_frame(
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 struct BrowserTunnelPeer {
     inbound: mpsc::Receiver<TunnelFrame>,
     outbound: mpsc::Sender<TunnelFrame>,
 }
 
+#[cfg(test)]
 impl BrowserTunnelPeer {
     async fn send_frame(&self, frame: TunnelFrame) -> Result<(), TunnelError> {
         self.outbound
@@ -1794,11 +1814,13 @@ impl BrowserTunnelPeer {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 struct InProcessTunnelTransport {
     inbound: mpsc::Receiver<TunnelFrame>,
     outbound: mpsc::Sender<TunnelFrame>,
 }
 
+#[cfg(test)]
 impl TunnelTransport for InProcessTunnelTransport {
     async fn send_frame(&mut self, frame: TunnelFrame) -> Result<(), TunnelError> {
         self.outbound
@@ -1812,6 +1834,7 @@ impl TunnelTransport for InProcessTunnelTransport {
     }
 }
 
+#[cfg(test)]
 fn in_process_tunnel_pair() -> (BrowserTunnelPeer, InProcessTunnelTransport) {
     let (browser_to_runtime_tx, browser_to_runtime_rx) =
         mpsc::channel(runtime_tunnel::CHANNEL_CAPACITY);
@@ -1830,11 +1853,13 @@ fn in_process_tunnel_pair() -> (BrowserTunnelPeer, InProcessTunnelTransport) {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 enum SendBrowserFrameResult {
     Continue(Result<(), axum::Error>),
     Closed(Result<(), axum::Error>),
 }
 
+#[cfg(test)]
 impl SendBrowserFrameResult {
     fn is_err(&self) -> bool {
         match self {
@@ -1847,6 +1872,7 @@ impl SendBrowserFrameResult {
     }
 }
 
+#[cfg(test)]
 async fn send_tunnel_frame_to_browser(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     frame: TunnelFrame,
@@ -1905,6 +1931,7 @@ async fn send_tunnel_frame_to_browser(
     }
 }
 
+#[cfg(test)]
 async fn send_process_exited(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
 ) -> Result<(), axum::Error> {
@@ -2262,6 +2289,7 @@ fn client_timeout_close() -> CloseFrame {
     }
 }
 
+#[cfg(test)]
 fn close_frame_for_tunnel_reason(reason: TunnelCloseReason) -> CloseFrame {
     let reason = match reason {
         TunnelCloseReason::Supervisor => browser_socket::CLOSE_REASON_SERVER_SHUTDOWN,
@@ -2289,8 +2317,10 @@ fn gateway_for_session(
     state: &AppState,
     requested: &SessionName,
 ) -> Result<BackendGateway, ApiError> {
-    let WebSession::BackendGateway { gateway, session } = &state.inner.session else {
-        return Err(ApiError::Unsupported);
+    let (gateway, session) = match &state.inner.session {
+        WebSession::BackendGateway { gateway, session } => (gateway, session),
+        #[cfg(test)]
+        WebSession::Runtime { .. } => return Err(ApiError::Unsupported),
     };
     if session != requested {
         return Err(ApiError::NotFound);
@@ -2528,6 +2558,7 @@ enum ApiError {
     NotFound,
     Runtime,
     Security(WebError),
+    #[cfg(test)]
     Unsupported,
 }
 
@@ -2575,6 +2606,7 @@ impl IntoResponse for ApiError {
                         ErrorCode::Runtime,
                         SafeMessage::from_static("backend operation failed"),
                     ),
+                    #[cfg(test)]
                     Self::Unsupported => (
                         StatusCode::CONFLICT,
                         ErrorCode::Runtime,

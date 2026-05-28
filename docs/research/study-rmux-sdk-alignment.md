@@ -81,7 +81,7 @@ browser or Agent API JSON.
 
 | Termstage semantic operation | rmux SDK primitive | Adapter decision |
 | --- | --- | --- |
-| `session create` / `browser attach` resolution | `Rmux::connect_or_start`, `EnsureSession`, `Rmux::session` | Direct SDK usage. Use create/reuse for termstage-created sessions and reuse-only for attaching an existing rmux session. |
+| `session create` / `session attach --browser` resolution | `Rmux::connect_or_start`, `EnsureSession`, `Rmux::session` | Direct SDK usage. Use create/reuse for termstage-created sessions and reuse-only for attaching an existing rmux session. |
 | Stable pane binding | `Session::pane(0, 0)`, `Pane::id`, `Session::pane_by_id` | Resolve the initial slot, then store stable `PaneId` when available. |
 | `writeText` | `Pane::send_text` | Direct SDK usage after termstage lock validation. No implicit newline. |
 | `pressKey` | `Pane::send_key` or `Pane::keyboard().press` | Direct SDK usage. Prefer termstage's own allowed key-token grammar at the API boundary; use rmux normalization only inside adapter tests or higher-level helper paths. |
@@ -296,7 +296,7 @@ For rmux:
 
 - browser xterm.js should consume `Output { bytes }`;
 - lag should trigger a status/resync path, not unbounded replay;
-- late browser attach should prefer initial structured/text snapshot plus
+- late browser-mode attach should prefer initial structured/text snapshot plus
   stream-from-`Now`, rather than replaying all retained output by default;
 - `render_stream` can feed future screen-diff or Agent observation features.
 
@@ -378,7 +378,7 @@ read-only attach mode that termstage can control.
 - Do not use `line_stream` for xterm.js output; it is lossy and line-oriented.
 - Do not implement rmux `scroll` by sending arbitrary mouse-wheel bytes without
   a defined copy-mode or viewport semantic.
-- Do not replay all retained rmux output on late browser attach by default.
+- Do not replay all retained rmux output on late browser-mode attach by default.
 
 ## Recommended PR #6 Amendments
 

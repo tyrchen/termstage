@@ -4,7 +4,7 @@ use std::{
     env,
     ffi::OsString,
     io::{self, Write},
-    net::{IpAddr, Ipv4Addr},
+    net::IpAddr,
     path::PathBuf,
     str::FromStr,
     sync::Arc,
@@ -16,10 +16,6 @@ use serde_json::{Value, json};
 use termstage_core::{
     protocol::{AccessToken, SessionName, TerminalSize},
     rmux_backend::{RmuxBackend, RmuxSessionCommand},
-    runtime::{
-        ExitPolicy, ReconnectPolicy, RuntimeConfig, RuntimeSession, SessionMode, ShellCommand,
-        ShutdownReason,
-    },
     security::{BasePath, PublicBaseUrl},
     session_gateway::SessionGateway,
     tmux_backend::{TmuxBackend, TmuxSessionCommand},
@@ -27,25 +23,23 @@ use termstage_core::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    process::Command,
     sync::Mutex,
 };
 use tracing::{debug, info};
 use url::{Host, Url};
 
 use crate::{
-    settings::{
-        api_client, backend_gateway, browser_presentation, cli_defaults, runtime_supervisor,
-        session_names,
-    },
+    settings::{api_client, backend_gateway, browser_presentation, cli_defaults, session_names},
     web::{BackendGateway, PresentationSettings, PresentationTheme, WebConfig, WebExposure, serve},
 };
 
 /// Browser terminal command-line arguments.
 #[derive(Debug, Parser)]
 #[command(name = "termstage")]
-#[command(about = "Manage termstage backend sessions, browser helpers, and semantic APIs")]
+#[command(about = "Manage termstage backend sessions, browser gateway, and semantic APIs")]
 #[command(
-    long_about = "Manage termstage backend sessions, browser helpers, and semantic APIs. The CLI \
+    long_about = "Manage termstage backend sessions, browser gateway, and semantic APIs. The CLI \
                   requires an explicit command group."
 )]
 pub struct CliArgs {
@@ -58,72 +52,10 @@ pub struct CliArgs {
 enum CliCommand {
     /// Manage backend sessions.
     Session(SessionArgs),
-    /// Attach browser gateway surfaces to backend sessions.
-    Browser(BrowserArgs),
     /// Call semantic API operations on a running gateway.
     Api(ApiArgs),
-    /// Manage browser web server helpers.
-    Web(WebArgs),
     /// Inspect local auth state.
     Auth(AuthArgs),
-}
-
-#[derive(Debug, Clone, Args)]
-struct ServeArgs {
-    /// Attach to or create this backend session.
-    #[arg(long, default_value = cli_defaults::DEFAULT_SESSION_NAME)]
-    session: String,
-    /// Backend for shared session mode.
-    #[arg(long, value_enum)]
-    backend: Option<CliBackend>,
-    /// Terminal backend mode.
-    #[arg(long, value_enum)]
-    mode: Option<CliMode>,
-    /// Command executable for shell mode.
-    #[arg(long)]
-    command: Option<PathBuf>,
-    /// Argument passed to the shell-mode command. Repeat for multiple arguments.
-    #[arg(
-        short = 'g',
-        long = "command-arg",
-        value_name = "ARG",
-        allow_hyphen_values = true
-    )]
-    command_args: Vec<OsString>,
-    /// Bind address. Non-loopback addresses require --expose-public.
-    #[arg(long, default_value = "127.0.0.1")]
-    host: IpAddr,
-    /// TCP port. Use 0 for an OS-selected random port.
-    #[arg(long, default_value_t = 0)]
-    port: u16,
-    /// Open the tokenized URL in the default browser.
-    #[arg(long, default_value_t = false)]
-    open: bool,
-    /// Browser terminal font size in CSS pixels.
-    #[arg(long, default_value_t = browser_presentation::DEFAULT_FONT_SIZE)]
-    font_size: u16,
-    /// Browser terminal theme.
-    #[arg(long, value_enum, default_value_t = CliTheme::HighContrast)]
-    theme: CliTheme,
-    /// Session keepalive policy for browser refresh and shutdown.
-    #[arg(long, value_enum, default_value_t = CliKeepalive::Session)]
-    keepalive: CliKeepalive,
-    /// Child process exit handling policy.
-    #[arg(long, value_enum)]
-    exit_policy: Option<CliExitPolicy>,
-    /// Enable internet-facing pod mode behind an HTTPS ingress.
-    #[arg(long, default_value_t = false)]
-    expose_public: bool,
-    /// Browser-visible HTTPS base URL for public mode.
-    #[arg(long)]
-    public_url: Option<String>,
-    /// Environment variable containing the 64-hex-character access token.
-    #[arg(long)]
-    token_env: Option<String>,
-    /// Reverse-proxy base path under which to mount all routes
-    /// (e.g. `/p/<sessionId>/`). Must start and end with `/`.
-    #[arg(long)]
-    base_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -156,6 +88,8 @@ enum SessionCommand {
         )]
         command_args: Vec<OsString>,
     },
+    /// Attach to one session. Native attach is default; use --browser for browser-mode attach.
+    Attach(SessionAttachArgs),
     /// List sessions visible to termstage.
     List {
         /// Optional backend filter.
@@ -172,6 +106,55 @@ enum SessionCommand {
         /// Termstage session id or backend session name.
         session_id: String,
     },
+}
+
+#[derive(Debug, Clone, Args)]
+struct SessionAttachArgs {
+    /// Termstage session id or backend session name.
+    session_id: String,
+    /// Optional backend filter when the session id is ambiguous.
+    #[arg(long, value_enum)]
+    backend: Option<CliBackend>,
+    /// Start a browser/API gateway instead of native backend attach.
+    #[arg(long, visible_alias = "broswer", default_value_t = false)]
+    browser: bool,
+    /// Bind address used with --browser. Non-loopback addresses require --expose-public.
+    #[arg(long, default_value = "127.0.0.1", requires = "browser")]
+    host: IpAddr,
+    /// TCP port used with --browser. Use 0 for an OS-selected random port.
+    #[arg(long, default_value_t = 0, requires = "browser")]
+    port: u16,
+    /// Open the tokenized URL in the default browser when used with --browser.
+    #[arg(long, default_value_t = false, requires = "browser")]
+    open: bool,
+    /// Browser terminal font size in CSS pixels.
+    #[arg(
+        long,
+        default_value_t = browser_presentation::DEFAULT_FONT_SIZE,
+        requires = "browser"
+    )]
+    font_size: u16,
+    /// Browser terminal theme.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = CliTheme::HighContrast,
+        requires = "browser"
+    )]
+    theme: CliTheme,
+    /// Enable internet-facing pod mode behind an HTTPS ingress.
+    #[arg(long, default_value_t = false, requires = "browser")]
+    expose_public: bool,
+    /// Browser-visible HTTPS base URL for public mode.
+    #[arg(long, requires = "browser")]
+    public_url: Option<String>,
+    /// Environment variable containing the 64-hex-character access token.
+    #[arg(long, requires = "browser")]
+    token_env: Option<String>,
+    /// Reverse-proxy base path under which to mount all routes
+    /// (e.g. `/p/<sessionId>/`). Must start and end with `/`.
+    #[arg(long, requires = "browser")]
+    base_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -250,90 +233,6 @@ enum ApiCommand {
 }
 
 #[derive(Debug, Clone, Args)]
-struct BrowserArgs {
-    /// Browser command.
-    #[command(subcommand)]
-    command: BrowserCommand,
-}
-
-#[derive(Debug, Clone, Subcommand)]
-enum BrowserCommand {
-    /// Attach the browser/API gateway to an existing session.
-    Attach(BrowserAttachArgs),
-}
-
-#[derive(Debug, Clone, Args)]
-struct WebArgs {
-    /// Browser web server helper command.
-    #[command(subcommand)]
-    command: WebCommand,
-}
-
-#[derive(Debug, Clone, Subcommand)]
-enum WebCommand {
-    /// Start the browser/API gateway.
-    Start(ServeArgs),
-    /// Build a tokenized browser URL from a base URL and token.
-    Url {
-        /// Base URL printed by `termstage web start`.
-        #[arg(long)]
-        base_url: String,
-        /// Gateway access token.
-        #[arg(long)]
-        token: String,
-    },
-    /// Token helper commands.
-    Token {
-        /// Token command.
-        #[command(subcommand)]
-        command: WebTokenCommand,
-    },
-}
-
-#[derive(Debug, Clone, Args)]
-struct BrowserAttachArgs {
-    /// Termstage session id or backend session name.
-    session_id: String,
-    /// Optional backend filter when the session id is ambiguous.
-    #[arg(long, value_enum)]
-    backend: Option<CliBackend>,
-    /// Bind address. Non-loopback addresses require --expose-public.
-    #[arg(long, default_value = "127.0.0.1")]
-    host: IpAddr,
-    /// TCP port. Use 0 for an OS-selected random port.
-    #[arg(long, default_value_t = 0)]
-    port: u16,
-    /// Open the tokenized URL in the default browser.
-    #[arg(long, default_value_t = false)]
-    open: bool,
-    /// Browser terminal font size in CSS pixels.
-    #[arg(long, default_value_t = browser_presentation::DEFAULT_FONT_SIZE)]
-    font_size: u16,
-    /// Browser terminal theme.
-    #[arg(long, value_enum, default_value_t = CliTheme::HighContrast)]
-    theme: CliTheme,
-    /// Enable internet-facing pod mode behind an HTTPS ingress.
-    #[arg(long, default_value_t = false)]
-    expose_public: bool,
-    /// Browser-visible HTTPS base URL for public mode.
-    #[arg(long)]
-    public_url: Option<String>,
-    /// Environment variable containing the 64-hex-character access token.
-    #[arg(long)]
-    token_env: Option<String>,
-    /// Reverse-proxy base path under which to mount all routes
-    /// (e.g. `/p/<sessionId>/`). Must start and end with `/`.
-    #[arg(long)]
-    base_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Subcommand)]
-enum WebTokenCommand {
-    /// Generate a 64-hex-character access token.
-    Generate,
-}
-
-#[derive(Debug, Clone, Args)]
 struct AuthArgs {
     /// Auth helper command.
     #[command(subcommand)]
@@ -346,30 +245,8 @@ enum AuthCommand {
     Status,
 }
 
-/// Validated CLI configuration.
 #[derive(Debug, Clone)]
-pub struct ValidatedCliConfig {
-    /// Runtime configuration.
-    pub runtime: RuntimeConfig,
-    /// Bind host.
-    pub host: IpAddr,
-    /// TCP bind port.
-    pub port: u16,
-    /// Whether to open the browser.
-    pub open: bool,
-    /// Browser presentation settings.
-    pub presentation: PresentationSettings,
-    /// Browser terminal exposure mode.
-    pub exposure: WebExposure,
-    /// Access token for this server run.
-    pub token: AccessToken,
-    /// Optional reverse-proxy base path.
-    pub base_path: Option<BasePath>,
-    gateway_backend: Option<CliBackend>,
-}
-
-#[derive(Debug, Clone)]
-struct ValidatedBrowserAttachConfig {
+struct ValidatedSessionAttachConfig {
     session_id: SessionName,
     backend: Option<CliBackend>,
     host: IpAddr,
@@ -383,11 +260,8 @@ struct ValidatedBrowserAttachConfig {
 
 #[derive(Debug, Clone)]
 enum ValidatedCliCommand {
-    WebStart(ValidatedCliConfig),
-    BrowserAttach(ValidatedBrowserAttachConfig),
     Session(SessionArgs),
     Api(ApiArgs),
-    Web(WebArgs),
     Auth(AuthArgs),
 }
 
@@ -431,27 +305,16 @@ impl TryFrom<CliArgs> for ValidatedCliCommand {
     fn try_from(args: CliArgs) -> Result<Self, Self::Error> {
         match args.command {
             CliCommand::Session(command) => Ok(Self::Session(validate_session_args(command)?)),
-            CliCommand::Browser(command) => match command.command {
-                BrowserCommand::Attach(attach) => Ok(Self::BrowserAttach(
-                    ValidatedBrowserAttachConfig::try_from(attach)?,
-                )),
-            },
             CliCommand::Api(command) => Ok(Self::Api(command)),
-            CliCommand::Web(command) => match command.command {
-                WebCommand::Start(serve) => {
-                    Ok(Self::WebStart(ValidatedCliConfig::try_from(serve)?))
-                }
-                command => Ok(Self::Web(WebArgs { command })),
-            },
             CliCommand::Auth(command) => Ok(Self::Auth(command)),
         }
     }
 }
 
-impl TryFrom<BrowserAttachArgs> for ValidatedBrowserAttachConfig {
+impl TryFrom<SessionAttachArgs> for ValidatedSessionAttachConfig {
     type Error = anyhow::Error;
 
-    fn try_from(args: BrowserAttachArgs) -> Result<Self, Self::Error> {
+    fn try_from(args: SessionAttachArgs) -> Result<Self, Self::Error> {
         if !(browser_presentation::FONT_SIZE_MIN..=browser_presentation::FONT_SIZE_MAX)
             .contains(&args.font_size)
         {
@@ -489,87 +352,6 @@ impl TryFrom<BrowserAttachArgs> for ValidatedBrowserAttachConfig {
     }
 }
 
-impl TryFrom<ServeArgs> for ValidatedCliConfig {
-    type Error = anyhow::Error;
-
-    fn try_from(args: ServeArgs) -> Result<Self, Self::Error> {
-        if !(browser_presentation::FONT_SIZE_MIN..=browser_presentation::FONT_SIZE_MAX)
-            .contains(&args.font_size)
-        {
-            bail!(
-                "font size must be in {}..={}",
-                browser_presentation::FONT_SIZE_MIN,
-                browser_presentation::FONT_SIZE_MAX
-            );
-        }
-        if args.backend.is_some() && args.mode.is_some() {
-            bail!("--backend cannot be combined with legacy --mode");
-        }
-        let base_path = match args.base_path.as_deref() {
-            Some(value) => Some(BasePath::from_str(value).context("invalid --base-path")?),
-            None => None,
-        };
-        let (exposure, token) = exposure_and_token(&args)?;
-        let initial_size = initial_terminal_size()?;
-        let effective_mode = effective_session_mode(args.backend, args.mode)?;
-        if args.command.is_some() && !matches!(effective_mode, EffectiveSessionMode::LegacyShell) {
-            bail!("--command requires --mode shell");
-        }
-        if !args.command_args.is_empty()
-            && !matches!(effective_mode, EffectiveSessionMode::LegacyShell)
-        {
-            bail!("--command-arg requires --mode shell");
-        }
-        let explicit_shell_command = args.command.is_some();
-        let (mode, gateway_backend) = match effective_mode {
-            EffectiveSessionMode::TmuxBackend => (
-                SessionMode::Tmux {
-                    session: termstage_session_name(&args.session)
-                        .context("invalid tmux session name")?,
-                },
-                Some(CliBackend::Tmux),
-            ),
-            EffectiveSessionMode::LegacyShell => (
-                SessionMode::NewShell {
-                    shell: shell_mode_command(args.command, args.command_args)?,
-                },
-                None,
-            ),
-            EffectiveSessionMode::RmuxBackend => (
-                SessionMode::Tmux {
-                    session: termstage_session_name(&args.session)
-                        .context("invalid rmux session name")?,
-                },
-                Some(CliBackend::Rmux),
-            ),
-        };
-        let exit_policy = match args.exit_policy {
-            Some(policy) => policy.into(),
-            None if explicit_shell_command => ExitPolicy::End,
-            None => ExitPolicy::Hold,
-        };
-        Ok(Self {
-            runtime: RuntimeConfig {
-                mode,
-                initial_size,
-                reconnect_policy: args.keepalive.into(),
-                exit_policy,
-            },
-            host: args.host,
-            port: args.port,
-            open: args.open,
-            presentation: PresentationSettings {
-                font_size: args.font_size,
-                theme: args.theme.into(),
-            },
-            exposure,
-            token,
-            base_path,
-            gateway_backend,
-        })
-    }
-}
-
 /// Runs the CLI application.
 ///
 /// # Errors
@@ -585,176 +367,26 @@ pub async fn run() -> anyhow::Result<()> {
 
 async fn run_validated_command(command: ValidatedCliCommand) -> anyhow::Result<()> {
     match command {
-        ValidatedCliCommand::WebStart(config) => run_with_config(config).await,
-        ValidatedCliCommand::BrowserAttach(config) => run_browser_attach(config).await,
         ValidatedCliCommand::Session(args) => run_session_command(args).await,
         ValidatedCliCommand::Api(args) => run_api_command(args).await,
-        ValidatedCliCommand::Web(args) => run_web_command(args),
         ValidatedCliCommand::Auth(args) => run_auth_command(args),
     }
 }
 
-/// Runs the browser terminal from a validated configuration.
-///
-/// # Errors
-///
-/// Returns an error when runtime or server startup fails.
-pub async fn run_with_config(config: ValidatedCliConfig) -> anyhow::Result<()> {
-    reject_root_user()?;
-    match (config.gateway_backend, config.runtime.mode.clone()) {
-        (Some(CliBackend::Tmux), SessionMode::Tmux { session }) => {
-            run_gateway_tmux(config, session).await
-        }
-        (Some(CliBackend::Rmux), SessionMode::Tmux { session }) => {
-            run_gateway_rmux(config, session).await
-        }
-        (None, SessionMode::NewShell { .. }) => run_legacy_runtime(config).await,
-        (Some(_), SessionMode::NewShell { .. }) | (None, SessionMode::Tmux { .. }) => {
-            bail!("validated CLI configuration has inconsistent backend mode")
-        }
-    }
-}
-
-async fn run_legacy_runtime(config: ValidatedCliConfig) -> anyhow::Result<()> {
-    let session = RuntimeSession::start(config.runtime.clone())
-        .context("failed to start browser terminal runtime")?;
-    let mut web_config = WebConfig::local(config.token, session.command_sender(), config.runtime);
-    web_config.host = config.host;
-    web_config.port = config.port;
-    web_config.presentation = config.presentation;
-    web_config.exposure = config.exposure;
-    web_config.base_path = config.base_path;
-
-    let server = serve(web_config)
-        .await
-        .context("failed to start browser terminal server")?;
-    let launch_url = server.launch_url();
-    if config.open {
-        if let Err(error) = open::that_detached(&launch_url) {
-            eprintln!("{launch_url}");
-            info!(%error, "failed to open browser; printed launch URL");
-        }
-    } else {
-        eprintln!("{launch_url}");
-    }
-    info!(address = %server.address(), "browser terminal server started");
-    let shutdown_reason = wait_for_shutdown_or_runtime_exit(&session).await;
-    server
-        .shutdown()
-        .await
-        .context("failed to shutdown browser terminal server")?;
-    session
-        .shutdown(shutdown_reason)
-        .await
-        .context("failed to shutdown browser terminal runtime")
-}
-
-async fn run_gateway_tmux(config: ValidatedCliConfig, session: SessionName) -> anyhow::Result<()> {
-    let backend = TmuxBackend::from_path().context("failed to resolve tmux backend")?;
-    let mut gateway = SessionGateway::new(backend, backend_gateway::OPERATION_LOCK_LEASE_TTL);
-    let registration = gateway
-        .create_or_find_session(
-            session.clone(),
-            session.clone(),
-            config.runtime.initial_size,
-        )
-        .await
-        .context("failed to create or find tmux backend session")?;
-    eprintln!(
-        "{}",
-        tmux_gateway_session_status(&session, registration.backend_created())
-    );
-    let gateway = Arc::new(Mutex::new(gateway));
-    let backend_gateway = BackendGateway::Tmux(Arc::clone(&gateway));
-    let mut web_config =
-        WebConfig::local_backend_gateway(config.token, backend_gateway.clone(), session.clone());
-    web_config.host = config.host;
-    web_config.port = config.port;
-    web_config.presentation = config.presentation;
-    web_config.exposure = config.exposure;
-    web_config.base_path = config.base_path;
-
-    let server = serve(web_config)
-        .await
-        .context("failed to start browser terminal server")?;
-    let launch_url = server.launch_url();
-    if config.open {
-        if let Err(error) = open::that_detached(&launch_url) {
-            eprintln!("{launch_url}");
-            info!(%error, "failed to open browser; printed launch URL");
-        }
-    } else {
-        eprintln!("{launch_url}");
-    }
-    info!(address = %server.address(), "browser terminal server started");
-    wait_for_gateway_shutdown_or_session_end(backend_gateway, session).await;
-    server
-        .shutdown()
-        .await
-        .context("failed to shutdown browser terminal server")
-}
-
-async fn run_gateway_rmux(config: ValidatedCliConfig, session: SessionName) -> anyhow::Result<()> {
-    let backend = RmuxBackend::connect_or_start()
-        .await
-        .context("failed to connect or start rmux backend")?;
-    let mut gateway = SessionGateway::new(backend, backend_gateway::OPERATION_LOCK_LEASE_TTL);
-    let registration = gateway
-        .create_or_find_session(
-            session.clone(),
-            session.clone(),
-            config.runtime.initial_size,
-        )
-        .await
-        .context("failed to create or find rmux backend session")?;
-    eprintln!(
-        "{}",
-        rmux_gateway_session_status(&session, registration.backend_created())
-    );
-    let gateway = Arc::new(Mutex::new(gateway));
-    let backend_gateway = BackendGateway::Rmux(Arc::clone(&gateway));
-    let mut web_config =
-        WebConfig::local_backend_gateway(config.token, backend_gateway.clone(), session.clone());
-    web_config.host = config.host;
-    web_config.port = config.port;
-    web_config.presentation = config.presentation;
-    web_config.exposure = config.exposure;
-    web_config.base_path = config.base_path;
-
-    let server = serve(web_config)
-        .await
-        .context("failed to start browser terminal server")?;
-    let launch_url = server.launch_url();
-    if config.open {
-        if let Err(error) = open::that_detached(&launch_url) {
-            eprintln!("{launch_url}");
-            info!(%error, "failed to open browser; printed launch URL");
-        }
-    } else {
-        eprintln!("{launch_url}");
-    }
-    info!(address = %server.address(), "browser terminal server started");
-    wait_for_gateway_shutdown_or_session_end(backend_gateway, session).await;
-    server
-        .shutdown()
-        .await
-        .context("failed to shutdown browser terminal server")
-}
-
-async fn run_browser_attach(config: ValidatedBrowserAttachConfig) -> anyhow::Result<()> {
+async fn run_session_browser_attach(config: ValidatedSessionAttachConfig) -> anyhow::Result<()> {
     reject_root_user()?;
     match resolve_cli_session(config.backend, &config.session_id).await? {
         ResolvedCliSession::Tmux {
             backend_session, ..
-        } => run_browser_attach_tmux(config, backend_session).await,
+        } => run_session_browser_attach_tmux(config, backend_session).await,
         ResolvedCliSession::Rmux {
             backend_session, ..
-        } => run_browser_attach_rmux(config, backend_session).await,
+        } => run_session_browser_attach_rmux(config, backend_session).await,
     }
 }
 
-async fn run_browser_attach_tmux(
-    config: ValidatedBrowserAttachConfig,
+async fn run_session_browser_attach_tmux(
+    config: ValidatedSessionAttachConfig,
     backend_session: SessionName,
 ) -> anyhow::Result<()> {
     let backend = TmuxBackend::from_path().context("failed to resolve tmux backend")?;
@@ -799,8 +431,8 @@ async fn run_browser_attach_tmux(
         .context("failed to shutdown browser terminal server")
 }
 
-async fn run_browser_attach_rmux(
-    config: ValidatedBrowserAttachConfig,
+async fn run_session_browser_attach_rmux(
+    config: ValidatedSessionAttachConfig,
     backend_session: SessionName,
 ) -> anyhow::Result<()> {
     let backend = RmuxBackend::connect()
@@ -847,20 +479,6 @@ async fn run_browser_attach_rmux(
         .context("failed to shutdown browser terminal server")
 }
 
-fn shell_mode_command(path: Option<PathBuf>, args: Vec<OsString>) -> anyhow::Result<ShellCommand> {
-    match path {
-        Some(path) => ShellCommand::new(path, args).map_err(Into::into),
-        None if args.is_empty() => ShellCommand::default_unix().map_err(Into::into),
-        None => {
-            let command = ShellCommand::default_unix()?;
-            let executable = command.executable().to_path_buf();
-            let mut command_args = command.args().to_vec();
-            command_args.extend(args);
-            ShellCommand::new(executable, command_args).map_err(Into::into)
-        }
-    }
-}
-
 fn validate_session_args(args: SessionArgs) -> anyhow::Result<SessionArgs> {
     match &args.command {
         SessionCommand::Create {
@@ -872,29 +490,12 @@ fn validate_session_args(args: SessionArgs) -> anyhow::Result<SessionArgs> {
                 bail!("--command-arg requires --command");
             }
         }
+        SessionCommand::Attach(_attach) => {}
         SessionCommand::List { .. }
         | SessionCommand::Inspect { .. }
         | SessionCommand::Stop { .. } => {}
     }
     Ok(args)
-}
-
-fn tmux_gateway_session_status(session: &SessionName, created: bool) -> String {
-    let action = if created { "created" } else { "reused" };
-    format!(
-        "tmux session {} {action}; attach with: tmux attach -t {}",
-        session.as_str(),
-        session.as_str()
-    )
-}
-
-fn rmux_gateway_session_status(session: &SessionName, created: bool) -> String {
-    let action = if created { "created" } else { "reused" };
-    format!(
-        "rmux session {} {action}; attach with: rmux attach -t {}",
-        session.as_str(),
-        session.as_str()
-    )
 }
 
 fn tmux_session_command(
@@ -1164,23 +765,6 @@ fn terminal_size_from_values(cols: &str, rows: &str) -> anyhow::Result<TerminalS
     TerminalSize::new(cols, rows).context("terminal size is invalid")
 }
 
-fn exposure_and_token(args: &ServeArgs) -> anyhow::Result<(WebExposure, AccessToken)> {
-    exposure_and_token_with_env(args, |name| env::var(name))
-}
-
-fn exposure_and_token_with_env(
-    args: &ServeArgs,
-    get_env: impl Fn(&str) -> Result<String, env::VarError>,
-) -> anyhow::Result<(WebExposure, AccessToken)> {
-    exposure_and_token_from_parts(
-        args.expose_public,
-        args.host,
-        args.public_url.as_deref(),
-        args.token_env.as_deref(),
-        get_env,
-    )
-}
-
 fn exposure_and_token_from_parts(
     expose_public: bool,
     host: IpAddr,
@@ -1241,25 +825,6 @@ fn validate_token_env_name(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn wait_for_shutdown_or_runtime_exit(session: &RuntimeSession) -> ShutdownReason {
-    let mut interval = tokio::time::interval(runtime_supervisor::ACTOR_EXIT_POLL_INTERVAL);
-    loop {
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                match result {
-                    Ok(()) | Err(_) => {}
-                }
-                return ShutdownReason::Supervisor;
-            }
-            _ = interval.tick() => {
-                if session.is_finished() {
-                    return ShutdownReason::ChildExit;
-                }
-            }
-        }
-    }
-}
-
 async fn wait_for_gateway_shutdown_or_session_end(gateway: BackendGateway, session: SessionName) {
     let mut interval = tokio::time::interval(backend_gateway::SESSION_EXIT_POLL_INTERVAL);
     loop {
@@ -1290,6 +855,7 @@ async fn run_session_command(args: SessionArgs) -> anyhow::Result<()> {
             command,
             command_args,
         } => run_session_create(backend, name, command, command_args).await,
+        SessionCommand::Attach(args) => run_session_attach(args).await,
         SessionCommand::List { backend } => {
             let mut stdout = io::stdout().lock();
             let records = list_cli_sessions(backend).await?;
@@ -1413,11 +979,44 @@ async fn run_session_create(
         .context("failed to write session create")?;
     writeln!(
         stdout,
-        "browser: termstage browser attach {} --backend {}",
+        "browser: termstage session attach {} --backend {} --browser",
         backend_session.as_str(),
         backend.as_str()
     )
     .context("failed to write session create")?;
+    Ok(())
+}
+
+async fn run_session_attach(args: SessionAttachArgs) -> anyhow::Result<()> {
+    if args.browser {
+        let config = ValidatedSessionAttachConfig::try_from(args)?;
+        run_session_browser_attach(config).await
+    } else {
+        let session_id = SessionName::from_str(&args.session_id).context("invalid session id")?;
+        run_native_session_attach(args.backend, &session_id).await
+    }
+}
+
+async fn run_native_session_attach(
+    backend: Option<CliBackend>,
+    session_id: &SessionName,
+) -> anyhow::Result<()> {
+    reject_root_user()?;
+    let resolved = resolve_cli_session(backend, session_id).await?;
+    let record = match resolved {
+        ResolvedCliSession::Tmux { record, .. } | ResolvedCliSession::Rmux { record, .. } => record,
+    };
+    let mut command = native_attach_process(&record);
+    let status = command
+        .status()
+        .await
+        .with_context(|| format!("failed to run {}", native_attach_command(&record)))?;
+    if !status.success() {
+        bail!(
+            "{} native attach exited with status {status}",
+            record.backend.as_str()
+        );
+    }
     Ok(())
 }
 
@@ -1535,7 +1134,7 @@ fn write_session_inspect_details<W: Write>(
         output,
         "browser",
         &format!(
-            "termstage browser attach {} --backend {}",
+            "termstage session attach {} --backend {} --browser",
             record.id,
             record.backend.as_str()
         ),
@@ -1636,6 +1235,15 @@ fn native_attach_command(record: &CliSessionRecord) -> String {
     }
 }
 
+fn native_attach_process(record: &CliSessionRecord) -> Command {
+    let mut command = match record.backend {
+        CliBackend::Tmux => Command::new("tmux"),
+        CliBackend::Rmux => Command::new("rmux"),
+    };
+    command.arg("attach").arg("-t").arg(&record.backend_session);
+    command
+}
+
 async fn run_api_command(args: ApiArgs) -> anyhow::Result<()> {
     let token = args.token.as_deref().context("--token is required")?;
     let token = AccessToken::from_str(token).context("invalid --token")?;
@@ -1730,26 +1338,6 @@ fn api_request(args: ApiArgs) -> anyhow::Result<(SessionName, ApiEndpoint, Value
     ))
 }
 
-fn run_web_command(args: WebArgs) -> anyhow::Result<()> {
-    match args.command {
-        WebCommand::Start(_serve) => bail!("web start must be dispatched before web helpers"),
-        WebCommand::Url { base_url, token } => {
-            let token = AccessToken::from_str(&token).context("invalid --token")?;
-            let url = browser_url(&base_url, &token)?;
-            writeln!(io::stdout(), "{url}").context("failed to write browser URL")?;
-            Ok(())
-        }
-        WebCommand::Token { command } => match command {
-            WebTokenCommand::Generate => {
-                let token = AccessToken::generate().context("failed to generate access token")?;
-                writeln!(io::stdout(), "{}", token.to_url_token())
-                    .context("failed to write access token")?;
-                Ok(())
-            }
-        },
-    }
-}
-
 fn run_auth_command(args: AuthArgs) -> anyhow::Result<()> {
     let AuthArgs { command } = args;
     match command {
@@ -1779,16 +1367,6 @@ fn api_endpoint_url(
     };
     url.set_path(&path);
     url.set_query(None);
-    url.query_pairs_mut()
-        .append_pair("token", &token.to_url_token());
-    Ok(url)
-}
-
-fn browser_url(base_url: &str, token: &AccessToken) -> anyhow::Result<Url> {
-    let mut url = Url::parse(base_url).context("invalid --base-url")?;
-    if url.fragment().is_some() {
-        bail!("--base-url must not contain a fragment");
-    }
     url.query_pairs_mut()
         .append_pair("token", &token.to_url_token());
     Ok(url)
@@ -2036,33 +1614,6 @@ impl CliBackend {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum CliMode {
-    Tmux,
-    Shell,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EffectiveSessionMode {
-    TmuxBackend,
-    RmuxBackend,
-    LegacyShell,
-}
-
-fn effective_session_mode(
-    backend: Option<CliBackend>,
-    mode: Option<CliMode>,
-) -> anyhow::Result<EffectiveSessionMode> {
-    match (backend, mode) {
-        (Some(CliBackend::Tmux), None) | (None, Some(CliMode::Tmux) | None) => {
-            Ok(EffectiveSessionMode::TmuxBackend)
-        }
-        (Some(CliBackend::Rmux), None) => Ok(EffectiveSessionMode::RmuxBackend),
-        (None, Some(CliMode::Shell)) => Ok(EffectiveSessionMode::LegacyShell),
-        (Some(_), Some(_)) => bail!("--backend cannot be combined with legacy --mode"),
-    }
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliScrollDirection {
     Up,
     Down,
@@ -2092,76 +1643,27 @@ impl From<CliTheme> for PresentationTheme {
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum CliKeepalive {
-    Session,
-    Exit,
-}
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
 
-impl From<CliKeepalive> for ReconnectPolicy {
-    fn from(value: CliKeepalive) -> Self {
-        match value {
-            CliKeepalive::Session => Self::KeepAlive,
-            CliKeepalive::Exit => Self::TerminateOnShutdown,
-        }
-    }
-}
+    use super::*;
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum CliExitPolicy {
-    Hold,
-    End,
-}
-
-impl From<CliExitPolicy> for ExitPolicy {
-    fn from(value: CliExitPolicy) -> Self {
-        match value {
-            CliExitPolicy::Hold => Self::Hold,
-            CliExitPolicy::End => Self::End,
-        }
-    }
-}
-
-impl Default for ServeArgs {
-    fn default() -> Self {
-        Self {
-            session: cli_defaults::DEFAULT_SESSION_NAME.to_owned(),
+    fn session_attach_args() -> SessionAttachArgs {
+        SessionAttachArgs {
+            session_id: "demo".to_owned(),
             backend: None,
-            mode: None,
-            command: None,
-            command_args: Vec::new(),
+            browser: false,
             host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 0,
             open: false,
             font_size: browser_presentation::DEFAULT_FONT_SIZE,
             theme: CliTheme::HighContrast,
-            keepalive: CliKeepalive::Session,
-            exit_policy: None,
             expose_public: false,
             public_url: None,
             token_env: None,
             base_path: None,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_should_validate_default_cli_config() -> anyhow::Result<()> {
-        let config = ValidatedCliConfig::try_from(ServeArgs::default())?;
-        assert!(config.host.is_loopback());
-        assert_eq!(config.port, 0);
-        assert_eq!(
-            config.presentation.font_size,
-            browser_presentation::DEFAULT_FONT_SIZE
-        );
-        assert!(matches!(config.exposure, WebExposure::Local));
-        assert!(matches!(config.runtime.mode, SessionMode::Tmux { .. }));
-        assert_eq!(config.runtime.exit_policy, ExitPolicy::Hold);
-        Ok(())
     }
 
     #[test]
@@ -2182,31 +1684,29 @@ mod tests {
 
     #[test]
     fn test_should_reject_non_loopback_host() {
-        let args = ServeArgs {
+        let args = SessionAttachArgs {
             host: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            ..ServeArgs::default()
+            ..session_attach_args()
         };
-        assert!(ValidatedCliConfig::try_from(args).is_err());
+        assert!(ValidatedSessionAttachConfig::try_from(args).is_err());
     }
 
     #[test]
     fn test_should_validate_public_exposure_config() -> anyhow::Result<()> {
         let token = AccessToken::from_bytes([3; 32]).to_url_token();
-        let args = ServeArgs {
-            host: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            port: 8080,
-            expose_public: true,
-            public_url: Some("https://term.example.com/".to_owned()),
-            token_env: Some("TERMSTAGE_TOKEN".to_owned()),
-            ..ServeArgs::default()
-        };
-        let (exposure, parsed_token) = exposure_and_token_with_env(&args, |name| {
-            if name == "TERMSTAGE_TOKEN" {
-                Ok(token.clone())
-            } else {
-                Err(env::VarError::NotPresent)
-            }
-        })?;
+        let (exposure, parsed_token) = exposure_and_token_from_parts(
+            true,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            Some("https://term.example.com/"),
+            Some("TERMSTAGE_TOKEN"),
+            |name| {
+                if name == "TERMSTAGE_TOKEN" {
+                    Ok(token.clone())
+                } else {
+                    Err(env::VarError::NotPresent)
+                }
+            },
+        )?;
         assert!(matches!(exposure, WebExposure::Public { .. }));
         assert!(parsed_token.constant_time_eq(&AccessToken::from_bytes([3; 32])));
         Ok(())
@@ -2214,22 +1714,25 @@ mod tests {
 
     #[test]
     fn test_should_reject_public_mode_without_required_flags() {
-        let args = ServeArgs {
-            expose_public: true,
-            ..ServeArgs::default()
-        };
         assert!(
-            exposure_and_token_with_env(&args, |_name| Err(env::VarError::NotPresent)).is_err()
+            exposure_and_token_from_parts(
+                true,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                None,
+                None,
+                |_name| Err(env::VarError::NotPresent)
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn test_should_reject_public_args_without_public_mode() {
-        let args = ServeArgs {
+        let args = SessionAttachArgs {
             public_url: Some("https://term.example.com/".to_owned()),
-            ..ServeArgs::default()
+            ..session_attach_args()
         };
-        assert!(ValidatedCliConfig::try_from(args).is_err());
+        assert!(ValidatedSessionAttachConfig::try_from(args).is_err());
     }
 
     #[test]
@@ -2242,166 +1745,11 @@ mod tests {
 
     #[test]
     fn test_should_reject_invalid_session_name() {
-        let args = ServeArgs {
-            session: "bad/name".to_owned(),
-            ..ServeArgs::default()
+        let args = SessionAttachArgs {
+            session_id: "bad/name".to_owned(),
+            ..session_attach_args()
         };
-        assert!(ValidatedCliConfig::try_from(args).is_err());
-    }
-
-    #[test]
-    fn test_should_validate_shell_mode_without_session_use() -> anyhow::Result<()> {
-        let args = ServeArgs {
-            mode: Some(CliMode::Shell),
-            command: Some(PathBuf::from("/bin/sh")),
-            ..ServeArgs::default()
-        };
-        let config = ValidatedCliConfig::try_from(args)?;
-        assert!(matches!(config.runtime.mode, SessionMode::NewShell { .. }));
-        assert_eq!(config.runtime.exit_policy, ExitPolicy::End);
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_allow_explicit_shell_command_hold_policy() -> anyhow::Result<()> {
-        let args = ServeArgs {
-            mode: Some(CliMode::Shell),
-            command: Some(PathBuf::from("/bin/sh")),
-            exit_policy: Some(CliExitPolicy::Hold),
-            ..ServeArgs::default()
-        };
-        let config = ValidatedCliConfig::try_from(args)?;
-        assert_eq!(config.runtime.exit_policy, ExitPolicy::Hold);
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_pass_shell_arguments_to_shell_mode() -> anyhow::Result<()> {
-        let args = ServeArgs {
-            mode: Some(CliMode::Shell),
-            command: Some(PathBuf::from("codemax")),
-            command_args: vec![OsString::from("claude")],
-            ..ServeArgs::default()
-        };
-        let config = ValidatedCliConfig::try_from(args)?;
-        let shell = match config.runtime.mode {
-            SessionMode::NewShell { shell } => shell,
-            SessionMode::Tmux { .. } => {
-                anyhow::bail!("validated shell mode must produce a new shell command");
-            }
-        };
-        assert_eq!(shell.executable(), PathBuf::from("codemax").as_path());
-        assert_eq!(shell.args(), [OsString::from("claude")]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_reject_command_args_outside_shell_mode() {
-        let args = ServeArgs {
-            command_args: vec![OsString::from("claude")],
-            ..ServeArgs::default()
-        };
-        assert!(ValidatedCliConfig::try_from(args).is_err());
-    }
-
-    #[test]
-    fn test_should_reject_command_outside_shell_mode() {
-        let args = ServeArgs {
-            command: Some(PathBuf::from("claude")),
-            ..ServeArgs::default()
-        };
-        assert!(ValidatedCliConfig::try_from(args).is_err());
-    }
-
-    #[test]
-    fn test_should_parse_short_command_args() -> anyhow::Result<()> {
-        let args = CliArgs::try_parse_from([
-            "termstage",
-            "web",
-            "start",
-            "--mode",
-            "shell",
-            "--command",
-            "abc",
-            "-g=-p",
-            "-g=--resume",
-        ])?;
-        let command = ValidatedCliCommand::try_from(args)?;
-        let ValidatedCliCommand::WebStart(config) = command else {
-            anyhow::bail!("web start command must validate to web start config");
-        };
-        let shell = match config.runtime.mode {
-            SessionMode::NewShell { shell } => shell,
-            SessionMode::Tmux { .. } => {
-                anyhow::bail!("validated shell mode must produce a new shell command");
-            }
-        };
-        assert_eq!(shell.executable(), PathBuf::from("abc").as_path());
-        assert_eq!(
-            shell.args(),
-            [OsString::from("-p"), OsString::from("--resume")]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_parse_web_start_command() -> anyhow::Result<()> {
-        let args = CliArgs::try_parse_from([
-            "termstage",
-            "web",
-            "start",
-            "--backend",
-            "tmux",
-            "--session",
-            "demo",
-        ])?;
-        let command = ValidatedCliCommand::try_from(args)?;
-        let ValidatedCliCommand::WebStart(config) = command else {
-            anyhow::bail!("web start command must validate to web start config");
-        };
-        let SessionMode::Tmux { session } = config.runtime.mode else {
-            anyhow::bail!("tmux backend must validate to tmux runtime mode");
-        };
-        assert_eq!(session.as_str(), "TerminalUse-demo");
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_parse_rmux_web_start_command() -> anyhow::Result<()> {
-        let args = CliArgs::try_parse_from([
-            "termstage",
-            "web",
-            "start",
-            "--backend",
-            "rmux",
-            "--session",
-            "demo",
-        ])?;
-        let command = ValidatedCliCommand::try_from(args)?;
-        let ValidatedCliCommand::WebStart(config) = command else {
-            anyhow::bail!("web start command must validate to web start config");
-        };
-        let SessionMode::Tmux { session } = config.runtime.mode else {
-            anyhow::bail!("rmux backend must validate to gateway session mode");
-        };
-        assert_eq!(config.gateway_backend, Some(CliBackend::Rmux));
-        assert_eq!(session.as_str(), "TerminalUse-demo");
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_reject_backend_and_legacy_mode_together() -> anyhow::Result<()> {
-        let args = CliArgs::try_parse_from([
-            "termstage",
-            "web",
-            "start",
-            "--backend",
-            "tmux",
-            "--mode",
-            "shell",
-        ])?;
-        assert!(ValidatedCliCommand::try_from(args).is_err());
-        Ok(())
+        assert!(ValidatedSessionAttachConfig::try_from(args).is_err());
     }
 
     #[test]
@@ -2460,6 +1808,87 @@ mod tests {
                 && command_args == &[OsString::from("--readonly")]
         ));
         Ok(())
+    }
+
+    #[test]
+    fn test_should_parse_session_attach_as_native_by_default() -> anyhow::Result<()> {
+        let args = CliArgs::try_parse_from(["termstage", "session", "attach", "demo"])?;
+        let command = ValidatedCliCommand::try_from(args)?;
+        let ValidatedCliCommand::Session(args) = command else {
+            anyhow::bail!("session command group must validate to session args");
+        };
+        assert!(matches!(
+            args.command,
+            SessionCommand::Attach(SessionAttachArgs {
+                ref session_id,
+                backend: None,
+                browser: false,
+                ..
+            }) if session_id == "demo"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_parse_session_attach_browser_mode() -> anyhow::Result<()> {
+        let args = CliArgs::try_parse_from([
+            "termstage",
+            "session",
+            "attach",
+            "demo",
+            "--backend",
+            "rmux",
+            "--browser",
+            "--open",
+        ])?;
+        let command = ValidatedCliCommand::try_from(args)?;
+        let ValidatedCliCommand::Session(args) = command else {
+            anyhow::bail!("session command group must validate to session args");
+        };
+        assert!(matches!(
+            args.command,
+            SessionCommand::Attach(SessionAttachArgs {
+                ref session_id,
+                backend: Some(CliBackend::Rmux),
+                browser: true,
+                open: true,
+                ..
+            }) if session_id == "demo"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_accept_session_attach_browser_typo_alias() -> anyhow::Result<()> {
+        let args =
+            CliArgs::try_parse_from(["termstage", "session", "attach", "demo", "--broswer"])?;
+        let command = ValidatedCliCommand::try_from(args)?;
+        let ValidatedCliCommand::Session(args) = command else {
+            anyhow::bail!("session command group must validate to session args");
+        };
+        assert!(matches!(
+            args.command,
+            SessionCommand::Attach(SessionAttachArgs { browser: true, .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_browser_only_flags_without_browser_mode() {
+        assert!(
+            CliArgs::try_parse_from(["termstage", "session", "attach", "demo", "--open"]).is_err()
+        );
+        assert!(
+            CliArgs::try_parse_from([
+                "termstage",
+                "session",
+                "attach",
+                "demo",
+                "--font-size",
+                "28",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -2571,7 +2000,8 @@ mod tests {
                 "\n",
                 "Attach:\n",
                 "  terminal      rmux attach -t TerminalUse-yoyo\n",
-                "  browser       termstage browser attach TerminalUse-yoyo --backend rmux\n",
+                "  browser       termstage session attach TerminalUse-yoyo --backend rmux \
+                 --browser\n",
             )
         );
         Ok(())
@@ -2623,42 +2053,6 @@ mod tests {
     }
 
     #[test]
-    fn test_should_parse_browser_attach_command() -> anyhow::Result<()> {
-        let args = CliArgs::try_parse_from(["termstage", "browser", "attach", "ts-1-2", "--open"])?;
-        let command = ValidatedCliCommand::try_from(args)?;
-        let ValidatedCliCommand::BrowserAttach(config) = command else {
-            anyhow::bail!("browser attach command must validate to browser attach config");
-        };
-        assert_eq!(config.session_id.as_str(), "ts-1-2");
-        assert!(config.open);
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_parse_rmux_browser_attach_command() -> anyhow::Result<()> {
-        let args = CliArgs::try_parse_from([
-            "termstage",
-            "browser",
-            "attach",
-            "demo",
-            "--backend",
-            "rmux",
-        ])?;
-        let command = ValidatedCliCommand::try_from(args)?;
-        let ValidatedCliCommand::BrowserAttach(config) = command else {
-            anyhow::bail!("browser attach command must validate to browser attach config");
-        };
-        assert_eq!(config.session_id.as_str(), "demo");
-        assert_eq!(config.backend, Some(CliBackend::Rmux));
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_reject_removed_web_attach_command() {
-        assert!(CliArgs::try_parse_from(["termstage", "web", "attach", "demo"]).is_err());
-    }
-
-    #[test]
     fn test_should_parse_session_stop_command() -> anyhow::Result<()> {
         let args = CliArgs::try_parse_from(["termstage", "session", "stop", "demo"])?;
         let command = ValidatedCliCommand::try_from(args)?;
@@ -2680,36 +2074,6 @@ mod tests {
         assert!(
             CliArgs::try_parse_from(["termstage", "session", "stop", "demo", "--kill"]).is_err()
         );
-    }
-
-    #[test]
-    fn test_should_report_tmux_gateway_session_status() -> anyhow::Result<()> {
-        let session = SessionName::from_str("demo")?;
-
-        assert_eq!(
-            tmux_gateway_session_status(&session, true),
-            "tmux session demo created; attach with: tmux attach -t demo"
-        );
-        assert_eq!(
-            tmux_gateway_session_status(&session, false),
-            "tmux session demo reused; attach with: tmux attach -t demo"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_report_rmux_gateway_session_status() -> anyhow::Result<()> {
-        let session = SessionName::from_str("demo")?;
-
-        assert_eq!(
-            rmux_gateway_session_status(&session, true),
-            "rmux session demo created; attach with: rmux attach -t demo"
-        );
-        assert_eq!(
-            rmux_gateway_session_status(&session, false),
-            "rmux session demo reused; attach with: rmux attach -t demo"
-        );
-        Ok(())
     }
 
     #[test]
@@ -2739,17 +2103,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_parse_web_and_auth_command_groups() -> anyhow::Result<()> {
-        let web = CliArgs::try_parse_from(["termstage", "web", "token", "generate"])?;
-        assert!(matches!(
-            ValidatedCliCommand::try_from(web)?,
-            ValidatedCliCommand::Web(WebArgs {
-                command: WebCommand::Token {
-                    command: WebTokenCommand::Generate,
-                },
-            })
-        ));
-
+    fn test_should_parse_auth_command_group() -> anyhow::Result<()> {
         let auth = CliArgs::try_parse_from(["termstage", "auth", "status"])?;
         assert!(matches!(
             ValidatedCliCommand::try_from(auth)?,
@@ -2758,6 +2112,13 @@ mod tests {
             })
         ));
         Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_removed_web_and_browser_command_groups() {
+        assert!(CliArgs::try_parse_from(["termstage", "web", "token", "generate"]).is_err());
+        assert!(CliArgs::try_parse_from(["termstage", "web", "attach", "demo"]).is_err());
+        assert!(CliArgs::try_parse_from(["termstage", "browser", "attach", "demo"]).is_err());
     }
 
     #[test]
@@ -2788,36 +2149,21 @@ mod tests {
     }
 
     #[test]
-    fn test_should_reject_removed_local_attach_short_flag() {
-        let result = CliArgs::try_parse_from([
-            "termstage",
-            "web",
-            "start",
-            "--mode",
-            "shell",
-            "--command",
-            "abc",
-            "-a",
-        ]);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_should_reject_invalid_font_size() {
-        let args = ServeArgs {
+        let args = SessionAttachArgs {
             font_size: browser_presentation::FONT_SIZE_MAX.saturating_add(1),
-            ..ServeArgs::default()
+            ..session_attach_args()
         };
-        assert!(ValidatedCliConfig::try_from(args).is_err());
+        assert!(ValidatedSessionAttachConfig::try_from(args).is_err());
     }
 
     #[test]
     fn test_should_validate_base_path_argument() -> anyhow::Result<()> {
-        let args = ServeArgs {
+        let args = SessionAttachArgs {
             base_path: Some("/p/sess-1/".to_owned()),
-            ..ServeArgs::default()
+            ..session_attach_args()
         };
-        let config = ValidatedCliConfig::try_from(args)?;
+        let config = ValidatedSessionAttachConfig::try_from(args)?;
         assert_eq!(
             config.base_path.as_ref().map(BasePath::as_str),
             Some("/p/sess-1/")
@@ -2827,11 +2173,11 @@ mod tests {
 
     #[test]
     fn test_should_reject_invalid_base_path_argument() {
-        let args = ServeArgs {
+        let args = SessionAttachArgs {
             base_path: Some("p/missing-leading-slash/".to_owned()),
-            ..ServeArgs::default()
+            ..session_attach_args()
         };
-        assert!(ValidatedCliConfig::try_from(args).is_err());
+        assert!(ValidatedSessionAttachConfig::try_from(args).is_err());
     }
 
     #[test]
