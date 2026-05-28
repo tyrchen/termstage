@@ -40,7 +40,7 @@ Presenter workflow
 | G1 | Start a browser terminal for a local demo quickly. | Fresh checkout can run the M0 command and reach an interactive shell in <= 10 seconds after build. |
 | G2 | Preserve real terminal semantics. | Ctrl-C, Ctrl-D, arrow keys, tab completion, paste, resize, `vim`, `less`, and `tmux` work through PTY byte streaming. |
 | G3 | Keep the shell boundary local by default. | Server binds only loopback, requires a random token, validates Host/Origin, and rejects non-loopback peers in M0. |
-| G4 | Optimize for presentation readability. | M1 ships large-font presets, high-contrast themes, fit-to-window resize, and no in-app instructional clutter. |
+| G4 | Optimize for presentation readability. | M1 ships large-font presets, high-contrast themes, fit-to-container embedded terminal layout, and no in-app instructional clutter. |
 | G5 | Keep implementation auditable. | Protocol, security checks, session lifecycle, and CLI behavior are covered by automated tests in the standard quality gates. |
 
 ## 4. Non-Goals

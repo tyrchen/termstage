@@ -2,7 +2,7 @@
 
 Status: draft v1
 Owner: termstage
-Last updated: 2026-05-19
+Last updated: 2026-05-28
 
 ## 0. Readiness Assessment
 
@@ -89,10 +89,12 @@ Maps to roadmap: closes M1.
 | --- | --- | --- | --- |
 | 4.1 | Add frontend terminal app with xterm.js, fit addon, and custom socket protocol. | [20](./20-browser-terminal-web-design.md) | 1.5 days |
 | 4.2 | Add presentation theme/font presets and CLI plumbing. | [50](./50-browser-terminal-cli-design.md) | 1 day |
-| 4.3 | Add Playwright smoke tests and screenshots. | [72](./72-browser-terminal-verification-plan.md) | 1 day |
+| 4.3 | Make xterm an embedded component that fits its terminal container rather than the whole page. | [20](./20-browser-terminal-web-design.md), [72](./72-browser-terminal-verification-plan.md) | 0.5 day |
+| 4.4 | Add Playwright smoke tests and screenshots. | [72](./72-browser-terminal-verification-plan.md) | 1 day |
 
 Exit criteria: M1 roadmap criteria pass and screenshots are non-empty across target
-viewports.
+viewports. The page can contain toolbar/future HTML around the terminal without
+changing xterm sizing semantics.
 
 ## 8. Phase 5 - Reconnect and Hardening
 
@@ -153,11 +155,13 @@ Maps to roadmap: closes M6.
 | 8.3 | Route browser WebSocket traffic through Termstage Protocol into the backend adapter. | [10](./10-browser-terminal-protocol-design.md), [20](./20-browser-terminal-web-design.md), [23](./23-local-remote-command-lease-design.md) | 1.5 days |
 | 8.4 | Add Semantic Operations API for press-key, write-text, run-command, read-screen, and scroll. | [23](./23-local-remote-command-lease-design.md), [70](./70-browser-terminal-security-design.md) | 2 days |
 | 8.5 | Implement Level 1 operation lock with owner kind, owner id, epoch, TTL, and conflict responses. | [23](./23-local-remote-command-lease-design.md), [72](./72-browser-terminal-verification-plan.md) | 1 day |
-| 8.6 | Add integration tests for browser/API synchronization, lock conflict, native backend attach compatibility, and semantic request/response behavior. | [23](./23-local-remote-command-lease-design.md), [72](./72-browser-terminal-verification-plan.md) | 1.5 days |
+| 8.6 | Implement backend-screen to browser-viewport projection for backend-owned gateway sessions. Browser resize updates viewport state and must not resize the backend pane. | [20](./20-browser-terminal-web-design.md), [23](./23-local-remote-command-lease-design.md), [72](./72-browser-terminal-verification-plan.md) | 1 day |
+| 8.7 | Add integration tests for browser/API synchronization, lock conflict, native backend attach compatibility, viewport projection, and semantic request/response behavior. | [23](./23-local-remote-command-lease-design.md), [72](./72-browser-terminal-verification-plan.md) | 1.5 days |
 
 Exit criteria: M6 roadmap criteria pass; browser and Agent API operate the same
 backend session; exactly one controller can write at a time; backend-native local
-attach does not share stdout/stderr with `termstage`.
+attach does not share stdout/stderr with `termstage`; backend screens larger than
+the browser terminal container remain navigable without resizing the backend pane.
 
 ## 13. Phase 9 - CLI Command Groups
 

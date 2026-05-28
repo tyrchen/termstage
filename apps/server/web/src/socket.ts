@@ -19,10 +19,26 @@ interface AcquireControlMessage {
   type: 'acquireControl';
 }
 
-type ClientControlMessage = ResizeControlMessage | HeartbeatControlMessage | AcquireControlMessage;
+interface ViewportControlMessage {
+  type: 'viewport';
+  col?: number;
+  row?: number;
+}
+
+type ClientControlMessage =
+  | ResizeControlMessage
+  | HeartbeatControlMessage
+  | AcquireControlMessage
+  | ViewportControlMessage;
+
+export interface TerminalViewportOrigin {
+  col?: number;
+  row?: number;
+}
 
 export interface TerminalSocket {
   sendResize: (size: TerminalSize) => void;
+  sendViewport: (origin: TerminalViewportOrigin) => void;
   close: () => void;
 }
 
@@ -69,7 +85,11 @@ export function connectTerminalSocket(
   let pendingAcquireInputExpiresAt = 0;
 
   const disposable = terminal.onData((data: string) => {
-    if (inputForwardingSuppressed || socket.readyState !== WebSocket.OPEN) {
+    if (socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    if (inputForwardingSuppressed) {
+      queuePendingAcquireInput(data);
       return;
     }
     if (leaseOwner === 'browser') {
@@ -85,6 +105,9 @@ export function connectTerminalSocket(
     sendResize: (size: TerminalSize) => {
       lastSize = size;
       sendControl(socket, { type: 'resize', cols: size.cols, rows: size.rows });
+    },
+    sendViewport: (origin: TerminalViewportOrigin) => {
+      sendControl(socket, { type: 'viewport', ...origin });
     },
     close: () => {
       closedByClient = true;
@@ -193,6 +216,7 @@ export function connectTerminalSocket(
     terminal.write('', () => {
       scrollTerminalViewportToContentEnd(terminal);
       setInputForwardingSuppressed(false);
+      resumePendingInput();
     });
   }
 
@@ -240,6 +264,17 @@ export function connectTerminalSocket(
   function clearPendingAcquireInput(): void {
     pendingAcquireInput = '';
     pendingAcquireInputExpiresAt = 0;
+  }
+
+  function resumePendingInput(): void {
+    if (pendingAcquireInput.length === 0) {
+      return;
+    }
+    if (leaseOwner === 'browser') {
+      flushPendingAcquireInput();
+    } else {
+      requestBrowserControl();
+    }
   }
 
   function currentSocketUrl(): string {

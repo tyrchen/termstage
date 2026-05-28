@@ -133,6 +133,13 @@ Design rules:
   when that size is detectable. In backend-owned gateway mode, browser viewport
   changes must not resize the backend pane because local native attaches should
   remain governed by the backend client size policy.
+- Browser xterm is an embedded component inside the served page. It fits the
+  terminal container allocated by the page layout, which currently sits below
+  the toolbar and may later sit beside or among other HTML controls.
+- `web attach` must not make the xterm DOM grow to the backend pane size. When
+  the backend screen is larger than the browser container, the gateway projects
+  the backend snapshot into the browser viewport and exposes component-local
+  navigation over the larger backend screen.
 - Backend-native attaches, such as `tmux attach -t <session>`, are treated as
   terminal control for the browser toolbar. While a native client is attached,
   browser input is read-only and visual-only mouse selection in the native

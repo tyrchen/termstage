@@ -36,7 +36,8 @@ Browser xterm.js / Agent API
 │  ┌────────────────────┐   ┌──────────────────────────────┐  │
 │  │ session registry   │   │ browser WebSocket gateway    │  │
 │  │ - termstage id     │   │ - token/auth boundary        │  │
-│  │ - backend ref      │   │ - xterm byte stream bridge   │  │
+│  │ - backend ref      │   │ - embedded xterm bridge      │  │
+│  │                    │   │ - viewport projection        │  │
 │  └─────────┬──────────┘   └──────────────┬───────────────┘  │
 │            │                             │                  │
 │  ┌─────────▼──────────┐   ┌──────────────▼───────────────┐  │
@@ -122,7 +123,8 @@ each other.
 │ Layer 2: Terminal Byte Stream                              │
 │ - VT/ANSI output bytes                                     │
 │ - input bytes                                              │
-│ - resize                                                   │
+│ - browser viewport resize                                  │
+│ - explicit backend resize operation                        │
 │ - replay                                                   │
 │ - close/error/control frames                               │
 └──────────────────────────────┬─────────────────────────────┘
@@ -142,7 +144,15 @@ Layer 2 must faithfully carry the terminal byte stream:
 - mouse protocols;
 - terminal query/response traffic;
 - title, hyperlink, and clipboard OSC sequences;
-- resize and close events.
+- browser viewport resize, explicit backend resize, and close events.
+- browser viewport origin updates for component-local navigation across a larger
+  backend screen.
+
+Browser viewport resize is not the same operation as resizing a backend-owned
+pane. A browser xterm is embedded inside a page container and must fit that
+container. A backend pane is owned by rmux/tmux/future backends and may have a
+different screen size because native local attach clients and backend policies
+control it.
 
 Layer 3 adds request/response semantics for agents. Example operations:
 
@@ -220,13 +230,60 @@ Required capabilities:
 - write input bytes to the pane;
 - send literal text, key tokens, and submitted commands as backend-native
   semantic operations;
-- resize the pane when the active controller size changes;
+- resize the pane only for explicit backend resize operations or backend modes
+  where the controller truly owns the pane size;
 - read a screen snapshot for semantic API operations;
 - close, detach, or keep the backend session according to exit policy.
 
 The first backend should prefer rmux if its API exposes screen read/write
 semantics cleanly. tmux remains a compatibility backend because native local
 attach is well understood.
+
+## 8a. Browser Viewport Projection
+
+Browser xterm.js is a component embedded inside the web page. Its dimensions are
+derived from its container element through the fit addon. Those dimensions are a
+browser viewport, not the backend screen size.
+
+```text
+Browser terminal component                  termstage gateway
+┌──────────────────────────────┐            ┌──────────────────────────┐
+│ page                         │            │ gateway session state    │
+│ ┌──────────────────────────┐ │            │ - backend ref            │
+│ │ toolbar / future HTML    │ │            │ - operation lock         │
+│ └──────────────────────────┘ │            │ - browser viewport       │
+│ ┌──────────────────────────┐ │ resize --->│   cols/rows + origin     │
+│ │ terminal container       │ │            └────────────┬─────────────┘
+│ │ xterm fit: 100x30       │ │                         │ read screen
+│ └──────────────────────────┘ │                         ▼
+└──────────────────────────────┘            ┌──────────────────────────┐
+                                            │ backend pane screen      │
+                                            │ e.g. tmux 188x52        │
+                                            └────────────┬─────────────┘
+                                                         │ project
+                                                         ▼
+                                            xterm-sized frame 100x30
+```
+
+Projection rules:
+
+- The gateway reads backend screen size, cursor, lines, and attributes from the
+  backend adapter.
+- The gateway maintains browser viewport state: visible `cols`, visible `rows`,
+  horizontal origin, and vertical origin. The initial origin should keep the
+  cursor visible where possible without forcing every screen to bottom-align.
+- The binary frame sent to browser xterm must fit the browser viewport. For a
+  backend screen wider than the browser viewport, the frame contains the
+  selected horizontal slice rather than the entire backend line.
+- Browser input coordinates and mouse events are translated through the current
+  viewport origin before reaching the backend.
+- Component-local scroll, trackpad, keyboard navigation, or future toolbar
+  controls may update the viewport origin. They must not scroll the document
+  body or require xterm to grow to backend size.
+- Runtime-owned PTY mode ignores viewport-origin control frames because there is
+  no separate backend screen to project.
+- Browser viewport changes never resize a backend-owned pane. Native local
+  attach clients remain governed by the backend's size policy.
 
 ## 9. Migration Plan
 
@@ -274,6 +331,8 @@ Exit criteria:
 
 - Extends [10-browser-terminal-protocol-design.md](./10-browser-terminal-protocol-design.md)
   with semantic operations and transport-independent terminal frames.
+- Refines [20-browser-terminal-web-design.md](./20-browser-terminal-web-design.md)
+  for backend-owned gateway viewport projection.
 - Replaces the local-terminal ownership portions of
   [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md).
 - Updates [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md)

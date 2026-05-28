@@ -14,6 +14,7 @@ import {
 import { proposedTerminalSize, TerminalSize, watchTerminalResize } from './resize';
 import { connectTerminalSocket } from './socket';
 import { createTerminalSurface, resizeTerminalSurface, setTerminalFontFamily } from './terminal';
+import { watchBackendViewportNavigation } from './viewport';
 
 const root = document.querySelector<HTMLElement>('#terminal-root');
 
@@ -63,8 +64,13 @@ if (root !== null) {
       surface.fitAddon,
       socket.sendResize
     );
+    const stopViewportNavigation = watchBackendViewportNavigation(
+      terminalViewport,
+      socket.sendViewport
+    );
     window.addEventListener('beforeunload', () => {
       stopResize();
+      stopViewportNavigation();
       socket.close();
     });
 

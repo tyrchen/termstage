@@ -30,7 +30,7 @@ use termstage_core::{
     operation_lock::{ControllerId, ControllerKind, ControllerRef, OperationLockError},
     protocol::{
         AccessToken, ClientControlMessage, ErrorCode, LeaseOwner, SafeMessage,
-        ServerControlMessage, SessionName, TerminalSize,
+        ServerControlMessage, SessionName, TerminalSize, ViewportOrigin,
     },
     runtime::{ClientId, RuntimeCommand, RuntimeConfig},
     security::{
@@ -62,6 +62,48 @@ struct GatewayBrowserLease {
     owner: LeaseOwner,
     epoch: u64,
     native_attached: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GatewayViewport {
+    size: TerminalSize,
+    origin_col: Option<u16>,
+    origin_row: Option<u16>,
+}
+
+impl GatewayViewport {
+    const fn new(size: TerminalSize) -> Self {
+        Self {
+            size,
+            origin_col: None,
+            origin_row: None,
+        }
+    }
+
+    const fn size(self) -> TerminalSize {
+        self.size
+    }
+
+    fn update_size(&mut self, size: TerminalSize) {
+        self.size = size;
+    }
+
+    fn update_origin(&mut self, col: Option<u16>, row: Option<u16>) {
+        if let Some(col) = col {
+            self.origin_col = Some(col);
+        }
+        if let Some(row) = row {
+            self.origin_row = Some(row);
+        }
+    }
+
+    const fn origin_col(self) -> Option<u16> {
+        self.origin_col
+    }
+
+    const fn origin_row(self) -> Option<u16> {
+        self.origin_row
+    }
 }
 
 const DEFAULT_BIND_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -457,11 +499,11 @@ struct TokenQuery {
 }
 
 impl TokenQuery {
-    fn browser_size(&self) -> Option<TerminalSize> {
+    fn browser_viewport(&self) -> Option<GatewayViewport> {
         let (Some(cols), Some(rows)) = (self.cols, self.rows) else {
             return None;
         };
-        TerminalSize::new(cols, rows).ok()
+        TerminalSize::new(cols, rows).ok().map(GatewayViewport::new)
     }
 }
 
@@ -583,11 +625,11 @@ async fn ws(
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, WebError> {
     validate_http_request(&state, peer, &headers, &query, true)?;
-    let browser_size = query.browser_size();
+    let browser_viewport = query.browser_viewport();
     Ok(upgrade
         .max_frame_size(MAX_FRAME_SIZE)
         .max_message_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| bridge_socket(state, socket, browser_size))
+        .on_upgrade(move |socket| bridge_socket(state, socket, browser_viewport))
         .into_response())
 }
 
@@ -754,11 +796,15 @@ async fn api_scroll(
     Ok(Json(OperationResponse { ok: true }))
 }
 
-async fn bridge_socket(state: AppState, socket: WebSocket, browser_size: Option<TerminalSize>) {
+async fn bridge_socket(
+    state: AppState,
+    socket: WebSocket,
+    browser_viewport: Option<GatewayViewport>,
+) {
     match state.inner.session.clone() {
         WebSession::Runtime { commands } => bridge_runtime_socket(state, socket, commands).await,
         WebSession::TmuxGateway { gateway, session } => {
-            bridge_gateway_socket(state, socket, gateway, session, browser_size).await;
+            bridge_gateway_socket(state, socket, gateway, session, browser_viewport).await;
         }
     }
 }
@@ -845,7 +891,7 @@ async fn bridge_gateway_socket(
     socket: WebSocket,
     gateway: Arc<Mutex<SessionGateway<TmuxBackend>>>,
     session: SessionName,
-    browser_size: Option<TerminalSize>,
+    browser_viewport: Option<GatewayViewport>,
 ) {
     let client_id = state.client_id();
     let controller = match controller_from_client(client_id) {
@@ -856,22 +902,27 @@ async fn bridge_gateway_socket(
         }
     };
     let (mut sender, mut receiver) = socket.split();
-    let mut lease =
-        match attach_gateway_browser(&gateway, &session, controller, browser_size, &mut sender)
-            .await
-        {
-            Ok(lease_state) => lease_state,
-            Err(error) => {
-                debug!(%error, "gateway browser attach failed");
-                let _result = sender
-                    .send(Message::Close(Some(runtime_unavailable_close())))
-                    .await;
-                return;
-            }
-        };
+    let mut lease = match attach_gateway_browser(
+        &gateway,
+        &session,
+        controller,
+        browser_viewport,
+        &mut sender,
+    )
+    .await
+    {
+        Ok(lease_state) => lease_state,
+        Err(error) => {
+            debug!(%error, "gateway browser attach failed");
+            let _result = sender
+                .send(Message::Close(Some(runtime_unavailable_close())))
+                .await;
+            return;
+        }
+    };
 
     let mut last_client_message = Instant::now();
-    let mut browser_size = browser_size;
+    let mut browser_viewport = browser_viewport;
     let mut last_screen = Bytes::new();
     let mut heartbeat_check = time::interval(CLIENT_HEARTBEAT_CHECK_INTERVAL);
     let mut server_ping = time::interval(SERVER_PING_INTERVAL);
@@ -886,7 +937,7 @@ async fn bridge_gateway_socket(
                     &session,
                     controller,
                     &mut lease,
-                    &mut browser_size,
+                    &mut browser_viewport,
                     &mut sender,
                 ).await.should_close() {
                     break;
@@ -902,7 +953,7 @@ async fn bridge_gateway_socket(
                 ).await.should_close() {
                     break;
                 }
-                if send_gateway_screen_if_changed(&gateway, &session, browser_size, &mut sender, &mut last_screen).await.should_close() {
+                if send_gateway_screen_if_changed(&gateway, &session, browser_viewport, &mut sender, &mut last_screen).await.should_close() {
                     break;
                 }
             }
@@ -1018,7 +1069,7 @@ async fn attach_gateway_browser(
     gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
     session: &SessionName,
     controller: ControllerRef,
-    browser_size: Option<TerminalSize>,
+    browser_viewport: Option<GatewayViewport>,
     sender: &mut BrowserSocketSender,
 ) -> Result<GatewayBrowserLease, SessionGatewayError> {
     let (owns_lease, lease_owner, lease_epoch, native_attached, snapshot) = {
@@ -1060,7 +1111,7 @@ async fn attach_gateway_browser(
         },
     )
     .await;
-    let bytes = screen_snapshot_bytes(&snapshot, browser_size);
+    let bytes = screen_snapshot_bytes(&snapshot, browser_viewport);
     let _result = sender.send(Message::Binary(bytes)).await;
     send_server_control(sender, ServerControlMessage::ReplayFinished).await;
     Ok(GatewayBrowserLease {
@@ -1232,7 +1283,7 @@ async fn handle_gateway_browser_message(
     session: &SessionName,
     controller: ControllerRef,
     lease: &mut GatewayBrowserLease,
-    browser_size: &mut Option<TerminalSize>,
+    browser_viewport: &mut Option<GatewayViewport>,
     sender: &mut BrowserSocketSender,
 ) -> BrowserSocketAction {
     match message {
@@ -1246,7 +1297,7 @@ async fn handle_gateway_browser_message(
                 session,
                 controller,
                 lease,
-                browser_size,
+                browser_viewport,
                 sender,
             )
             .await
@@ -1307,7 +1358,7 @@ async fn handle_gateway_text(
     session: &SessionName,
     controller: ControllerRef,
     lease: &mut GatewayBrowserLease,
-    browser_size: &mut Option<TerminalSize>,
+    browser_viewport: &mut Option<GatewayViewport>,
     sender: &mut BrowserSocketSender,
 ) -> BrowserSocketAction {
     let message = match serde_json::from_str::<ClientControlMessage>(text) {
@@ -1326,7 +1377,10 @@ async fn handle_gateway_text(
         }
         ClientControlMessage::Resize { cols, rows } => {
             let size = TerminalSize { cols, rows };
-            *browser_size = Some(size);
+            match browser_viewport {
+                Some(viewport) => viewport.update_size(size),
+                None => *browser_viewport = Some(GatewayViewport::new(size)),
+            }
             debug!(
                 ?size,
                 owns_lease = lease.owns_lease,
@@ -1334,6 +1388,17 @@ async fn handle_gateway_text(
                 "ignored browser resize for backend-owned gateway session"
             );
             send_server_control(sender, ServerControlMessage::SizeChanged { size }).await;
+        }
+        ClientControlMessage::Viewport { col, row } => {
+            if let Some(viewport) = browser_viewport {
+                viewport.update_origin(col.map(ViewportOrigin::get), row.map(ViewportOrigin::get));
+                debug!(
+                    ?viewport,
+                    owns_lease = lease.owns_lease,
+                    ?controller,
+                    "updated browser viewport origin for backend-owned gateway session"
+                );
+            }
         }
         ClientControlMessage::Heartbeat { .. } => {}
     }
@@ -1343,7 +1408,7 @@ async fn handle_gateway_text(
 async fn send_gateway_screen_if_changed(
     gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
     session: &SessionName,
-    browser_size: Option<TerminalSize>,
+    browser_viewport: Option<GatewayViewport>,
     sender: &mut BrowserSocketSender,
     last_screen: &mut Bytes,
 ) -> BrowserSocketAction {
@@ -1360,7 +1425,7 @@ async fn send_gateway_screen_if_changed(
             }
         }
     };
-    let bytes = screen_snapshot_bytes(&snapshot, browser_size);
+    let bytes = screen_snapshot_bytes(&snapshot, browser_viewport);
     if bytes == *last_screen {
         return BrowserSocketAction::Continue;
     }
@@ -1415,6 +1480,7 @@ async fn handle_browser_text(
             client_id,
             size: TerminalSize { cols, rows },
         },
+        Ok(ClientControlMessage::Viewport { .. }) => return BrowserSocketAction::Continue,
         Ok(ClientControlMessage::Heartbeat { sequence }) => TunnelFrame::Heartbeat { sequence },
         Err(error) => {
             debug!(%error, "closing websocket after invalid control frame");
@@ -1686,20 +1752,33 @@ fn controller_from_client(client_id: ClientId) -> Result<ControllerRef, Operatio
 
 fn screen_snapshot_bytes(
     snapshot: &BackendScreenSnapshot,
-    viewport: Option<TerminalSize>,
+    viewport: Option<GatewayViewport>,
 ) -> Bytes {
-    let viewport = viewport.unwrap_or_else(|| snapshot.size());
-    let visible_rows = viewport.rows.get();
-    let visible_cols = viewport.cols.get();
+    let viewport = viewport.unwrap_or_else(|| GatewayViewport::new(snapshot.size()));
+    let visible_rows = viewport.size().rows.get();
+    let visible_cols = viewport.size().cols.get();
     let snapshot_rows = snapshot.size().rows.get();
+    let snapshot_cols = snapshot.size().cols.get();
     let backend_cursor_row = snapshot.cursor_row().min(snapshot_rows.saturating_sub(1));
-    let start_row = snapshot_start_row(snapshot_rows, backend_cursor_row, visible_rows);
+    let backend_cursor_col = snapshot.cursor_col().min(snapshot_cols.saturating_sub(1));
+    let start_row = snapshot_start_axis(
+        snapshot_rows,
+        backend_cursor_row,
+        visible_rows,
+        viewport.origin_row(),
+    );
+    let start_col = snapshot_start_axis(
+        snapshot_cols,
+        backend_cursor_col,
+        visible_cols,
+        viewport.origin_col(),
+    );
     let cursor_row = backend_cursor_row
         .saturating_sub(start_row)
         .min(visible_rows.saturating_sub(1))
         .saturating_add(1);
-    let cursor_col = snapshot
-        .cursor_col()
+    let cursor_col = backend_cursor_col
+        .saturating_sub(start_col)
         .min(visible_cols.saturating_sub(1))
         .saturating_add(1);
     let mut text = String::from("\x1b[0m\x1b[?7l\x1b[H\x1b[2J");
@@ -1709,25 +1788,164 @@ fn screen_snapshot_bytes(
         }
         let row = start_row.saturating_add(index);
         if let Some(line) = snapshot.lines().get(usize::from(row)) {
-            text.push_str(line);
+            text.push_str(&project_snapshot_line(line, start_col, visible_cols));
         }
     }
     let _result = write!(text, "\x1b[0m\x1b[?7h\x1b[{cursor_row};{cursor_col}H");
     Bytes::from(text)
 }
 
-const fn snapshot_start_row(snapshot_rows: u16, cursor_row: u16, visible_rows: u16) -> u16 {
-    if snapshot_rows <= visible_rows {
+const fn snapshot_start_axis(
+    total_cells: u16,
+    cursor_cell: u16,
+    visible_cells: u16,
+    requested_origin: Option<u16>,
+) -> u16 {
+    if total_cells <= visible_cells {
         return 0;
     }
-    let max_start = snapshot_rows.saturating_sub(visible_rows);
-    if cursor_row >= max_start {
+    let max_start = total_cells.saturating_sub(visible_cells);
+    if let Some(requested_origin) = requested_origin {
+        return if requested_origin > max_start {
+            max_start
+        } else {
+            requested_origin
+        };
+    }
+    if cursor_cell >= max_start {
         return max_start;
     }
-    if cursor_row < visible_rows {
+    if cursor_cell < visible_cells {
         return 0;
     }
-    cursor_row.saturating_add(1).saturating_sub(visible_rows)
+    cursor_cell.saturating_add(1).saturating_sub(visible_cells)
+}
+
+fn project_snapshot_line(line: &str, start_col: u16, visible_cols: u16) -> String {
+    let end_col = start_col.saturating_add(visible_cols);
+    let mut output = String::new();
+    let mut byte_index = 0;
+    let mut cell_col = 0_u16;
+    while byte_index < line.len() {
+        let Some(rest) = line.get(byte_index..) else {
+            break;
+        };
+        let Some(character) = rest.chars().next() else {
+            break;
+        };
+        if character == '\x1b' {
+            let sequence_end = ansi_sequence_end(line.as_bytes(), byte_index);
+            if cell_col <= end_col
+                && let Some(sequence) = line.get(byte_index..sequence_end)
+            {
+                output.push_str(sequence);
+            }
+            byte_index = sequence_end;
+            continue;
+        }
+
+        let width = character_cell_width(character, cell_col);
+        let next_cell_col = cell_col.saturating_add(width);
+        if character_overlaps_viewport(cell_col, next_cell_col, start_col, end_col) {
+            output.push(character);
+        }
+        cell_col = next_cell_col;
+        byte_index = byte_index.saturating_add(character.len_utf8());
+    }
+    output
+}
+
+fn ansi_sequence_end(bytes: &[u8], start: usize) -> usize {
+    let Some(kind) = bytes.get(start.saturating_add(1)) else {
+        return bytes.len();
+    };
+    match *kind {
+        b'[' => csi_sequence_end(bytes, start.saturating_add(2)),
+        b']' => osc_sequence_end(bytes, start.saturating_add(2)),
+        b'(' | b')' | b'*' | b'+' => bytes.len().min(start.saturating_add(3)),
+        _ => bytes.len().min(start.saturating_add(2)),
+    }
+}
+
+fn csi_sequence_end(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() {
+        if let Some(byte) = bytes.get(index)
+            && (0x40..=0x7e).contains(byte)
+        {
+            return index.saturating_add(1);
+        }
+        index = index.saturating_add(1);
+    }
+    bytes.len()
+}
+
+fn osc_sequence_end(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() {
+        match bytes.get(index) {
+            Some(0x07) => return index.saturating_add(1),
+            Some(0x1b) if bytes.get(index.saturating_add(1)) == Some(&b'\\') => {
+                return index.saturating_add(2);
+            }
+            Some(_byte) => {
+                index = index.saturating_add(1);
+            }
+            None => return bytes.len(),
+        }
+    }
+    bytes.len()
+}
+
+const fn character_overlaps_viewport(
+    start: u16,
+    end: u16,
+    viewport_start: u16,
+    viewport_end: u16,
+) -> bool {
+    if start == end {
+        return start >= viewport_start && start < viewport_end;
+    }
+    end > viewport_start && start < viewport_end
+}
+
+fn character_cell_width(character: char, cell_col: u16) -> u16 {
+    if character == '\t' {
+        return 8_u16.saturating_sub(cell_col % 8);
+    }
+    if character.is_control() || is_combining_mark(character) {
+        return 0;
+    }
+    if is_wide_character(character) {
+        return 2;
+    }
+    1
+}
+
+const fn is_combining_mark(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x0300..=0x036f
+            | 0x1ab0..=0x1aff
+            | 0x1dc0..=0x1dff
+            | 0x20d0..=0x20ff
+            | 0xfe20..=0xfe2f
+    )
+}
+
+const fn is_wide_character(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x1100..=0x115f
+            | 0x2329..=0x232a
+            | 0x2e80..=0xa4cf
+            | 0xac00..=0xd7a3
+            | 0xf900..=0xfaff
+            | 0xfe10..=0xfe19
+            | 0xfe30..=0xfe6f
+            | 0xff00..=0xff60
+            | 0xffe0..=0xffe6
+            | 0x1f300..=0x1f64f
+            | 0x1f900..=0x1f9ff
+    )
 }
 
 fn protocol_error_message() -> SafeMessage {
@@ -3402,7 +3620,8 @@ mod tests {
             numbered_snapshot_lines(40),
         );
 
-        let bytes = screen_snapshot_bytes(&snapshot, Some(TerminalSize::new(80, 24)?));
+        let viewport = GatewayViewport::new(TerminalSize::new(80, 24)?);
+        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
         let text = std::str::from_utf8(bytes.as_ref())?;
 
         assert!(text.starts_with("\u{1b}[0m\u{1b}[?7l\u{1b}[H\u{1b}[2Jrow-00"));
@@ -3417,18 +3636,79 @@ mod tests {
     -> anyhow::Result<()> {
         let snapshot = BackendScreenSnapshot::new(
             TerminalSize::new(120, 40)?,
-            117,
+            10,
             37,
             numbered_snapshot_lines(40),
         );
 
-        let bytes = screen_snapshot_bytes(&snapshot, Some(TerminalSize::new(80, 24)?));
+        let viewport = GatewayViewport::new(TerminalSize::new(80, 24)?);
+        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
         let text = std::str::from_utf8(bytes.as_ref())?;
 
         assert!(text.starts_with("\u{1b}[0m\u{1b}[?7l\u{1b}[H\u{1b}[2Jrow-16"));
         assert!(!text.contains("row-15"));
         assert!(text.contains("row-39"));
-        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[22;80H"));
+        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[22;11H"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_project_gateway_snapshot_horizontally() -> anyhow::Result<()> {
+        let snapshot = BackendScreenSnapshot::new(
+            TerminalSize::new(40, 24)?,
+            35,
+            3,
+            vec!["0000000000111111111122222222223333333333".to_owned()],
+        );
+
+        let viewport = GatewayViewport::new(TerminalSize::new(20, 5)?);
+        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let text = std::str::from_utf8(bytes.as_ref())?;
+
+        assert!(text.contains("22222222223333333333"));
+        assert!(!text.contains("0000000000"));
+        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[4;16H"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_project_gateway_snapshot_from_requested_origin() -> anyhow::Result<()> {
+        let mut viewport = GatewayViewport::new(TerminalSize::new(20, 5)?);
+        viewport.update_origin(Some(8), None);
+        let snapshot = BackendScreenSnapshot::new(
+            TerminalSize::new(40, 24)?,
+            2,
+            3,
+            vec!["0123456789abcdefghijklmnopqrst".to_owned()],
+        );
+
+        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let text = std::str::from_utf8(bytes.as_ref())?;
+
+        assert!(text.contains("89abcdefghijklmnopq"));
+        assert!(!text.contains("01234567"));
+        assert!(!text.contains("rst"));
+        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[4;1H"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_preserve_ansi_state_when_projecting_gateway_snapshot() -> anyhow::Result<()> {
+        let mut viewport = GatewayViewport::new(TerminalSize::new(20, 5)?);
+        viewport.update_origin(Some(4), None);
+        let snapshot = BackendScreenSnapshot::new(
+            TerminalSize::new(120, 24)?,
+            5,
+            0,
+            vec!["\u{1b}[31m0123456789\u{1b}[0m".to_owned()],
+        );
+
+        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let text = std::str::from_utf8(bytes.as_ref())?;
+
+        assert!(text.contains("\u{1b}[31m456789"));
+        assert!(!text.contains("0123"));
+        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[1;2H"));
         Ok(())
     }
 

@@ -1,7 +1,7 @@
 # Specs Index
 
 Status: draft v1
-Last updated: 2026-05-26
+Last updated: 2026-05-28
 
 This spec set defines the browser-based terminal presentation mode for `termstage`.
 Read in numbered order for build order, then use the roadmap and implementation plan
@@ -14,7 +14,7 @@ to map that order to user-visible milestones.
 | [00-browser-terminal-prd.md](./00-browser-terminal-prd.md) | PRD | Product problem, users, goals, non-goals, success metrics. |
 | [10-browser-terminal-protocol-design.md](./10-browser-terminal-protocol-design.md) | Data model | WebSocket message contract, session identifiers, validation ranges. |
 | [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md) | Runtime design | PTY/session actor model, lifecycle, shutdown, reconnection. |
-| [20-browser-terminal-web-design.md](./20-browser-terminal-web-design.md) | Web design | Axum server, WebSocket upgrade, static asset serving, browser terminal frontend. |
+| [20-browser-terminal-web-design.md](./20-browser-terminal-web-design.md) | Web design | Axum server, WebSocket upgrade, static asset serving, embedded browser terminal frontend. |
 | [21-browser-terminal-public-exposure-design.md](./21-browser-terminal-public-exposure-design.md) | Public exposure design | Opt-in pod/internet mode, public URL validation, token-env token source. |
 | [22-browser-terminal-base-path-design.md](./22-browser-terminal-base-path-design.md) | Base-path design | Reverse-proxy path-prefix mounting via `--base-path`. |
 | [23-local-remote-command-lease-design.md](./23-local-remote-command-lease-design.md) | Session backend gateway design | Backend-owned session model, Termstage Protocol layers, semantic API, and operation lock. |
