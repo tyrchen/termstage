@@ -12,20 +12,27 @@ owns argument parsing, defaults, browser opening, and terminal session mode sele
 
 ## 2. Interface
 
-M0 command:
+Backend-session workflow:
 
 ```text
-termstage web start --backend tmux --session presentation --open
+termstage session create --backend tmux --name presentation --command k9s
+termstage web attach ts-presentation --open
 ```
 
-Planned arguments:
+Session creation arguments:
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
-| `--session <name>` | `presentation` | Attach/create a tmux session with the validated name. |
-| `--mode <tmux|shell>` | `tmux` | Choose shared tmux or fresh shell mode. |
-| `--command <path>` | `$SHELL` on Unix | Command executable for shell mode only. |
-| `-g, --command-arg <arg>` | unset | Repeatable argv tail for shell mode only. |
+| `--backend <tmux|rmux>` | `tmux` | Backend that owns the real session/pane/PTY. |
+| `--name <name>` | required | Human-readable session name. The tmux backend creates `ts-<name>`. |
+| `--command <path>` | `$SHELL` on Unix | Command executable for the first backend pane. |
+| `-g, --command-arg <arg>` | unset | Repeatable argv tail for `--command`. |
+
+Web attach arguments:
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `<session-id>` | required | Backend session id. For tmux, this is the tmux session name; if an exact match is missing, `web attach` also tries `ts-<session-id>`. |
 | `--host <addr>` | `127.0.0.1` | Bind address; non-loopback requires `--expose-public`. |
 | `--port <port>` | `0` | Port `0` means OS-chosen random port. |
 | `--open` | false | Open the tokenized URL in the default browser. |
@@ -39,20 +46,18 @@ Planned arguments:
 ## 2a. User Flow
 
 ```text
-CLI                 Server              Browser              Runtime
- |                    |                    |                    |
- | 1. parse args      |                    |                    |
- | 2. validate names  |                    |                    |
- | 3. bind loopback ->|                    |                    |
- |                    | 4. mint token      |                    |
- | 5. open URL ------>|------------------->|                    |
- |                    |                    | 6. load assets     |
- |                    |<-------------------| 7. WS connect      |
- |                    | 8. validate        |                    |
- |                    |----------------------------------------->|
- |                    |                    |                    | 9. start tmux
- |                    |<-----------------------------------------|
- |                    |------------------->| 10. terminal ready |
+CLI                   Backend             Browser
+ |                       |                    |
+ | 1. session create     |                    |
+ | 2. validate name/cmd  |                    |
+ |---------------------->| 3. create ts-name |
+ | 4. print id/attach    |                    |
+ |                       |                    |
+ | 5. web attach <id>    |                    |
+ | 6. resolve exact/id+prefix                 |
+ | 7. attach gateway --->|                    |
+ | 8. open URL ------------------------------>|
+ |                       |<-------------------| 9. WS connect
 ```
 
 ## 3. Invariants
@@ -61,7 +66,8 @@ CLI                 Server              Browser              Runtime
   and [21-browser-terminal-public-exposure-design.md](./21-browser-terminal-public-exposure-design.md)
   validation succeeds.
 - CLI arguments crossing trust boundaries are validated before server startup.
-- `--session` is a tmux session name, not a shell command.
+- `--name` is a human-readable session name, not a shell command. The tmux
+  backend prefixes termstage-created sessions with `ts-`.
 - `--command` is an executable path and `-g` / `--command-arg` is repeatable argv
   handling, not a string passed through `sh -c`.
 - Shell mode is browser-first. The invoking terminal remains the `termstage`
@@ -96,24 +102,35 @@ Target top-level command groups:
 
 | Group | Purpose | Initial commands |
 | --- | --- | --- |
-| `termstage session` | Manage backend sessions visible through the selected adapter. The first implementation supports tmux sessions directly; a persistent cross-process termstage registry is future work. | `session list`, `session inspect <name>`, `session stop <name> --detach|--kill`, `session attach-info <name>` |
+| `termstage session` | Create and manage backend-owned sessions. The backend session id is the termstage session id. | `session create --backend <tmux|rmux> --name <name> [--command <cmd> -g <arg>]`, `session list [--backend <backend>]`, `session inspect <session-id>`, `session stop <session-id> --detach|--kill` |
 | `termstage api` | CLI wrapper for semantic operations used by agents and automation. | `api send-text`, `api send-key`, `api run-command --wait-for --capture`, `api read-screen` |
-| `termstage web` | Start the browser/API gateway and manage URL/token helper surfaces. | `web start --backend <tmux|rmux> --session <name> --open`, `web url`, `web token generate`; future token revocation |
+| `termstage web` | Attach browser/API gateway surfaces to an existing backend session id and manage URL/token helper surfaces. | `web attach <session-id> --open`, `web url`, `web token generate`; future token revocation |
 | `termstage auth` | Inspect or manage authentication state. | `auth status`; future `auth login/logout` |
 
 Design rules:
 
-- `--backend <tmux|rmux>` chooses the owner of the actual session/pane/PTY. It
-  should replace `--mode tmux` as the long-term backend selector.
-- `--command <cmd>` and `-g, --command-arg <arg>` remain available only for
-  compatibility `--mode shell` until the backend adapter exposes an argv-safe
-  pane startup primitive. They must not be implemented by concatenating a shell
-  command string for a backend pane.
-- `--session <name>` names the shared backend session. If the session already
-  exists, the default should be create-or-reuse and the CLI must clearly report
-  whether the command was started or the existing session was reused.
-- `web start` sizes newly created backend panes from the invoking terminal when
-  that size is detectable. In backend-owned gateway mode, browser viewport
+- `--backend <tmux|rmux>` chooses the owner of the actual session/pane/PTY.
+  Tmux is the implemented backend. `session create --backend tmux --name abc`
+  creates tmux session `ts-abc`; `ts-abc` is also the termstage session id.
+- `session create --name <name>` returns the backend session id instead of
+  writing a local registry file. If `--command` is omitted, the backend starts
+  the user's default shell. If `--command <cmd>` is present,
+  `-g, --command-arg <arg>` is repeatable and is passed as argv to the backend
+  pane startup primitive; it must not be implemented by concatenating a shell
+  command string.
+- `session list` without `--backend` lists backend sessions visible to
+  termstage. For tmux, this means valid tmux session names. The list output
+  includes `SESSION_ID`, `BACKEND`, and `DISPLAY_NAME`; it does not repeat a
+  separate `BACKEND_SESSION` column because tmux uses the same value.
+- `session inspect <session-id>` returns the backend kind, backend
+  session/window/pane details when live, and the native attach command such as
+  `tmux attach -t <backend-session>`.
+- `web attach <session-id>` starts only the browser/API gateway for an existing
+  backend session. It must not create backend sessions. Tmux resolution first
+  checks the exact session id, then checks `ts-<session-id>` when the requested
+  value is unprefixed, so `web attach abc` can attach `ts-abc`.
+- Backend panes are sized from the invoking terminal at `session create` time
+  when that size is detectable. In backend-owned gateway mode, browser viewport
   changes must not resize the backend pane because local native attaches should
   remain governed by the backend client size policy.
 - Backend-native attaches, such as `tmux attach -t <session>`, are treated as
@@ -123,7 +140,7 @@ Design rules:
 - The browser snapshot stream preserves terminal color attributes emitted by
   the backend. Backend-local selection highlights are transient client UI and
   are not part of the shared screen model.
-- `web start` exits when the backend session disappears, for example when the
+- `web attach` exits when the backend session disappears, for example when the
   tmux session is killed, instead of keeping the web server alive indefinitely.
 - `termstage`'s invoking terminal remains a supervisor surface for URL, status,
   health, and errors. Local viewing stays backend-native, for example
@@ -131,17 +148,15 @@ Design rules:
 - Running `termstage` without a command group must fail with clap's missing
   subcommand error. Root-level gateway flags are not a compatibility alias.
 
-Registry persistence:
+Session identity:
 
-- tmux direct discovery does not require a termstage-owned file because tmux is
-  the source of truth for existing sessions.
-- A future cross-backend termstage registry should persist only non-secret
-  metadata, such as termstage session id, backend kind, backend session/window/pane
-  reference, timestamps, and labels. It must not store bearer tokens in cleartext.
-- Local single-host persistence should use the platform state/config directory
-  with owner-only permissions and atomic file replacement. EKS or multi-process
-  deployments should use a shared control-plane store instead of a per-pod
-  `~/.termstage/session.json` file.
+- There is no `$HOME/.termstage/sessions.json` registry. The backend is the
+  source of truth for live sessions.
+- For tmux, termstage-created sessions always use the `ts-` prefix. The
+  session id, backend session name, native attach target, and web attach target
+  are the same value, for example `ts-abc`.
+- `web attach` can attach any existing tmux session whose name is valid for the
+  termstage protocol, including sessions created outside termstage.
 
 ## 5. AGENTS.md Binding
 

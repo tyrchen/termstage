@@ -68,7 +68,7 @@ test('terminal app renders common Unicode terminal glyphs', async ({ page }, tes
     });
     await page.goto(server.url);
     await expect(page.locator('.xterm')).toBeVisible();
-    await page.keyboard.type("printf '─│╭╮█⠀'");
+    await page.keyboard.insertText("printf '─│╭╮█⠀'");
     await page.keyboard.press('Enter');
     await expect(page.locator('.xterm-rows')).toContainText('─│╭╮█⠀');
     const screenshot = await page.screenshot({
@@ -137,9 +137,7 @@ test('terminal app stops reconnecting when another browser takes over', async ({
   }
 });
 
-test('terminal app reconnects after ambiguous session-ended socket close', async ({
-  page
-}, testInfo) => {
+test('terminal app reconnects after ambiguous socket close', async ({ page }, testInfo) => {
   const server = await startTermstageServer();
   try {
     testInfo.attach('launch-url-redacted', {
@@ -173,7 +171,7 @@ test('terminal app reconnects after ambiguous session-ended socket close', async
                 this.dispatchEvent(
                   new CloseEvent('close', {
                     code: 1000,
-                    reason: 'session ended',
+                    reason: '',
                     wasClean: true
                   })
                 );
@@ -212,6 +210,8 @@ test('terminal app holds the session when shell exits', async ({ page }, testInf
     });
     await page.goto(server.url);
     await expect(page.locator('.xterm')).toBeVisible();
+    await expect(page.locator('.xterm-rows')).toContainText('$');
+    await page.locator('.xterm').click();
     await page.keyboard.type('exit');
     await page.keyboard.press('Enter');
     await expect(page.getByRole('dialog')).toContainText('Process exited');
@@ -219,6 +219,8 @@ test('terminal app holds the session when shell exits', async ({ page }, testInf
     await page.reload();
     await expect(page.locator('.xterm')).toBeVisible();
     await expect(page.getByRole('dialog')).toBeHidden();
+    await expect(page.locator('.xterm-rows')).toContainText('$');
+    await page.locator('.xterm').click();
     await page.keyboard.type('printf after-refresh-restart');
     await page.keyboard.press('Enter');
     await expect(page.locator('.xterm-rows')).toContainText('after-refresh-restart');
@@ -264,10 +266,14 @@ async function startTermstageServer(): Promise<{
       '--bin',
       'termstage',
       '--',
+      'web',
+      'start',
       '--mode',
       'shell',
-      '--shell',
+      '--command',
       '/bin/bash',
+      '--exit-policy',
+      'hold',
       '--port',
       '0',
       '--font-size',

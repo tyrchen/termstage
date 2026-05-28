@@ -32,6 +32,33 @@ pub struct TmuxBackend {
     tmux: PathBuf,
 }
 
+/// Command used to start a new tmux session pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxSessionCommand {
+    executable: OsString,
+    args: Vec<OsString>,
+}
+
+impl TmuxSessionCommand {
+    /// Creates a tmux session command.
+    #[must_use]
+    pub fn new(executable: OsString, args: Vec<OsString>) -> Self {
+        Self { executable, args }
+    }
+
+    /// Returns the executable.
+    #[must_use]
+    pub fn executable(&self) -> &OsString {
+        &self.executable
+    }
+
+    /// Returns the command arguments.
+    #[must_use]
+    pub fn args(&self) -> &[OsString] {
+        &self.args
+    }
+}
+
 /// tmux session details used by supervisor CLI commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxSessionInfo {
@@ -172,6 +199,58 @@ impl TmuxBackend {
         self.run(["kill-session", "-t", session.as_str()]).await
     }
 
+    /// Returns whether a tmux session exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when tmux cannot check the session.
+    pub async fn session_exists_by_name(
+        &self,
+        session: &SessionName,
+    ) -> Result<bool, BackendError> {
+        self.session_exists(session).await
+    }
+
+    /// Creates a new tmux session and starts `command` as the first pane
+    /// command. When `command` is `None`, tmux starts the user's default shell.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when the session already exists or tmux cannot
+    /// create or inspect the session.
+    pub async fn create_new_session(
+        &self,
+        session: &SessionName,
+        size: TerminalSize,
+        command: Option<&TmuxSessionCommand>,
+    ) -> Result<TmuxSessionInfo, BackendError> {
+        if self.session_exists(session).await? {
+            return Err(BackendError::Operation(SafeMessage::from_static(
+                "tmux session already exists",
+            )));
+        }
+        self.create_session(session, size, command).await?;
+        self.prepare_session(session).await?;
+        self.inspect_session(session).await
+    }
+
+    /// Resolves and prepares an existing tmux session for gateway attachment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::SessionNotFound`] when the session does not
+    /// exist, or another [`BackendError`] when tmux cannot inspect it.
+    pub async fn attach_existing_session(
+        &self,
+        session: &SessionName,
+    ) -> Result<BackendSessionRef, BackendError> {
+        if !self.session_exists(session).await? {
+            return Err(BackendError::SessionNotFound);
+        }
+        self.prepare_session(session).await?;
+        self.resolve_reference(session).await
+    }
+
     async fn ensure_session(
         &self,
         session: &SessionName,
@@ -180,7 +259,7 @@ impl TmuxBackend {
         if self.session_exists(session).await? {
             return Ok(false);
         }
-        self.create_session(session, size).await?;
+        self.create_session(session, size, None).await?;
         Ok(true)
     }
 
@@ -200,11 +279,19 @@ impl TmuxBackend {
         &self,
         session: &SessionName,
         size: TerminalSize,
+        command: Option<&TmuxSessionCommand>,
     ) -> Result<(), BackendError> {
         let cols = size.cols.get().to_string();
         let rows = size.rows.get().to_string();
-        let output = self
-            .command()
+        let default_command;
+        let command = if let Some(command) = command {
+            command
+        } else {
+            default_command = TmuxSessionCommand::new(default_shell_command(), Vec::new());
+            &default_command
+        };
+        let mut process = self.command();
+        process
             .env("COLORTERM", TERMINAL_COLOR_MODE)
             .env("CLICOLOR", "1")
             .env("TERM_PROGRAM", TERMINAL_PROGRAM)
@@ -230,10 +317,10 @@ impl TmuxBackend {
                 "TERM_PROGRAM_VERSION={}",
                 env!("CARGO_PKG_VERSION")
             ))
-            .arg(default_shell_command())
-            .output()
-            .await
-            .map_err(BackendError::Io)?;
+            .arg("--")
+            .arg(command.executable())
+            .args(command.args());
+        let output = process.output().await.map_err(BackendError::Io)?;
         Self::ensure_success(output, "tmux new-session failed")
     }
 
@@ -835,6 +922,20 @@ mod tests {
 
         assert!(matches!(result, Err(BackendError::Io(_))));
         Ok(())
+    }
+
+    #[test]
+    fn test_should_create_tmux_session_command() {
+        let command = TmuxSessionCommand::new(
+            OsString::from("k9s"),
+            vec![OsString::from("-A"), OsString::from("--readonly")],
+        );
+
+        assert_eq!(command.executable(), &OsString::from("k9s"));
+        assert_eq!(
+            command.args(),
+            [OsString::from("-A"), OsString::from("--readonly")]
+        );
     }
 
     #[test]

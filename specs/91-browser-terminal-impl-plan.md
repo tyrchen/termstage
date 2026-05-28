@@ -148,7 +148,7 @@ Maps to roadmap: closes M6.
 
 | # | Task | Spec | Effort |
 | --- | --- | --- | --- |
-| 8.1 | Add a session registry that maps `termstage` session ids to backend session/window/pane references. | [23](./23-local-remote-command-lease-design.md), [11](./11-browser-terminal-runtime-design.md) | 1 day |
+| 8.1 | Add an in-memory gateway registry that maps request session ids to backend session/window/pane references for the active web/API gateway process. | [23](./23-local-remote-command-lease-design.md), [11](./11-browser-terminal-runtime-design.md) | 1 day |
 | 8.2 | Define the backend adapter trait and implement the first rmux/tmux adapter path for create/find, stream output, write input, resize, and read-screen. | [23](./23-local-remote-command-lease-design.md), [61](./61-browser-terminal-crates-and-features.md) | 2 days |
 | 8.3 | Route browser WebSocket traffic through Termstage Protocol into the backend adapter. | [10](./10-browser-terminal-protocol-design.md), [20](./20-browser-terminal-web-design.md), [23](./23-local-remote-command-lease-design.md) | 1.5 days |
 | 8.4 | Add Semantic Operations API for press-key, write-text, run-command, read-screen, and scroll. | [23](./23-local-remote-command-lease-design.md), [70](./70-browser-terminal-security-design.md) | 2 days |
@@ -165,14 +165,16 @@ Maps to roadmap: follow-up after M6.
 
 | # | Task | Spec | Effort |
 | --- | --- | --- | --- |
-| 9.1 | Move gateway startup under `termstage web start`, remove the top-level `serve` command, and reject root-level startup aliases with clap's missing/unknown subcommand errors. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 1 day |
-| 9.2 | Introduce `--backend <tmux|rmux>` for backend-owned sessions while keeping `--mode shell` as the compatibility path for `--command` / `--command-arg` until an argv-safe backend pane startup primitive exists. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 1 day |
-| 9.3 | Add `termstage session` commands for list, inspect, stop `--detach|--kill`, and attach-info. | [50](./50-browser-terminal-cli-design.md), [70](./70-browser-terminal-security-design.md) | 2 days |
+| 9.1 | Move backend session creation under `termstage session create --backend <backend> --name <name> [--command <cmd>]`, use the backend session id as the termstage session id, and reject root-level startup aliases with clap's missing/unknown subcommand errors. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 1 day |
+| 9.2 | Introduce argv-safe tmux pane startup for `session create --command <cmd> -g <arg>` while keeping `--mode shell` as the compatibility path for browser-only command runs. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 1 day |
+| 9.3 | Add `termstage session` commands for list, inspect, and stop `--detach|--kill`; inspect returns backend-native attach info, so a separate attach-info command is unnecessary. | [50](./50-browser-terminal-cli-design.md), [70](./70-browser-terminal-security-design.md) | 2 days |
 | 9.4 | Add `termstage api` commands for send-text, send-key, run-command wait/capture, and read-screen as CLI wrappers over the semantic API. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 2 days |
-| 9.5 | Reserve `termstage web` and `termstage auth` command groups for URL/token management and future OIDC login/logout/status flows. | [50](./50-browser-terminal-cli-design.md), [21](./21-browser-terminal-public-exposure-design.md) | 1 day |
+| 9.5 | Add `termstage web attach <session-id>` for browser/API gateway attachment to an existing session id, and reserve `termstage auth` for future OIDC login/logout/status flows. | [50](./50-browser-terminal-cli-design.md), [21](./21-browser-terminal-public-exposure-design.md) | 1 day |
 
 Exit criteria: the CLI help is organized by `session`, `api`, `web`, and `auth`
-command groups; legacy root invocation is rejected; parser tests cover command
+command groups; tmux session ids resolve directly from tmux with `ts-` fallback
+for unprefixed names; browser gateway attachment does not create backend
+sessions; legacy root invocation is rejected; parser tests cover command
 grouping and invalid flag placement.
 
 ## 14. Cross-References
