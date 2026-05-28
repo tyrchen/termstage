@@ -11,5 +11,6 @@ pub mod runtime;
 pub mod security;
 pub mod session_gateway;
 pub mod session_registry;
+mod settings;
 pub mod tmux_backend;
 pub mod tunnel;

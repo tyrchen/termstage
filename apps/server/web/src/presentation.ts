@@ -1,3 +1,5 @@
+import { browserPresentationSettings } from './settings';
+
 export type PresentationThemeName = 'high-contrast' | 'light';
 export type TerminalFontFamilyName =
   | 'termstage'
@@ -48,10 +50,10 @@ export interface ThemePalette {
   brightWhite: string;
 }
 
-const DEFAULT_FONT_SIZE = 24;
-const DEFAULT_FONT_FAMILY: TerminalFontFamilyName = 'termstage';
-export const MIN_FONT_SIZE = 12;
-export const MAX_FONT_SIZE = 96;
+const DEFAULT_FONT_FAMILY: TerminalFontFamilyName =
+  browserPresentationSettings.defaultFontFamily;
+export const MIN_FONT_SIZE = browserPresentationSettings.fontSizeMin;
+export const MAX_FONT_SIZE = browserPresentationSettings.fontSizeMax;
 
 export const FONT_FAMILIES: readonly TerminalFontFamily[] = [
   {
@@ -187,11 +189,11 @@ export function fontFamilyByName(name: TerminalFontFamilyName): TerminalFontFami
 
 function parseFontSize(value: string | null): number {
   if (value === null) {
-    return DEFAULT_FONT_SIZE;
+    return browserPresentationSettings.defaultFontSize;
   }
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed)) {
-    return DEFAULT_FONT_SIZE;
+    return browserPresentationSettings.defaultFontSize;
   }
   return clampFontSize(parsed);
 }

@@ -2,6 +2,7 @@ import { Terminal } from '@xterm/xterm';
 
 import { ConnectionStatus } from './connection-status';
 import { TerminalSize, clampTerminalSize } from './resize';
+import { browserTerminalCloseReasons, browserTerminalSocketSettings } from './settings';
 import { scrollTerminalViewportToContentEnd, writeTerminalOutput } from './terminal';
 
 interface ResizeControlMessage {
@@ -49,17 +50,7 @@ export interface TerminalSocketOptions {
   onSizeChange?: (size: TerminalSize) => void;
 }
 
-const RECONNECT_DELAYS_MS = [250, 500, 1000, 2000] as const;
-const LOST_AFTER_RECONNECT_ATTEMPTS = RECONNECT_DELAYS_MS.length;
-const SESSION_ENDED_REASON = 'session ended';
-const SERVER_SHUTDOWN_REASON = 'server shutting down';
-const RUNTIME_ERROR_REASON = 'runtime error';
-const CLIENT_DISCONNECTED_REASON = 'client disconnected';
-const CONTROLLER_REPLACED_REASON = 'controller replaced';
-const BROWSER_BACKPRESSURE_REASON = 'browser client backpressure';
-const ACQUIRE_CONTROL_THROTTLE_MS = 50;
-const PENDING_ACQUIRE_INPUT_TTL_MS = 1000;
-const PENDING_ACQUIRE_INPUT_MAX_CHARS = 4096;
+const LOST_AFTER_RECONNECT_ATTEMPTS = browserTerminalSocketSettings.reconnectDelaysMs.length;
 
 export function connectTerminalSocket(
   terminal: Terminal,
@@ -177,7 +168,12 @@ export function connectTerminalSocket(
 
     emitStatus({ state: 'reconnecting' });
     const delay =
-      RECONNECT_DELAYS_MS[Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)];
+      browserTerminalSocketSettings.reconnectDelaysMs[
+        Math.min(
+          reconnectAttempt,
+          browserTerminalSocketSettings.reconnectDelaysMs.length - 1
+        )
+      ];
     reconnectAttempt += 1;
     reconnectId = window.setTimeout(() => {
       socket = openSocket();
@@ -229,7 +225,10 @@ export function connectTerminalSocket(
       return;
     }
     const now = Date.now();
-    if (now - lastAcquireControlAt < ACQUIRE_CONTROL_THROTTLE_MS) {
+    if (
+      now - lastAcquireControlAt <
+      browserTerminalSocketSettings.acquireControlThrottleMs
+    ) {
       return;
     }
     lastAcquireControlAt = now;
@@ -237,12 +236,16 @@ export function connectTerminalSocket(
   }
 
   function queuePendingAcquireInput(data: string): void {
-    if (pendingAcquireInput.length + data.length > PENDING_ACQUIRE_INPUT_MAX_CHARS) {
+    if (
+      pendingAcquireInput.length + data.length >
+      browserTerminalSocketSettings.pendingAcquireInputMaxChars
+    ) {
       clearPendingAcquireInput();
       return;
     }
     pendingAcquireInput += data;
-    pendingAcquireInputExpiresAt = Date.now() + PENDING_ACQUIRE_INPUT_TTL_MS;
+    pendingAcquireInputExpiresAt =
+      Date.now() + browserTerminalSocketSettings.pendingAcquireInputTtlMs;
   }
 
   function flushPendingAcquireInput(): void {
@@ -386,28 +389,28 @@ function isTerminalSize(value: unknown): value is TerminalSize {
 
 function terminalEndStatus(event: CloseEvent): ConnectionStatus | undefined {
   switch (event.reason) {
-    case CLIENT_DISCONNECTED_REASON:
-    case BROWSER_BACKPRESSURE_REASON:
+    case browserTerminalCloseReasons.clientDisconnected:
+    case browserTerminalCloseReasons.browserBackpressure:
       return undefined;
-    case SESSION_ENDED_REASON:
+    case browserTerminalCloseReasons.sessionEnded:
       return {
         state: 'ended',
         title: 'Session ended',
         message: 'The backend session ended.'
       };
-    case SERVER_SHUTDOWN_REASON:
+    case browserTerminalCloseReasons.serverShutdown:
       return {
         state: 'ended',
         title: 'Session ended',
         message: 'The server shut down.'
       };
-    case RUNTIME_ERROR_REASON:
+    case browserTerminalCloseReasons.runtimeError:
       return {
         state: 'ended',
         title: 'Session ended',
         message: 'The terminal runtime stopped after an error.'
       };
-    case CONTROLLER_REPLACED_REASON:
+    case browserTerminalCloseReasons.controllerReplaced:
       return {
         state: 'ended',
         title: 'Session attached elsewhere',

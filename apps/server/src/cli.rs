@@ -8,7 +8,6 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::Arc,
-    time::Duration,
 };
 
 use anyhow::{Context, bail};
@@ -32,21 +31,13 @@ use tokio::{
 use tracing::{debug, info};
 use url::{Host, Url};
 
-use crate::web::{PresentationSettings, PresentationTheme, WebConfig, WebExposure, serve};
-
-const DEFAULT_SESSION: &str = "presentation";
-const DEFAULT_FONT_SIZE: u16 = 24;
-const MIN_FONT_SIZE: u16 = 12;
-const MAX_FONT_SIZE: u16 = 96;
-const TOKEN_ENV_MAX_BYTES: usize = 128;
-const API_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
-const ACTOR_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const GATEWAY_LEASE_TTL: Duration = Duration::from_secs(90);
-const GATEWAY_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const HTTP_HEADER_SEPARATOR: &[u8; 4] = b"\r\n\r\n";
-const HTTP_LINE_SEPARATOR: &[u8; 2] = b"\r\n";
-const TERMSTAGE_TMUX_SESSION_PREFIX: &str = "ts-";
-const SESSION_LIST_HEADERS: [&str; 3] = ["SESSION_ID", "BACKEND", "DISPLAY_NAME"];
+use crate::{
+    settings::{
+        api_client, backend_gateway, browser_presentation, cli_defaults, runtime_supervisor,
+        session_names,
+    },
+    web::{PresentationSettings, PresentationTheme, WebConfig, WebExposure, serve},
+};
 
 /// Browser terminal command-line arguments.
 #[derive(Debug, Parser)]
@@ -77,7 +68,7 @@ enum CliCommand {
 #[derive(Debug, Clone, Args)]
 struct ServeArgs {
     /// Attach to or create this tmux session.
-    #[arg(long, default_value = DEFAULT_SESSION)]
+    #[arg(long, default_value = cli_defaults::DEFAULT_SESSION_NAME)]
     session: String,
     /// Backend for shared session mode.
     #[arg(long, value_enum)]
@@ -106,7 +97,7 @@ struct ServeArgs {
     #[arg(long, default_value_t = false)]
     open: bool,
     /// Browser terminal font size in CSS pixels.
-    #[arg(long, default_value_t = DEFAULT_FONT_SIZE)]
+    #[arg(long, default_value_t = browser_presentation::DEFAULT_FONT_SIZE)]
     font_size: u16,
     /// Browser terminal theme.
     #[arg(long, value_enum, default_value_t = CliTheme::HighContrast)]
@@ -304,7 +295,7 @@ struct WebAttachArgs {
     #[arg(long, default_value_t = false)]
     open: bool,
     /// Browser terminal font size in CSS pixels.
-    #[arg(long, default_value_t = DEFAULT_FONT_SIZE)]
+    #[arg(long, default_value_t = browser_presentation::DEFAULT_FONT_SIZE)]
     font_size: u16,
     /// Browser terminal theme.
     #[arg(long, value_enum, default_value_t = CliTheme::HighContrast)]
@@ -419,8 +410,14 @@ impl TryFrom<WebAttachArgs> for ValidatedWebAttachConfig {
     type Error = anyhow::Error;
 
     fn try_from(args: WebAttachArgs) -> Result<Self, Self::Error> {
-        if !(MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(&args.font_size) {
-            bail!("font size must be in {MIN_FONT_SIZE}..={MAX_FONT_SIZE}");
+        if !(browser_presentation::FONT_SIZE_MIN..=browser_presentation::FONT_SIZE_MAX)
+            .contains(&args.font_size)
+        {
+            bail!(
+                "font size must be in {}..={}",
+                browser_presentation::FONT_SIZE_MIN,
+                browser_presentation::FONT_SIZE_MAX
+            );
         }
         let base_path = match args.base_path.as_deref() {
             Some(value) => Some(BasePath::from_str(value).context("invalid --base-path")?),
@@ -453,8 +450,14 @@ impl TryFrom<ServeArgs> for ValidatedCliConfig {
     type Error = anyhow::Error;
 
     fn try_from(args: ServeArgs) -> Result<Self, Self::Error> {
-        if !(MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(&args.font_size) {
-            bail!("font size must be in {MIN_FONT_SIZE}..={MAX_FONT_SIZE}");
+        if !(browser_presentation::FONT_SIZE_MIN..=browser_presentation::FONT_SIZE_MAX)
+            .contains(&args.font_size)
+        {
+            bail!(
+                "font size must be in {}..={}",
+                browser_presentation::FONT_SIZE_MIN,
+                browser_presentation::FONT_SIZE_MAX
+            );
         }
         if args.backend.is_some() && args.mode.is_some() {
             bail!("--backend cannot be combined with legacy --mode");
@@ -586,7 +589,7 @@ async fn run_legacy_runtime(config: ValidatedCliConfig) -> anyhow::Result<()> {
 
 async fn run_gateway_tmux(config: ValidatedCliConfig, session: SessionName) -> anyhow::Result<()> {
     let backend = TmuxBackend::from_path().context("failed to resolve tmux backend")?;
-    let mut gateway = SessionGateway::new(backend, GATEWAY_LEASE_TTL);
+    let mut gateway = SessionGateway::new(backend, backend_gateway::OPERATION_LOCK_LEASE_TTL);
     let registration = gateway
         .create_or_find_session(
             session.clone(),
@@ -640,7 +643,7 @@ async fn run_web_attach_tmux(config: ValidatedWebAttachConfig) -> anyhow::Result
         .attach_existing_session(&backend_session)
         .await
         .with_context(|| format!("failed to attach tmux session {}", backend_session.as_str()))?;
-    let mut gateway = SessionGateway::new(backend, GATEWAY_LEASE_TTL);
+    let mut gateway = SessionGateway::new(backend, backend_gateway::OPERATION_LOCK_LEASE_TTL);
     gateway
         .register_existing_session(config.session_id.clone(), backend_ref)
         .context("failed to register backend session with gateway")?;
@@ -729,11 +732,18 @@ fn tmux_session_command(
 
 fn termstage_tmux_session_name(name: &str) -> anyhow::Result<SessionName> {
     let name = SessionName::from_str(name).context("invalid session name")?;
-    if name.as_str().starts_with(TERMSTAGE_TMUX_SESSION_PREFIX) {
+    if name
+        .as_str()
+        .starts_with(session_names::TERMSTAGE_TMUX_SESSION_PREFIX)
+    {
         Ok(name)
     } else {
-        SessionName::from_str(&format!("{TERMSTAGE_TMUX_SESSION_PREFIX}{}", name.as_str()))
-            .context("invalid prefixed tmux session name")
+        SessionName::from_str(&format!(
+            "{}{}",
+            session_names::TERMSTAGE_TMUX_SESSION_PREFIX,
+            name.as_str()
+        ))
+        .context("invalid prefixed tmux session name")
     }
 }
 
@@ -770,7 +780,7 @@ fn cli_record_from_tmux_session(session: &SessionName) -> CliSessionRecord {
     let backend_session = session.as_str().to_owned();
     let display_name = session
         .as_str()
-        .strip_prefix(TERMSTAGE_TMUX_SESSION_PREFIX)
+        .strip_prefix(session_names::TERMSTAGE_TMUX_SESSION_PREFIX)
         .unwrap_or(session.as_str())
         .to_owned();
     CliSessionRecord {
@@ -881,8 +891,11 @@ fn validate_token_env_name(value: &str) -> anyhow::Result<()> {
     let Some(first) = bytes.first() else {
         bail!("--token-env must not be empty");
     };
-    if value.len() > TOKEN_ENV_MAX_BYTES {
-        bail!("--token-env must be at most {TOKEN_ENV_MAX_BYTES} bytes");
+    if value.len() > cli_defaults::TOKEN_ENV_MAX_BYTES {
+        bail!(
+            "--token-env must be at most {} bytes",
+            cli_defaults::TOKEN_ENV_MAX_BYTES
+        );
     }
     if !first.is_ascii_uppercase() && *first != b'_' {
         bail!("--token-env must start with A-Z or _");
@@ -897,7 +910,7 @@ fn validate_token_env_name(value: &str) -> anyhow::Result<()> {
 }
 
 async fn wait_for_shutdown_or_runtime_exit(session: &RuntimeSession) -> ShutdownReason {
-    let mut interval = tokio::time::interval(ACTOR_EXIT_POLL_INTERVAL);
+    let mut interval = tokio::time::interval(runtime_supervisor::ACTOR_EXIT_POLL_INTERVAL);
     loop {
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
@@ -919,7 +932,7 @@ async fn wait_for_gateway_shutdown_or_session_end(
     gateway: Arc<Mutex<SessionGateway<TmuxBackend>>>,
     session: SessionName,
 ) {
-    let mut interval = tokio::time::interval(GATEWAY_EXIT_POLL_INTERVAL);
+    let mut interval = tokio::time::interval(backend_gateway::SESSION_EXIT_POLL_INTERVAL);
     loop {
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
@@ -935,7 +948,7 @@ async fn wait_for_gateway_shutdown_or_session_end(
                 };
                 if let Err(error) = result {
                     debug!(%error, session = session.as_str(), "tmux gateway session ended");
-                    tokio::time::sleep(GATEWAY_EXIT_POLL_INTERVAL).await;
+                    tokio::time::sleep(backend_gateway::SESSION_EXIT_POLL_INTERVAL).await;
                     return;
                 }
             }
@@ -984,7 +997,7 @@ fn write_session_list<W: Write>(
     records: &[CliSessionRecord],
 ) -> anyhow::Result<()> {
     let widths = session_list_widths(records);
-    write_session_list_row(output, SESSION_LIST_HEADERS, widths)?;
+    write_session_list_row(output, cli_defaults::SESSION_LIST_HEADERS, widths)?;
     for record in records {
         write_session_list_row(
             output,
@@ -1001,7 +1014,7 @@ fn write_session_list<W: Write>(
 
 fn session_list_widths(records: &[CliSessionRecord]) -> [usize; 3] {
     let [mut id_width, mut backend_width, mut display_name_width] =
-        SESSION_LIST_HEADERS.map(str::len);
+        cli_defaults::SESSION_LIST_HEADERS.map(str::len);
     for record in records {
         id_width = id_width.max(record.id.len());
         backend_width = backend_width.max(record.backend.as_str().len());
@@ -1445,8 +1458,11 @@ async fn read_capped_response(mut stream: TcpStream) -> anyhow::Result<Vec<u8>> 
             .len()
             .checked_add(bytes)
             .context("API response length overflow")?;
-        if next_len > API_RESPONSE_MAX_BYTES {
-            bail!("API response exceeded {API_RESPONSE_MAX_BYTES} bytes");
+        if next_len > api_client::MAX_RESPONSE_BYTES {
+            bail!(
+                "API response exceeded {} bytes",
+                api_client::MAX_RESPONSE_BYTES
+            );
         }
         let Some(slice) = chunk.get(..bytes) else {
             bail!("API response chunk length was invalid");
@@ -1457,12 +1473,12 @@ async fn read_capped_response(mut stream: TcpStream) -> anyhow::Result<Vec<u8>> 
 
 fn parse_http_response(response: &[u8]) -> anyhow::Result<ParsedHttpResponse> {
     let header_end = response
-        .windows(HTTP_HEADER_SEPARATOR.len())
-        .position(|window| window == HTTP_HEADER_SEPARATOR)
+        .windows(api_client::HTTP_HEADER_SEPARATOR.len())
+        .position(|window| window == api_client::HTTP_HEADER_SEPARATOR)
         .context("API response did not contain HTTP headers")?;
     let (header_bytes, body_bytes) = response.split_at(header_end);
     let body_bytes = body_bytes
-        .get(HTTP_HEADER_SEPARATOR.len()..)
+        .get(api_client::HTTP_HEADER_SEPARATOR.len()..)
         .context("API response body offset was invalid")?;
     let headers = std::str::from_utf8(header_bytes).context("API response headers were invalid")?;
     let status = parse_status(headers)?;
@@ -1507,12 +1523,12 @@ fn decode_chunked_body(mut body: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut output = Vec::new();
     loop {
         let line_end = body
-            .windows(HTTP_LINE_SEPARATOR.len())
-            .position(|window| window == HTTP_LINE_SEPARATOR)
+            .windows(api_client::HTTP_LINE_SEPARATOR.len())
+            .position(|window| window == api_client::HTTP_LINE_SEPARATOR)
             .context("chunked response missing chunk size")?;
         let (size_bytes, rest) = body.split_at(line_end);
         let rest = rest
-            .get(HTTP_LINE_SEPARATOR.len()..)
+            .get(api_client::HTTP_LINE_SEPARATOR.len()..)
             .context("chunked response size offset was invalid")?;
         let size_line =
             std::str::from_utf8(size_bytes).context("chunk size was not valid UTF-8")?;
@@ -1527,7 +1543,7 @@ fn decode_chunked_body(mut body: &[u8]) -> anyhow::Result<Vec<u8>> {
             return Ok(output);
         }
         let chunk_end = size
-            .checked_add(HTTP_LINE_SEPARATOR.len())
+            .checked_add(api_client::HTTP_LINE_SEPARATOR.len())
             .context("chunk length overflow")?;
         if rest.len() < chunk_end {
             bail!("chunked response ended before chunk body");
@@ -1539,7 +1555,7 @@ fn decode_chunked_body(mut body: &[u8]) -> anyhow::Result<Vec<u8>> {
         let separator = rest
             .get(size..chunk_end)
             .context("chunked response separator offset was invalid")?;
-        if separator != HTTP_LINE_SEPARATOR {
+        if separator != api_client::HTTP_LINE_SEPARATOR {
             bail!("chunked response chunk was not terminated");
         }
         body = rest
@@ -1696,7 +1712,7 @@ impl From<CliExitPolicy> for ExitPolicy {
 impl Default for ServeArgs {
     fn default() -> Self {
         Self {
-            session: DEFAULT_SESSION.to_owned(),
+            session: cli_defaults::DEFAULT_SESSION_NAME.to_owned(),
             backend: None,
             mode: None,
             command: None,
@@ -1704,7 +1720,7 @@ impl Default for ServeArgs {
             host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 0,
             open: false,
-            font_size: DEFAULT_FONT_SIZE,
+            font_size: browser_presentation::DEFAULT_FONT_SIZE,
             theme: CliTheme::HighContrast,
             keepalive: CliKeepalive::Session,
             exit_policy: None,
@@ -1725,7 +1741,10 @@ mod tests {
         let config = ValidatedCliConfig::try_from(ServeArgs::default())?;
         assert!(config.host.is_loopback());
         assert_eq!(config.port, 0);
-        assert_eq!(config.presentation.font_size, DEFAULT_FONT_SIZE);
+        assert_eq!(
+            config.presentation.font_size,
+            browser_presentation::DEFAULT_FONT_SIZE
+        );
         assert!(matches!(config.exposure, WebExposure::Local));
         assert!(matches!(config.runtime.mode, SessionMode::Tmux { .. }));
         assert_eq!(config.runtime.exit_policy, ExitPolicy::Hold);
@@ -2221,7 +2240,7 @@ mod tests {
     #[test]
     fn test_should_reject_invalid_font_size() {
         let args = ServeArgs {
-            font_size: MAX_FONT_SIZE.saturating_add(1),
+            font_size: browser_presentation::FONT_SIZE_MAX.saturating_add(1),
             ..ServeArgs::default()
         };
         assert!(ValidatedCliConfig::try_from(args).is_err());

@@ -6,14 +6,13 @@ import '@xterm/xterm/css/xterm.css';
 
 import { PresentationSettings, TerminalFontFamily, themePalette } from './presentation';
 import { clampTerminalSize } from './resize';
+import { browserPresentationSettings, browserTerminalSurfaceSettings } from './settings';
 
 export interface TerminalSurface {
   terminal: Terminal;
   fitAddon: FitAddon;
 }
 
-const WHEEL_PIXEL_LINE_HEIGHT = 40;
-const MAX_WHEEL_LINES = 24;
 export async function createTerminalSurface(
   root: HTMLElement,
   settings: PresentationSettings
@@ -31,11 +30,11 @@ export async function createTerminalSurface(
     fontSize: settings.fontSize,
     fontWeight: '400',
     fontWeightBold: '700',
-    lineHeight: 1.08,
+    lineHeight: browserTerminalSurfaceSettings.lineHeight,
     macOptionIsMeta: true,
     minimumContrastRatio: themePalette(settings.theme).minimumContrastRatio,
     rescaleOverlappingGlyphs: true,
-    scrollback: 4000,
+    scrollback: browserTerminalSurfaceSettings.scrollbackLines,
     theme: themePalette(settings.theme)
   });
   const fitAddon = new FitAddon();
@@ -65,7 +64,10 @@ export async function setTerminalFontFamily(
   terminal: Terminal,
   fontFamily: TerminalFontFamily
 ): Promise<void> {
-  await waitForTerminalFonts(fontFamily, terminal.options.fontSize ?? 24);
+  await waitForTerminalFonts(
+    fontFamily,
+    terminal.options.fontSize ?? browserPresentationSettings.defaultFontSize
+  );
   terminal.options.fontFamily = fontFamily.css;
   document.documentElement.style.setProperty('--terminal-font-family', fontFamily.css);
   syncTerminalGeometry(terminal);
@@ -232,7 +234,7 @@ function wheelDeltaToPixels(event: WheelEvent, pageHeight: number): number {
     return Math.sign(event.deltaY) * pageHeight;
   }
   if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) {
-    return event.deltaY * WHEEL_PIXEL_LINE_HEIGHT;
+    return event.deltaY * browserTerminalSurfaceSettings.wheelPixelLineHeight;
   }
   return event.deltaY;
 }
@@ -248,6 +250,6 @@ function wheelDeltaToLines(event: WheelEvent, rows: number): number {
       ? Math.max(1, rows - 1)
       : event.deltaMode === WheelEvent.DOM_DELTA_LINE
         ? Math.max(1, Math.round(magnitude))
-        : Math.max(1, Math.round(magnitude / WHEEL_PIXEL_LINE_HEIGHT));
-  return direction * Math.min(MAX_WHEEL_LINES, lines);
+        : Math.max(1, Math.round(magnitude / browserTerminalSurfaceSettings.wheelPixelLineHeight));
+  return direction * Math.min(browserTerminalSurfaceSettings.maxWheelLines, lines);
 }

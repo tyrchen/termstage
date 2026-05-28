@@ -19,12 +19,8 @@ use crate::{
         BackendScrollDirection, BackendSessionRef, BackendSessionResolution, BackendWindowId,
     },
     protocol::{SafeMessage, SessionName, TerminalSize},
+    settings::tmux_backend as tmux_settings,
 };
-
-const TERMINAL_COLOR_MODE: &str = "truecolor";
-const TERMINAL_PROGRAM: &str = "termstage";
-const TMUX_HISTORY_LIMIT: &str = "100000";
-const DISABLE_COLOR_ENV: [&str; 2] = ["NO_COLOR", "ANSI_COLORS_DISABLED"];
 
 /// tmux backend adapter.
 #[derive(Debug, Clone)]
@@ -292,9 +288,9 @@ impl TmuxBackend {
         };
         let mut process = self.command();
         process
-            .env("COLORTERM", TERMINAL_COLOR_MODE)
+            .env("COLORTERM", tmux_settings::TERMINAL_COLOR_MODE)
             .env("CLICOLOR", "1")
-            .env("TERM_PROGRAM", TERMINAL_PROGRAM)
+            .env("TERM_PROGRAM", tmux_settings::TERMINAL_PROGRAM)
             .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"))
             .env_remove("NO_COLOR")
             .env_remove("ANSI_COLORS_DISABLED")
@@ -307,11 +303,11 @@ impl TmuxBackend {
             .arg("-y")
             .arg(&rows)
             .arg("-e")
-            .arg(format!("COLORTERM={TERMINAL_COLOR_MODE}"))
+            .arg(format!("COLORTERM={}", tmux_settings::TERMINAL_COLOR_MODE))
             .arg("-e")
             .arg("CLICOLOR=1")
             .arg("-e")
-            .arg(format!("TERM_PROGRAM={TERMINAL_PROGRAM}"))
+            .arg(format!("TERM_PROGRAM={}", tmux_settings::TERMINAL_PROGRAM))
             .arg("-e")
             .arg(format!(
                 "TERM_PROGRAM_VERSION={}",
@@ -325,7 +321,7 @@ impl TmuxBackend {
     }
 
     async fn prepare_session(&self, session: &SessionName) -> Result<(), BackendError> {
-        for name in DISABLE_COLOR_ENV {
+        for name in tmux_settings::DISABLE_COLOR_ENV_KEYS {
             self.run(["set-environment", "-t", session.as_str(), "-u", name])
                 .await?;
         }
@@ -334,7 +330,7 @@ impl TmuxBackend {
             "-t",
             session.as_str(),
             "COLORTERM",
-            TERMINAL_COLOR_MODE,
+            tmux_settings::TERMINAL_COLOR_MODE,
         ])
         .await?;
         self.run(["set-environment", "-t", session.as_str(), "CLICOLOR", "1"])
@@ -344,7 +340,7 @@ impl TmuxBackend {
             "-t",
             session.as_str(),
             "TERM_PROGRAM",
-            TERMINAL_PROGRAM,
+            tmux_settings::TERMINAL_PROGRAM,
         ])
         .await?;
         self.run([
@@ -362,7 +358,7 @@ impl TmuxBackend {
             "-t",
             session.as_str(),
             "history-limit",
-            TMUX_HISTORY_LIMIT,
+            tmux_settings::HISTORY_LIMIT,
         ])
         .await
     }
