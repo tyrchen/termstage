@@ -75,8 +75,8 @@ impl GatewayViewport {
     const fn new(size: TerminalSize) -> Self {
         Self {
             size,
-            origin_col: None,
-            origin_row: None,
+            origin_col: Some(0),
+            origin_row: Some(0),
         }
     }
 
@@ -3632,7 +3632,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_render_gateway_snapshot_bottom_when_cursor_is_near_backend_bottom()
+    fn test_should_render_gateway_snapshot_from_top_when_cursor_is_near_backend_bottom()
     -> anyhow::Result<()> {
         let snapshot = BackendScreenSnapshot::new(
             TerminalSize::new(120, 40)?,
@@ -3645,15 +3645,15 @@ mod tests {
         let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
         let text = std::str::from_utf8(bytes.as_ref())?;
 
-        assert!(text.starts_with("\u{1b}[0m\u{1b}[?7l\u{1b}[H\u{1b}[2Jrow-16"));
-        assert!(!text.contains("row-15"));
-        assert!(text.contains("row-39"));
-        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[22;11H"));
+        assert!(text.starts_with("\u{1b}[0m\u{1b}[?7l\u{1b}[H\u{1b}[2Jrow-00"));
+        assert!(text.contains("row-23"));
+        assert!(!text.contains("row-24"));
+        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[24;11H"));
         Ok(())
     }
 
     #[test]
-    fn test_should_project_gateway_snapshot_horizontally() -> anyhow::Result<()> {
+    fn test_should_render_gateway_snapshot_from_left_by_default() -> anyhow::Result<()> {
         let snapshot = BackendScreenSnapshot::new(
             TerminalSize::new(40, 24)?,
             35,
@@ -3665,9 +3665,9 @@ mod tests {
         let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
         let text = std::str::from_utf8(bytes.as_ref())?;
 
-        assert!(text.contains("22222222223333333333"));
-        assert!(!text.contains("0000000000"));
-        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[4;16H"));
+        assert!(text.contains("00000000001111111111"));
+        assert!(!text.contains("2222222222"));
+        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[4;20H"));
         Ok(())
     }
 

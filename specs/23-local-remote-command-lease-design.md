@@ -270,8 +270,10 @@ Projection rules:
 - The gateway reads backend screen size, cursor, lines, and attributes from the
   backend adapter.
 - The gateway maintains browser viewport state: visible `cols`, visible `rows`,
-  horizontal origin, and vertical origin. The initial origin should keep the
-  cursor visible where possible without forcing every screen to bottom-align.
+  horizontal origin, and vertical origin. The initial origin is top-left:
+  column `0`, row `0`. This preserves full-screen application headers such as
+  k9s `Context:` on first attach. The origin changes only after explicit
+  component-local viewport navigation.
 - The binary frame sent to browser xterm must fit the browser viewport. For a
   backend screen wider than the browser viewport, the frame contains the
   selected horizontal slice rather than the entire backend line.

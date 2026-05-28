@@ -120,6 +120,9 @@ Rules:
   and columns from the backend screen according to viewport state, then writes a
   frame that fits the xterm instance. It must not rely on xterm overflow,
   autowrap suppression, or accidental clipping to hide content.
+- The initial projection origin is top-left: column `0`, row `0`. A backend
+  cursor near the right or bottom edge must not cause first attach to crop
+  left-side labels or full-screen headers such as k9s `Context:`.
 - Horizontal and vertical navigation over a larger backend screen is a
   component-local terminal viewport concern. The browser sends viewport-origin
   control frames for this navigation, and future buttons or page content must

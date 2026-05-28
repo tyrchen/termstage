@@ -32,7 +32,8 @@ mode.
 The gateway operation that maps a backend screen into the browser viewport. If
 the backend screen is wider or taller than the browser viewport, projection
 selects a visible slice and translates cursor/input coordinates through the
-current viewport origin.
+current viewport origin. The default origin is the top-left cell of the backend
+screen; explicit viewport navigation moves it.
 
 ## PTY
 
