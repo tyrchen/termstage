@@ -159,7 +159,23 @@ Exit criteria: M6 roadmap criteria pass; browser and Agent API operate the same
 backend session; exactly one controller can write at a time; backend-native local
 attach does not share stdout/stderr with `termstage`.
 
-## 13. Cross-References
+## 13. Phase 9 - CLI Command Groups
+
+Maps to roadmap: follow-up after M6.
+
+| # | Task | Spec | Effort |
+| --- | --- | --- | --- |
+| 9.1 | Move gateway startup under `termstage web start`, remove the top-level `serve` command, and reject root-level startup aliases with clap's missing/unknown subcommand errors. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 1 day |
+| 9.2 | Introduce `--backend <tmux|rmux>` for backend-owned sessions while keeping `--mode shell` as the compatibility path for `--command` / `--command-arg` until an argv-safe backend pane startup primitive exists. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 1 day |
+| 9.3 | Add `termstage session` commands for list, inspect, stop `--detach|--kill`, and attach-info. | [50](./50-browser-terminal-cli-design.md), [70](./70-browser-terminal-security-design.md) | 2 days |
+| 9.4 | Add `termstage api` commands for send-text, send-key, run-command wait/capture, and read-screen as CLI wrappers over the semantic API. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 2 days |
+| 9.5 | Reserve `termstage web` and `termstage auth` command groups for URL/token management and future OIDC login/logout/status flows. | [50](./50-browser-terminal-cli-design.md), [21](./21-browser-terminal-public-exposure-design.md) | 1 day |
+
+Exit criteria: the CLI help is organized by `session`, `api`, `web`, and `auth`
+command groups; legacy root invocation is rejected; parser tests cover command
+grouping and invalid flag placement.
+
+## 14. Cross-References
 
 - Depends on: all numbered browser terminal specs.
 - Pairs with: [90-browser-terminal-roadmap.md](./90-browser-terminal-roadmap.md).

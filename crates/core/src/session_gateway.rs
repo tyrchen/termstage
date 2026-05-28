@@ -30,6 +30,36 @@ pub enum SessionGatewayError {
     Lock(#[from] OperationLockError),
 }
 
+/// Result of registering a backend session with the gateway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRegistration {
+    record: SessionRecord,
+    backend_created: bool,
+}
+
+impl SessionRegistration {
+    /// Creates a session registration result.
+    #[must_use]
+    pub const fn new(record: SessionRecord, backend_created: bool) -> Self {
+        Self {
+            record,
+            backend_created,
+        }
+    }
+
+    /// Returns the registered session record.
+    #[must_use]
+    pub const fn record(&self) -> &SessionRecord {
+        &self.record
+    }
+
+    /// Returns whether the backend created a new session.
+    #[must_use]
+    pub const fn backend_created(&self) -> bool {
+        self.backend_created
+    }
+}
+
 /// Gateway that binds termstage sessions, operation locks, and a backend adapter.
 #[derive(Debug)]
 pub struct SessionGateway<B> {
@@ -66,20 +96,21 @@ where
         termstage_session: SessionName,
         backend_session: SessionName,
         size: TerminalSize,
-    ) -> Result<(), SessionGatewayError> {
+    ) -> Result<SessionRegistration, SessionGatewayError> {
         if self.registry.get(&termstage_session).is_ok() {
             return Err(SessionRegistryError::AlreadyRegistered {
                 session: termstage_session,
             }
             .into());
         }
-        let backend_ref = self
+        let resolution = self
             .backend
             .create_or_find_session(&backend_session, size)
             .await?;
-        self.registry
-            .register(SessionRecord::new(termstage_session, backend_ref))?;
-        Ok(())
+        let backend_created = resolution.created();
+        let record = SessionRecord::new(termstage_session, resolution.into_reference());
+        self.registry.register(record.clone())?;
+        Ok(SessionRegistration::new(record, backend_created))
     }
 
     /// Acquires or renews the Level 1 write lease for a session.
@@ -311,7 +342,8 @@ mod tests {
     use super::*;
     use crate::{
         backend::{
-            BackendKind, BackendPaneId, BackendScrollDirection, BackendSessionRef, BackendWindowId,
+            BackendKind, BackendPaneId, BackendScrollDirection, BackendSessionRef,
+            BackendSessionResolution, BackendWindowId,
         },
         operation_lock::{ControllerId, ControllerKind},
         protocol::SafeMessage,
@@ -346,9 +378,12 @@ mod tests {
             &mut self,
             session: &SessionName,
             _size: TerminalSize,
-        ) -> Result<BackendSessionRef, BackendError> {
+        ) -> Result<BackendSessionResolution, BackendError> {
             self.created.push(session.clone());
-            Self::reference(session)
+            Ok(BackendSessionResolution::new(
+                Self::reference(session)?,
+                true,
+            ))
         }
 
         async fn write_input(
@@ -584,6 +619,23 @@ mod tests {
         ));
         let backend = gateway.into_backend();
         assert_eq!(backend.created, [SessionName::new("backend-demo")?]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_report_backend_created_status() -> anyhow::Result<()> {
+        let mut gateway = SessionGateway::new(FakeBackend::default(), Duration::from_secs(30));
+
+        let registration = gateway
+            .create_or_find_session(
+                SessionName::new("demo")?,
+                SessionName::new("backend-demo")?,
+                TerminalSize::new(80, 24)?,
+            )
+            .await?;
+
+        assert_eq!(registration.record().termstage_session().as_str(), "demo");
+        assert!(registration.backend_created());
         Ok(())
     }
 

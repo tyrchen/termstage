@@ -15,7 +15,7 @@ owns argument parsing, defaults, browser opening, and terminal session mode sele
 M0 command:
 
 ```text
-termstage --session presentation --open
+termstage web start --backend tmux --session presentation --open
 ```
 
 Planned arguments:
@@ -85,6 +85,63 @@ the chosen logging/output convention. Structured logs still redact the token.
 
 The CLI exits on server shutdown. Ctrl-C initiates graceful shutdown: close browser
 connections, stop runtime actors according to keepalive policy, and join tasks.
+
+## 4a. CLI Command Groups
+
+The current `--mode <tmux|shell>` surface is a compatibility shape. The
+backend-session gateway design should move the CLI toward explicit subcommands
+and make backend selection separate from command/session creation.
+
+Target top-level command groups:
+
+| Group | Purpose | Initial commands |
+| --- | --- | --- |
+| `termstage session` | Manage backend sessions visible through the selected adapter. The first implementation supports tmux sessions directly; a persistent cross-process termstage registry is future work. | `session list`, `session inspect <name>`, `session stop <name> --detach|--kill`, `session attach-info <name>` |
+| `termstage api` | CLI wrapper for semantic operations used by agents and automation. | `api send-text`, `api send-key`, `api run-command --wait-for --capture`, `api read-screen` |
+| `termstage web` | Start the browser/API gateway and manage URL/token helper surfaces. | `web start --backend <tmux|rmux> --session <name> --open`, `web url`, `web token generate`; future token revocation |
+| `termstage auth` | Inspect or manage authentication state. | `auth status`; future `auth login/logout` |
+
+Design rules:
+
+- `--backend <tmux|rmux>` chooses the owner of the actual session/pane/PTY. It
+  should replace `--mode tmux` as the long-term backend selector.
+- `--command <cmd>` and `-g, --command-arg <arg>` remain available only for
+  compatibility `--mode shell` until the backend adapter exposes an argv-safe
+  pane startup primitive. They must not be implemented by concatenating a shell
+  command string for a backend pane.
+- `--session <name>` names the shared backend session. If the session already
+  exists, the default should be create-or-reuse and the CLI must clearly report
+  whether the command was started or the existing session was reused.
+- `web start` sizes newly created backend panes from the invoking terminal when
+  that size is detectable. In backend-owned gateway mode, browser viewport
+  changes must not resize the backend pane because local native attaches should
+  remain governed by the backend client size policy.
+- Backend-native attaches, such as `tmux attach -t <session>`, are treated as
+  terminal control for the browser toolbar. While a native client is attached,
+  browser input is read-only and visual-only mouse selection in the native
+  terminal is not mirrored to the browser.
+- The browser snapshot stream preserves terminal color attributes emitted by
+  the backend. Backend-local selection highlights are transient client UI and
+  are not part of the shared screen model.
+- `web start` exits when the backend session disappears, for example when the
+  tmux session is killed, instead of keeping the web server alive indefinitely.
+- `termstage`'s invoking terminal remains a supervisor surface for URL, status,
+  health, and errors. Local viewing stays backend-native, for example
+  `tmux attach -t <session>` or `rmux attach -t <session>`.
+- Running `termstage` without a command group must fail with clap's missing
+  subcommand error. Root-level gateway flags are not a compatibility alias.
+
+Registry persistence:
+
+- tmux direct discovery does not require a termstage-owned file because tmux is
+  the source of truth for existing sessions.
+- A future cross-backend termstage registry should persist only non-secret
+  metadata, such as termstage session id, backend kind, backend session/window/pane
+  reference, timestamps, and labels. It must not store bearer tokens in cleartext.
+- Local single-host persistence should use the platform state/config directory
+  with owner-only permissions and atomic file replacement. EKS or multi-process
+  deployments should use a shared control-plane store instead of a per-pod
+  `~/.termstage/session.json` file.
 
 ## 5. AGENTS.md Binding
 
