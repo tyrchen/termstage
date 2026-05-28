@@ -55,6 +55,7 @@ const SESSION_LABEL_MAX_BYTES: usize = 64;
 const SESSION_CREATED_AT_MAX_BYTES: usize = 64;
 const SESSION_COMMAND_MAX_ARGS: usize = 256;
 const SESSION_COMMAND_ARG_MAX_BYTES: usize = 4096;
+const SESSION_LIST_HEADER: &str = "SESSION_ID\tBACKEND\tNAME\tBACKEND_SESSION";
 
 /// Browser terminal command-line arguments.
 #[derive(Debug, Parser)]
@@ -1123,6 +1124,7 @@ async fn run_session_command(args: SessionArgs) -> anyhow::Result<()> {
             let path = session_registry_path()?;
             let registry = load_session_registry(&path).await?;
             let mut stdout = io::stdout().lock();
+            writeln!(stdout, "{SESSION_LIST_HEADER}").context("failed to write session list")?;
             for record in registry
                 .sessions
                 .iter()
