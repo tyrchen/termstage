@@ -2,7 +2,7 @@
 
 Status: draft v1
 Owner: termstage
-Last updated: 2026-05-19
+Last updated: 2026-05-28
 
 Each decision is permanent. Supersede with a new decision rather than editing history
 after implementation begins.
@@ -107,3 +107,24 @@ after implementation begins.
 - Pinned by: [23-local-remote-command-lease-design.md](./23-local-remote-command-lease-design.md),
   [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md).
 - Date: 2026-05-27.
+
+## D9 - Browser Xterm Fits Its Embedded Container
+
+- Context: Browser UI sizing for backend-owned sessions, where a tmux/rmux pane
+  may be wider or taller than the browser terminal container.
+- Alternatives considered: resize backend panes whenever the browser container
+  changes, make xterm DOM grow to backend pane size with native DOM overflow, or
+  keep xterm fit to its embedded container and project backend screens into that
+  viewport.
+- Decision: xterm fits the terminal container allocated by the page. Backend
+  screen size remains backend-owned, and `termstage` projects backend snapshots
+  into the browser viewport.
+- Why: The terminal is a reusable page component, not the whole browser page.
+  Future UI may add buttons, nav, sidebars, or other HTML around it. Browser
+  layout changes should not resize backend sessions or break native attach
+  clients, while wider backend screens must still be navigable from the
+  embedded terminal component.
+- Pinned by: [20-browser-terminal-web-design.md](./20-browser-terminal-web-design.md),
+  [23-local-remote-command-lease-design.md](./23-local-remote-command-lease-design.md),
+  [72-browser-terminal-verification-plan.md](./72-browser-terminal-verification-plan.md).
+- Date: 2026-05-28.

@@ -58,7 +58,7 @@ Versions verified on 2026-05-19. Phase 0 validation evidence is in
 | `secrecy` | `0.10.3` | core/server | Token redaction and explicit exposure. |
 | `getrandom` | `0.3` | core/server | CSPRNG token generation. |
 | `@xterm/xterm` | `6.0.0` | frontend | Use scoped package; legacy `xterm` package is deprecated. |
-| `@xterm/addon-fit` | `0.11.0` | frontend | Fit terminal to browser viewport. |
+| `@xterm/addon-fit` | `0.11.0` | frontend | Fit terminal to its embedded container viewport. |
 | `@xterm/addon-web-links` | `0.12.0` | frontend | Link detection. |
 | `@xterm/addon-webgl` | `0.19.0` | frontend optional | Optional renderer feature, not required for M0. |
 

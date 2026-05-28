@@ -1,7 +1,7 @@
 import { Terminal } from '@xterm/xterm';
 
 import { ConnectionStatus } from './connection-status';
-import { TerminalSize } from './resize';
+import { TerminalSize, clampTerminalSize } from './resize';
 import { scrollTerminalViewportToContentEnd, writeTerminalOutput } from './terminal';
 
 interface ResizeControlMessage {
@@ -19,10 +19,26 @@ interface AcquireControlMessage {
   type: 'acquireControl';
 }
 
-type ClientControlMessage = ResizeControlMessage | HeartbeatControlMessage | AcquireControlMessage;
+interface ViewportControlMessage {
+  type: 'viewport';
+  col?: number;
+  row?: number;
+}
+
+type ClientControlMessage =
+  | ResizeControlMessage
+  | HeartbeatControlMessage
+  | AcquireControlMessage
+  | ViewportControlMessage;
+
+export interface TerminalViewportOrigin {
+  col?: number;
+  row?: number;
+}
 
 export interface TerminalSocket {
   sendResize: (size: TerminalSize) => void;
+  sendViewport: (origin: TerminalViewportOrigin) => void;
   close: () => void;
 }
 
@@ -41,7 +57,7 @@ const RUNTIME_ERROR_REASON = 'runtime error';
 const CLIENT_DISCONNECTED_REASON = 'client disconnected';
 const CONTROLLER_REPLACED_REASON = 'controller replaced';
 const BROWSER_BACKPRESSURE_REASON = 'browser client backpressure';
-const ACQUIRE_CONTROL_THROTTLE_MS = 250;
+const ACQUIRE_CONTROL_THROTTLE_MS = 50;
 const PENDING_ACQUIRE_INPUT_TTL_MS = 1000;
 const PENDING_ACQUIRE_INPUT_MAX_CHARS = 4096;
 
@@ -60,7 +76,7 @@ export function connectTerminalSocket(
   let reconnectAttempt = 0;
   let closedByClient = false;
   let terminalEnded = false;
-  let lastSize: TerminalSize = { cols: terminal.cols, rows: terminal.rows };
+  let lastSize: TerminalSize = clampTerminalSize({ cols: terminal.cols, rows: terminal.rows });
   let socket = openSocket();
   let inputForwardingSuppressed = true;
   let leaseOwner: 'terminal' | 'browser' | 'agent' = 'terminal';
@@ -69,7 +85,11 @@ export function connectTerminalSocket(
   let pendingAcquireInputExpiresAt = 0;
 
   const disposable = terminal.onData((data: string) => {
-    if (inputForwardingSuppressed || socket.readyState !== WebSocket.OPEN) {
+    if (socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    if (inputForwardingSuppressed) {
+      queuePendingAcquireInput(data);
       return;
     }
     if (leaseOwner === 'browser') {
@@ -83,8 +103,11 @@ export function connectTerminalSocket(
 
   return {
     sendResize: (size: TerminalSize) => {
-      lastSize = size;
-      sendControl(socket, { type: 'resize', cols: size.cols, rows: size.rows });
+      lastSize = clampTerminalSize(size);
+      sendControl(socket, { type: 'resize', cols: lastSize.cols, rows: lastSize.rows });
+    },
+    sendViewport: (origin: TerminalViewportOrigin) => {
+      sendControl(socket, { type: 'viewport', ...origin });
     },
     close: () => {
       closedByClient = true;
@@ -193,6 +216,7 @@ export function connectTerminalSocket(
     terminal.write('', () => {
       scrollTerminalViewportToContentEnd(terminal);
       setInputForwardingSuppressed(false);
+      resumePendingInput();
     });
   }
 
@@ -240,6 +264,17 @@ export function connectTerminalSocket(
   function clearPendingAcquireInput(): void {
     pendingAcquireInput = '';
     pendingAcquireInputExpiresAt = 0;
+  }
+
+  function resumePendingInput(): void {
+    if (pendingAcquireInput.length === 0) {
+      return;
+    }
+    if (leaseOwner === 'browser') {
+      flushPendingAcquireInput();
+    } else {
+      requestBrowserControl();
+    }
   }
 
   function currentSocketUrl(): string {

@@ -8,6 +8,33 @@ Owner: termstage
 The Chrome-hosted xterm.js UI plus WebSocket client code. It is not the terminal
 emulator implementation in Rust and it is not a sandbox.
 
+## Embedded terminal component
+
+The page component that contains xterm.js. It fits the HTML element allocated by
+the page layout and can coexist with nav bars, buttons, sidebars, or other future
+HTML. Its scroll and viewport interactions are scoped to the component, not to
+the entire document.
+
+## Browser viewport
+
+The rows and columns currently visible inside the embedded terminal component,
+derived from the terminal container's CSS size, font family, font size, and line
+height. Browser viewport size is not automatically the backend pane size.
+
+## Backend screen
+
+The rows and columns owned by a backend pane, such as a tmux or rmux pane. It is
+the source of truth for terminal application layout in backend-owned gateway
+mode.
+
+## Viewport projection
+
+The gateway operation that maps a backend screen into the browser viewport. If
+the backend screen is wider or taller than the browser viewport, projection
+selects a visible slice and translates cursor/input coordinates through the
+current viewport origin. The default origin is the top-left cell of the backend
+screen; explicit viewport navigation moves it.
+
 ## PTY
 
 The operating-system pseudo-terminal pair used to make shells and terminal programs

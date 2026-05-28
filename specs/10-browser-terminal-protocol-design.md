@@ -7,9 +7,10 @@ Depends on: [00-browser-terminal-prd.md](./00-browser-terminal-prd.md)
 ## 1. Purpose
 
 This spec owns the wire protocol between the browser terminal and the local Rust
-server. The protocol is intentionally small: binary WebSocket frames carry raw PTY
-bytes, and text WebSocket frames carry validated JSON control messages. This keeps
-terminal behavior byte-accurate while making resize and lifecycle messages explicit.
+server. The protocol is intentionally small: binary WebSocket frames carry raw
+terminal bytes, and text WebSocket frames carry validated JSON control messages.
+This keeps terminal behavior byte-accurate while making viewport size, backend
+resize, and lifecycle messages explicit.
 
 ## 2. Interface
 
@@ -23,11 +24,17 @@ Binary frame:
 
 Text frame:
   JSON control message using camelCase fields
+  - `resize` updates the embedded terminal viewport size.
+  - `viewport` updates the browser-local backend-screen origin.
+  - `heartbeat` keeps the socket alive.
+  - `acquireControl` requests the input lease.
 
 Server -> Browser
 
 Binary frame:
-  raw PTY output bytes for xterm.js term.write()
+  terminal bytes for xterm.js term.write()
+  - runtime mode: raw PTY output
+  - gateway mode: projected backend-screen frame
 
 Text frame:
   JSON status/error control message
@@ -44,6 +51,8 @@ per `AGENTS.md` input validation guidance.
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ClientControlMessage {
     Resize { cols: TerminalCols, rows: TerminalRows },
+    Viewport { col: Option<ViewportOrigin>, row: Option<ViewportOrigin> },
+    AcquireControl,
     Heartbeat { sequence: HeartbeatSequence },
 }
 
@@ -63,6 +72,7 @@ Required newtypes:
 | `SessionName` | ASCII `[A-Za-z0-9_.-]`, 1..=64 bytes. |
 | `TerminalCols` | Integer range 20..=300. |
 | `TerminalRows` | Integer range 5..=120. |
+| `ViewportOrigin` | Zero-based backend-screen row/column origin, integer range 0..=10000. |
 | `HeartbeatSequence` | Monotonic `u64`; overflow closes the connection with a protocol error. |
 | `SafeMessage` | Server-generated only; max 512 bytes; no secrets. |
 | `AccessToken` | 256-bit CSPRNG token, redacted in `Debug`, compared constant-time. |
@@ -70,7 +80,7 @@ Required newtypes:
 ### 2.3 Flow
 
 ```text
-Browser                         Server                         PTY Actor
+Browser                         Server                         Runtime/Gateway
   |                               |                               |
   | 1. GET /?token=... ---------->|                               |
   |                               | 2. Validate token/host/origin |
@@ -79,8 +89,9 @@ Browser                         Server                         PTY Actor
   |                               | 4. Upgrade after validation   |
   |                               |                               |
   | 5. resize JSON -------------->|                               |
-  |                               | 6. Validate cols/rows -------->|
-  |                               |                               | resize PTY
+  |    browser viewport size      | 6. Validate cols/rows         |
+  |                               |    runtime mode: resize PTY ->| resize PTY
+  |                               |    gateway mode: store viewport
   | 7. input bytes -------------->|                               |
   |                               | 8. Forward bytes ------------->| write master
   |                               |                               |
@@ -96,9 +107,16 @@ Browser                         Server                         PTY Actor
 - Raw terminal input and output are never wrapped in JSON.
 - Every JSON text frame is schema-validated and size-limited before use.
 - Unknown control message fields are rejected.
-- Resize dimensions are valid domain newtypes before reaching the PTY actor.
+- Resize dimensions are valid domain newtypes before reaching runtime or gateway
+  state.
 - Tokens never appear in logs, debug output, browser-visible errors, or panic messages.
 - The protocol supports reconnect without changing the PTY byte contract.
+- Browser resize means "the embedded xterm viewport can currently display this
+  many rows/columns." Applying that size to a PTY or backend pane is a
+  session-mode decision, not an unconditional protocol rule.
+- Browser viewport origin means "the embedded terminal component is viewing this
+  zero-based row/column slice of a backend-owned screen." It is browser-local
+  gateway state and is ignored by runtime-owned PTY mode.
 
 ## 4. Behavior
 
@@ -108,8 +126,11 @@ frame size limits from [20-browser-terminal-web-design.md](./20-browser-terminal
 Invalid text frames produce `ServerControlMessage::Error` and close the WebSocket
 with a protocol close code. The server does not attempt to sanitize malformed JSON.
 
-Resize events are debounced in the browser, but the server remains correct if resize
-messages arrive rapidly. The PTY actor processes them sequentially in mailbox order.
+Resize events are debounced in the browser, but the server remains correct if
+resize messages arrive rapidly. In runtime-owned PTY mode, the PTY actor
+processes them sequentially in mailbox order. In backend-owned gateway mode,
+the gateway stores them as browser viewport state and uses them when projecting
+backend screen snapshots into the browser xterm.
 
 ## 5. AGENTS.md Binding
 

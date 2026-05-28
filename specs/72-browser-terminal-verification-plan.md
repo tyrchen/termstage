@@ -36,7 +36,8 @@ ad hoc scripts should become the primary automation entry point.
 | Protocol validation | Valid/invalid resize ranges, unknown JSON fields, frame type handling, redacted token debug. |
 | Runtime lifecycle | Start shell, start tmux, attach/detach, resize, child exit, graceful Ctrl-C shutdown. |
 | Web routes | `/`, `/assets`, `/ws`, `/healthz`, invalid token, invalid Host, invalid Origin. |
-| Browser UI | xterm renders, sends input bytes, receives output bytes, resizes on viewport changes. |
+| Browser UI | xterm renders, sends input bytes, receives output bytes, fits its container, and treats resize as embedded viewport state. |
+| Backend viewport projection | Backend-owned sessions with a wider/taller pane project into the browser viewport without accidental clipping, wrapping, or document-level scrolling. |
 | Terminal compatibility | `printf`, Ctrl-C, paste, `less`, `vim` smoke where environment supports it. |
 | Security | Non-loopback bind rejected unless public mode is explicit, peer checks, public Host/Origin checks, token-env parsing, frame caps, no CDN assets, no token in logs. |
 
@@ -47,15 +48,30 @@ Use Playwright once frontend assets exist. Required screenshots:
 - Desktop presentation viewport.
 - Narrow browser viewport.
 - Terminal after command output.
+- Embedded layout with toolbar plus terminal container.
+- Backend-owned tmux screen wider than the browser terminal container.
 
 The test must assert that the terminal canvas/DOM is non-empty and that user input
 round-trips to PTY output.
+
+For backend-owned gateway sessions, browser verification must also assert:
+
+- xterm fills the terminal container, not the whole document and not the backend
+  pane pixel size;
+- document `body` does not scroll during terminal scroll gestures;
+- terminal scroll or future viewport controls are scoped to the terminal
+  component;
+- browser resize does not resize the backend tmux/rmux pane;
+- a backend screen wider than the browser viewport remains navigable through
+  deterministic viewport projection, so right-side columns such as k9s `AGE` /
+  `AGED` are not permanently inaccessible.
 
 ## 5. Exit Criteria by Milestone
 
 - M0: CLI starts loopback server, browser connects, interactive shell/tmux works, and
   all security negative route tests pass.
-- M1: presentation UX presets pass visual smoke checks and resize tests.
+- M1: presentation UX presets pass visual smoke checks, embedded container fit
+  tests, and resize tests.
 - M2: reconnect to tmux-backed session preserves state across browser refresh.
 - M3: hardening gates include `cargo audit`, `cargo deny check`, and documented release
   packaging checks.

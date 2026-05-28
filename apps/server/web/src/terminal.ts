@@ -5,6 +5,7 @@ import { Terminal } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 
 import { PresentationSettings, TerminalFontFamily, themePalette } from './presentation';
+import { clampTerminalSize } from './resize';
 
 export interface TerminalSurface {
   terminal: Terminal;
@@ -32,6 +33,7 @@ export async function createTerminalSurface(
     fontWeightBold: '700',
     lineHeight: 1.08,
     macOptionIsMeta: true,
+    minimumContrastRatio: themePalette(settings.theme).minimumContrastRatio,
     rescaleOverlappingGlyphs: true,
     scrollback: 4000,
     theme: themePalette(settings.theme)
@@ -46,6 +48,7 @@ export async function createTerminalSurface(
   terminal.open(root);
   attachScrollbackWheelHandler(terminal);
   fitAddon.fit();
+  resizeTerminalSurface(terminal, clampTerminalSize({ cols: terminal.cols, rows: terminal.rows }));
   syncTerminalGeometry(terminal);
   terminal.focus();
   return { terminal, fitAddon };
