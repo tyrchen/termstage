@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 declare global {
   interface Window {
     __termstageMockSocketCount?: number;
+    __termstageObservedResizeMessages?: string[];
+    __termstageObservedSocketCloseCount?: number;
   }
 }
 
@@ -80,6 +82,89 @@ test('terminal app renders common Unicode terminal glyphs', async ({ page }, tes
   }
 });
 
+test('terminal app keeps viewport stable when font size crosses a column boundary', async ({
+  page
+}, testInfo) => {
+  const server = await startTermstageServer();
+  try {
+    testInfo.attach('launch-url-redacted', {
+      body: server.url.replace(/token=[^&]+/, 'token=[REDACTED]'),
+      contentType: 'text/plain'
+    });
+    await page.setViewportSize({ width: 1525, height: 900 });
+    await page.goto(server.url.replace(/fontSize=\d+/, 'fontSize=13'));
+    await expect(page.locator('.xterm')).toBeVisible();
+    await expectTerminalViewportNotOverflowing(page);
+    await page.getByRole('button', { name: 'Increase font size' }).click();
+    await expect(page.getByRole('navigation', { name: 'Terminal session' })).toContainText(
+      '14px'
+    );
+    await expectTerminalViewportNotOverflowing(page);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('terminal app keeps websocket connected when the viewport is shorter than protocol minimum rows', async ({
+  page
+}, testInfo) => {
+  const server = await startTermstageServer();
+  try {
+    testInfo.attach('launch-url-redacted', {
+      body: server.url.replace(/token=[^&]+/, 'token=[REDACTED]'),
+      contentType: 'text/plain'
+    });
+    await page.addInitScript(() => {
+      const NativeWebSocket = window.WebSocket;
+      window.__termstageObservedResizeMessages = [];
+      window.__termstageObservedSocketCloseCount = 0;
+
+      class ObservedTerminalWebSocket extends NativeWebSocket {
+        constructor(url: string | URL, protocols?: string | string[]) {
+          if (protocols === undefined) {
+            super(url);
+          } else {
+            super(url, protocols);
+          }
+          this.addEventListener('close', () => {
+            window.__termstageObservedSocketCloseCount =
+              (window.__termstageObservedSocketCloseCount ?? 0) + 1;
+          });
+        }
+
+        override send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void {
+          if (typeof data === 'string' && data.includes('"type":"resize"')) {
+            window.__termstageObservedResizeMessages?.push(data);
+          }
+          super.send(data);
+        }
+      }
+
+      window.WebSocket = ObservedTerminalWebSocket as unknown as typeof WebSocket;
+    });
+    await page.setViewportSize({ width: 1024, height: 128 });
+    const url = new URL(server.url);
+    url.searchParams.set('fontFamily', 'monospace');
+    url.searchParams.set('fontSize', '18');
+    await page.goto(url.toString());
+    await expect(page.locator('.xterm')).toBeVisible();
+    await page.waitForTimeout(800);
+    await expect(page.getByRole('dialog')).toBeHidden();
+    expect(await page.evaluate(() => window.__termstageObservedSocketCloseCount ?? 0)).toBe(0);
+    const resizeMessages = await page.evaluate(
+      () => window.__termstageObservedResizeMessages ?? []
+    );
+    expect(resizeMessages.length).toBeGreaterThan(0);
+    for (const message of resizeMessages) {
+      const resize = JSON.parse(message) as { cols?: unknown; rows?: unknown };
+      expect(resize.cols).toBeGreaterThanOrEqual(20);
+      expect(resize.rows).toBeGreaterThanOrEqual(5);
+    }
+  } finally {
+    await server.stop();
+  }
+});
+
 test('terminal app scrolls through browser wheel input', async ({ page }, testInfo) => {
   const server = await startTermstageServer();
   try {
@@ -121,6 +206,7 @@ test('terminal app stops reconnecting when another browser takes over', async ({
     });
     await page.goto(server.url);
     await expect(page.locator('.xterm')).toBeVisible();
+    await page.locator('.xterm').click();
     await page.keyboard.type('printf controller-before-replace');
     await page.keyboard.press('Enter');
     await expect(page.locator('.xterm-rows')).toContainText('controller-before-replace');
@@ -128,6 +214,7 @@ test('terminal app stops reconnecting when another browser takes over', async ({
     await secondPage.goto(server.url);
     await expect(secondPage.locator('.xterm')).toBeVisible();
     await expect(page.getByRole('dialog')).toContainText('Session attached elsewhere');
+    await secondPage.locator('.xterm').click();
     await secondPage.keyboard.type('printf controller-after-replace');
     await secondPage.keyboard.press('Enter');
     await expect(secondPage.locator('.xterm-rows')).toContainText('controller-after-replace');
@@ -250,6 +337,26 @@ test('terminal app shows lost-connectivity status when server disappears', async
     }
   }
 });
+
+async function expectTerminalViewportNotOverflowing(page: Page): Promise<void> {
+  const metrics = await page.evaluate(() => {
+    const viewport = document.querySelector<HTMLElement>('.terminal-viewport');
+    const xterm = document.querySelector<HTMLElement>('.xterm');
+    return {
+      viewportClientWidth: viewport?.clientWidth ?? 0,
+      viewportScrollWidth: viewport?.scrollWidth ?? 0,
+      viewportClientHeight: viewport?.clientHeight ?? 0,
+      viewportScrollHeight: viewport?.scrollHeight ?? 0,
+      xtermWidth: xterm?.getBoundingClientRect().width ?? 0,
+      xtermHeight: xterm?.getBoundingClientRect().height ?? 0
+    };
+  });
+
+  expect(metrics.viewportScrollWidth).toBeLessThanOrEqual(metrics.viewportClientWidth);
+  expect(metrics.viewportScrollHeight).toBeLessThanOrEqual(metrics.viewportClientHeight);
+  expect(metrics.xtermWidth).toBeLessThanOrEqual(metrics.viewportClientWidth);
+  expect(metrics.xtermHeight).toBeLessThanOrEqual(metrics.viewportClientHeight);
+}
 
 async function startTermstageServer(): Promise<{
   url: string;

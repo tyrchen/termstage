@@ -579,7 +579,7 @@ impl BackendAdapter for TmuxBackend {
                 "-p",
                 "-t",
                 target.pane().as_str(),
-                "#{pane_width} #{pane_height} #{cursor_x} #{cursor_y}",
+                "#{pane_width} #{pane_height} #{cursor_x} #{cursor_y} #{cursor_flag}",
             ])
             .output()
             .await
@@ -610,6 +610,10 @@ impl BackendAdapter for TmuxBackend {
         let size = TerminalSize::new(parse_u16(cols)?, parse_u16(rows)?)?;
         let cursor_col = parse_u16(cursor_col)?;
         let cursor_row = parse_u16(cursor_row)?;
+        let cursor_visible = match parts.next() {
+            Some(cursor_flag) => parse_u16(cursor_flag)? > 0,
+            None => true,
+        };
         let output = self
             .command()
             .args(["capture-pane", "-e", "-p", "-t", target.pane().as_str()])
@@ -618,8 +622,12 @@ impl BackendAdapter for TmuxBackend {
             .map_err(BackendError::Io)?;
         let text = Self::success_stdout(output, "tmux capture-pane failed")?;
         let lines = text.lines().map(ToOwned::to_owned).collect();
-        Ok(BackendScreenSnapshot::new(
-            size, cursor_col, cursor_row, lines,
+        Ok(BackendScreenSnapshot::new_with_cursor_visibility(
+            size,
+            cursor_col,
+            cursor_row,
+            cursor_visible,
+            lines,
         ))
     }
 

@@ -159,6 +159,7 @@ pub struct BackendScreenSnapshot {
     size: TerminalSize,
     cursor_col: u16,
     cursor_row: u16,
+    cursor_visible: bool,
     lines: Vec<String>,
 }
 
@@ -170,6 +171,25 @@ impl BackendScreenSnapshot {
             size,
             cursor_col,
             cursor_row,
+            cursor_visible: true,
+            lines,
+        }
+    }
+
+    /// Creates a backend screen snapshot with explicit cursor visibility.
+    #[must_use]
+    pub fn new_with_cursor_visibility(
+        size: TerminalSize,
+        cursor_col: u16,
+        cursor_row: u16,
+        cursor_visible: bool,
+        lines: Vec<String>,
+    ) -> Self {
+        Self {
+            size,
+            cursor_col,
+            cursor_row,
+            cursor_visible,
             lines,
         }
     }
@@ -190,6 +210,12 @@ impl BackendScreenSnapshot {
     #[must_use]
     pub const fn cursor_row(&self) -> u16 {
         self.cursor_row
+    }
+
+    /// Returns whether the backend cursor is visible.
+    #[must_use]
+    pub const fn cursor_visible(&self) -> bool {
+        self.cursor_visible
     }
 
     /// Returns screen lines.
@@ -402,7 +428,17 @@ mod tests {
         assert_eq!(snapshot.size(), TerminalSize::new(80, 24)?);
         assert_eq!(snapshot.cursor_col(), 4);
         assert_eq!(snapshot.cursor_row(), 3);
+        assert!(snapshot.cursor_visible());
         assert_eq!(snapshot.lines(), ["prompt"]);
+
+        let hidden_cursor = BackendScreenSnapshot::new_with_cursor_visibility(
+            TerminalSize::new(80, 24)?,
+            4,
+            3,
+            false,
+            vec!["prompt".to_owned()],
+        );
+        assert!(!hidden_cursor.cursor_visible());
         Ok(())
     }
 }

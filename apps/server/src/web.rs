@@ -29,8 +29,9 @@ use termstage_core::{
     backend::{BackendScreenSnapshot, BackendScrollDirection},
     operation_lock::{ControllerId, ControllerKind, ControllerRef, OperationLockError},
     protocol::{
-        AccessToken, ClientControlMessage, ErrorCode, LeaseOwner, SafeMessage,
-        ServerControlMessage, SessionName, TerminalSize, ViewportOrigin,
+        AccessToken, ClientControlMessage, ErrorCode, HeartbeatSequence, LeaseOwner, ProtocolError,
+        SafeMessage, ServerControlMessage, SessionName, TerminalCols, TerminalRows, TerminalSize,
+        ViewportOrigin,
     },
     runtime::{ClientId, RuntimeCommand, RuntimeConfig},
     security::{
@@ -120,7 +121,9 @@ const SEMANTIC_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CLIENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 const CLIENT_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const SERVER_PING_INTERVAL: Duration = Duration::from_secs(25);
-const GATEWAY_SCREEN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const GATEWAY_SCREEN_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const GATEWAY_SCREEN_ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const GATEWAY_SCREEN_ACTIVE_POLL_WINDOW: Duration = Duration::from_secs(2);
 const SERVER_PING_PAYLOAD: &[u8] = b"termstage";
 const TUNNEL_CHANNEL_CAPACITY: usize = 32;
 const CLOSE_REASON_SESSION_ENDED: &str = "session ended";
@@ -503,9 +506,47 @@ impl TokenQuery {
         let (Some(cols), Some(rows)) = (self.cols, self.rows) else {
             return None;
         };
-        TerminalSize::new(cols, rows).ok().map(GatewayViewport::new)
+        clamped_browser_terminal_size(cols, rows)
+            .ok()
+            .map(GatewayViewport::new)
     }
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+enum WireClientControlMessage {
+    AcquireControl,
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    Viewport {
+        #[serde(default)]
+        col: Option<ViewportOrigin>,
+        #[serde(default)]
+        row: Option<ViewportOrigin>,
+    },
+    Heartbeat {
+        sequence: HeartbeatSequence,
+    },
+}
+
+#[derive(Debug)]
+enum ClientControlDecodeError {
+    Json(serde_json::Error),
+    Protocol(ProtocolError),
+}
+
+impl fmt::Display for ClientControlDecodeError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Json(error) => write!(formatter, "{error}"),
+            Self::Protocol(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ClientControlDecodeError {}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -590,6 +631,7 @@ struct ScreenResponse {
     size: TerminalSize,
     cursor_col: u16,
     cursor_row: u16,
+    cursor_visible: bool,
     lines: Vec<String>,
 }
 
@@ -926,12 +968,14 @@ async fn bridge_gateway_socket(
     let mut last_screen = Bytes::new();
     let mut heartbeat_check = time::interval(CLIENT_HEARTBEAT_CHECK_INTERVAL);
     let mut server_ping = time::interval(SERVER_PING_INTERVAL);
-    let mut screen_poll = time::interval(GATEWAY_SCREEN_POLL_INTERVAL);
+    let mut screen_poll = time::interval(GATEWAY_SCREEN_IDLE_POLL_INTERVAL);
+    let mut active_screen_poll = time::interval(GATEWAY_SCREEN_ACTIVE_POLL_INTERVAL);
+    let mut active_screen_poll_until: Option<Instant> = None;
     loop {
         tokio::select! {
             Some(message) = receiver.next() => {
                 last_client_message = Instant::now();
-                if handle_gateway_browser_message(
+                let action = handle_gateway_browser_message(
                     message,
                     &gateway,
                     &session,
@@ -939,21 +983,28 @@ async fn bridge_gateway_socket(
                     &mut lease,
                     &mut browser_viewport,
                     &mut sender,
-                ).await.should_close() {
+                ).await;
+                if action.should_close() {
+                    break;
+                }
+                if action.should_refresh() {
+                    active_screen_poll_until = Some(Instant::now() + GATEWAY_SCREEN_ACTIVE_POLL_WINDOW);
+                    if poll_gateway_screen(&gateway, &session, controller, &mut lease, browser_viewport, &mut sender, &mut last_screen).await.should_close() {
+                        break;
+                    }
+                }
+            }
+            _ = screen_poll.tick(), if active_screen_poll_until.is_none() => {
+                if poll_gateway_screen(&gateway, &session, controller, &mut lease, browser_viewport, &mut sender, &mut last_screen).await.should_close() {
                     break;
                 }
             }
-            _ = screen_poll.tick() => {
-                if sync_gateway_browser_lease(
-                    &gateway,
-                    &session,
-                    controller,
-                    &mut lease,
-                    &mut sender,
-                ).await.should_close() {
-                    break;
+            _ = active_screen_poll.tick(), if active_screen_poll_until.is_some() => {
+                if active_screen_poll_until.is_some_and(|until| Instant::now() >= until) {
+                    active_screen_poll_until = None;
+                    continue;
                 }
-                if send_gateway_screen_if_changed(&gateway, &session, browser_viewport, &mut sender, &mut last_screen).await.should_close() {
+                if poll_gateway_screen(&gateway, &session, controller, &mut lease, browser_viewport, &mut sender, &mut last_screen).await.should_close() {
                     break;
                 }
             }
@@ -981,15 +1032,45 @@ async fn bridge_gateway_socket(
     }
 }
 
-#[derive(Debug)]
+async fn poll_gateway_screen(
+    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: &SessionName,
+    controller: ControllerRef,
+    lease: &mut GatewayBrowserLease,
+    browser_viewport: Option<GatewayViewport>,
+    sender: &mut BrowserSocketSender,
+    last_screen: &mut Bytes,
+) -> BrowserSocketAction {
+    if sync_gateway_browser_lease(gateway, session, controller, lease, sender)
+        .await
+        .should_close()
+    {
+        return BrowserSocketAction::Close;
+    }
+    if send_gateway_screen_if_changed(gateway, session, browser_viewport, sender, last_screen)
+        .await
+        .should_close()
+    {
+        BrowserSocketAction::Close
+    } else {
+        BrowserSocketAction::Continue
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrowserSocketAction {
     Continue,
+    Refresh,
     Close,
 }
 
 impl BrowserSocketAction {
     const fn should_close(self) -> bool {
         matches!(self, Self::Close)
+    }
+
+    const fn should_refresh(self) -> bool {
+        matches!(self, Self::Refresh)
     }
 }
 
@@ -1153,7 +1234,11 @@ async fn sync_gateway_browser_lease(
         .await;
     }
     *lease = next;
-    BrowserSocketAction::Continue
+    if next.owns_lease {
+        BrowserSocketAction::Refresh
+    } else {
+        BrowserSocketAction::Continue
+    }
 }
 
 async fn next_gateway_browser_lease(
@@ -1348,8 +1433,9 @@ async fn handle_gateway_binary(
     if let Err(error) = result {
         debug!(%error, "gateway input failed");
         let _result = send_runtime_error(sender).await;
+        return BrowserSocketAction::Continue;
     }
-    BrowserSocketAction::Continue
+    BrowserSocketAction::Refresh
 }
 
 async fn handle_gateway_text(
@@ -1361,7 +1447,7 @@ async fn handle_gateway_text(
     browser_viewport: &mut Option<GatewayViewport>,
     sender: &mut BrowserSocketSender,
 ) -> BrowserSocketAction {
-    let message = match serde_json::from_str::<ClientControlMessage>(text) {
+    let message = match decode_client_control_message(text) {
         Ok(message) => message,
         Err(error) => {
             debug!(%error, "closing gateway websocket after invalid control frame");
@@ -1388,6 +1474,7 @@ async fn handle_gateway_text(
                 "ignored browser resize for backend-owned gateway session"
             );
             send_server_control(sender, ServerControlMessage::SizeChanged { size }).await;
+            return BrowserSocketAction::Refresh;
         }
         ClientControlMessage::Viewport { col, row } => {
             if let Some(viewport) = browser_viewport {
@@ -1399,6 +1486,7 @@ async fn handle_gateway_text(
                     "updated browser viewport origin for backend-owned gateway session"
                 );
             }
+            return BrowserSocketAction::Refresh;
         }
         ClientControlMessage::Heartbeat { .. } => {}
     }
@@ -1472,7 +1560,7 @@ async fn handle_browser_text(
     tunnel: &BrowserTunnelPeer,
     sender: &mut BrowserSocketSender,
 ) -> BrowserSocketAction {
-    let frame = match serde_json::from_str::<ClientControlMessage>(text) {
+    let frame = match decode_client_control_message(text) {
         Ok(ClientControlMessage::AcquireControl) => {
             TunnelFrame::BrowserAcquireControl { client_id }
         }
@@ -1750,6 +1838,37 @@ fn controller_from_client(client_id: ClientId) -> Result<ControllerRef, Operatio
     ))
 }
 
+fn decode_client_control_message(
+    text: &str,
+) -> Result<ClientControlMessage, ClientControlDecodeError> {
+    let message = serde_json::from_str::<WireClientControlMessage>(text)
+        .map_err(ClientControlDecodeError::Json)?;
+    match message {
+        WireClientControlMessage::AcquireControl => Ok(ClientControlMessage::AcquireControl),
+        WireClientControlMessage::Resize { cols, rows } => {
+            let size = clamped_browser_terminal_size(cols, rows)
+                .map_err(ClientControlDecodeError::Protocol)?;
+            Ok(ClientControlMessage::Resize {
+                cols: size.cols,
+                rows: size.rows,
+            })
+        }
+        WireClientControlMessage::Viewport { col, row } => {
+            Ok(ClientControlMessage::Viewport { col, row })
+        }
+        WireClientControlMessage::Heartbeat { sequence } => {
+            Ok(ClientControlMessage::Heartbeat { sequence })
+        }
+    }
+}
+
+fn clamped_browser_terminal_size(cols: u16, rows: u16) -> Result<TerminalSize, ProtocolError> {
+    TerminalSize::new(
+        cols.clamp(TerminalCols::MIN, TerminalCols::MAX),
+        rows.clamp(TerminalRows::MIN, TerminalRows::MAX),
+    )
+}
+
 fn screen_snapshot_bytes(
     snapshot: &BackendScreenSnapshot,
     viewport: Option<GatewayViewport>,
@@ -1781,17 +1900,26 @@ fn screen_snapshot_bytes(
         .saturating_sub(start_col)
         .min(visible_cols.saturating_sub(1))
         .saturating_add(1);
-    let mut text = String::from("\x1b[0m\x1b[?7l\x1b[H\x1b[2J");
+    let mut text = String::from("\x1b[?25l\x1b[0m\x1b[?7l\x1b[H\x1b[2J\x1b[3J");
     for index in 0..visible_rows {
         if index > 0 {
             text.push_str("\r\n");
         }
+        text.push_str("\x1b[0m");
         let row = start_row.saturating_add(index);
         if let Some(line) = snapshot.lines().get(usize::from(row)) {
             text.push_str(&project_snapshot_line(line, start_col, visible_cols));
         }
     }
-    let _result = write!(text, "\x1b[0m\x1b[?7h\x1b[{cursor_row};{cursor_col}H");
+    let cursor_visibility = if snapshot.cursor_visible() {
+        "\x1b[?25h"
+    } else {
+        "\x1b[?25l"
+    };
+    let _result = write!(
+        text,
+        "\x1b[0m\x1b[?7h\x1b[{cursor_row};{cursor_col}H{cursor_visibility}"
+    );
     Bytes::from(text)
 }
 
@@ -2164,6 +2292,7 @@ fn screen_response(snapshot: &BackendScreenSnapshot) -> ScreenResponse {
         size: snapshot.size(),
         cursor_col: snapshot.cursor_col(),
         cursor_row: snapshot.cursor_row(),
+        cursor_visible: snapshot.cursor_visible(),
         lines: snapshot.lines().to_vec(),
     }
 }
@@ -3624,10 +3753,12 @@ mod tests {
         let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
         let text = std::str::from_utf8(bytes.as_ref())?;
 
-        assert!(text.starts_with("\u{1b}[0m\u{1b}[?7l\u{1b}[H\u{1b}[2Jrow-00"));
+        assert!(text.starts_with(
+            "\u{1b}[?25l\u{1b}[0m\u{1b}[?7l\u{1b}[H\u{1b}[2J\u{1b}[3J\u{1b}[0mrow-00"
+        ));
         assert!(text.contains("row-23"));
         assert!(!text.contains("row-24"));
-        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[11;11H"));
+        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[11;11H\u{1b}[?25h"));
         Ok(())
     }
 
@@ -3645,10 +3776,12 @@ mod tests {
         let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
         let text = std::str::from_utf8(bytes.as_ref())?;
 
-        assert!(text.starts_with("\u{1b}[0m\u{1b}[?7l\u{1b}[H\u{1b}[2Jrow-00"));
+        assert!(text.starts_with(
+            "\u{1b}[?25l\u{1b}[0m\u{1b}[?7l\u{1b}[H\u{1b}[2J\u{1b}[3J\u{1b}[0mrow-00"
+        ));
         assert!(text.contains("row-23"));
         assert!(!text.contains("row-24"));
-        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[24;11H"));
+        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[24;11H\u{1b}[?25h"));
         Ok(())
     }
 
@@ -3667,7 +3800,25 @@ mod tests {
 
         assert!(text.contains("00000000001111111111"));
         assert!(!text.contains("2222222222"));
-        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[4;20H"));
+        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[4;20H\u{1b}[?25h"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_clamp_browser_resize_control_to_protocol_bounds() -> anyhow::Result<()> {
+        let message = decode_client_control_message(r#"{"type":"resize","cols":10,"rows":3}"#)?;
+        let ClientControlMessage::Resize { cols, rows } = message else {
+            anyhow::bail!("expected resize control message");
+        };
+        assert_eq!(cols.get(), TerminalCols::MIN);
+        assert_eq!(rows.get(), TerminalRows::MIN);
+
+        let message = decode_client_control_message(r#"{"type":"resize","cols":999,"rows":999}"#)?;
+        let ClientControlMessage::Resize { cols, rows } = message else {
+            anyhow::bail!("expected resize control message");
+        };
+        assert_eq!(cols.get(), TerminalCols::MAX);
+        assert_eq!(rows.get(), TerminalRows::MAX);
         Ok(())
     }
 
@@ -3688,7 +3839,7 @@ mod tests {
         assert!(text.contains("89abcdefghijklmnopq"));
         assert!(!text.contains("01234567"));
         assert!(!text.contains("rst"));
-        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[4;1H"));
+        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[4;1H\u{1b}[?25h"));
         Ok(())
     }
 
@@ -3708,7 +3859,45 @@ mod tests {
 
         assert!(text.contains("\u{1b}[31m456789"));
         assert!(!text.contains("0123"));
-        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[1;2H"));
+        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[1;2H\u{1b}[?25h"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reset_ansi_state_between_projected_snapshot_lines() -> anyhow::Result<()> {
+        let snapshot = BackendScreenSnapshot::new(
+            TerminalSize::new(20, 5)?,
+            0,
+            0,
+            vec![
+                "\u{1b}[1m\u{1b}[38;5;117m│".to_owned(),
+                "│ plain".to_owned(),
+            ],
+        );
+
+        let viewport = GatewayViewport::new(TerminalSize::new(20, 5)?);
+        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let text = std::str::from_utf8(bytes.as_ref())?;
+
+        assert!(text.contains("\u{1b}[38;5;117m│\r\n\u{1b}[0m│ plain"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_hide_gateway_cursor_when_backend_cursor_is_hidden() -> anyhow::Result<()> {
+        let snapshot = BackendScreenSnapshot::new_with_cursor_visibility(
+            TerminalSize::new(20, 5)?,
+            0,
+            0,
+            false,
+            vec!["prompt".to_owned()],
+        );
+
+        let viewport = GatewayViewport::new(TerminalSize::new(20, 5)?);
+        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let text = std::str::from_utf8(bytes.as_ref())?;
+
+        assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[1;1H\u{1b}[?25l"));
         Ok(())
     }
 

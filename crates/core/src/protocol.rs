@@ -129,6 +129,11 @@ impl<'de> Deserialize<'de> for SessionName {
 pub struct TerminalCols(NonZeroU16);
 
 impl TerminalCols {
+    /// Smallest supported terminal column count.
+    pub const MIN: u16 = TERMINAL_COLS_MIN;
+    /// Largest supported terminal column count.
+    pub const MAX: u16 = TERMINAL_COLS_MAX;
+
     /// Creates a validated terminal column count.
     ///
     /// # Errors
@@ -174,6 +179,11 @@ impl<'de> Deserialize<'de> for TerminalCols {
 pub struct TerminalRows(NonZeroU16);
 
 impl TerminalRows {
+    /// Smallest supported terminal row count.
+    pub const MIN: u16 = TERMINAL_ROWS_MIN;
+    /// Largest supported terminal row count.
+    pub const MAX: u16 = TERMINAL_ROWS_MAX;
+
     /// Creates a validated terminal row count.
     ///
     /// # Errors

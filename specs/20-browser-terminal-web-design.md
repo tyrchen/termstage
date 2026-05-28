@@ -120,6 +120,21 @@ Rules:
   and columns from the backend screen according to viewport state, then writes a
   frame that fits the xterm instance. It must not rely on xterm overflow,
   autowrap suppression, or accidental clipping to hide content.
+- Backend-owned gateway rendering uses adaptive polling: idle browser sessions
+  poll backend screen state at a conservative interval, while recent browser
+  input, viewport movement, resize, or lease acquisition temporarily enables a
+  faster screen poll window for responsive feedback.
+- Backend snapshot frames reset SGR state at each projected row boundary so
+  attributes from one backend row cannot leak into the first cell of the next
+  row.
+- Backend snapshot projection preserves ANSI color sequences. Theme presets own
+  the ANSI palette mapping. Presentation themes may map ANSI black to the
+  terminal default background to avoid discontinuities between default-background
+  cells and explicit `40m` cells, and must pair that with xterm's minimum
+  contrast handling so `30m` foreground text remains readable.
+- Backend snapshot frames preserve backend cursor visibility. Full-screen
+  applications that hide the cursor in tmux must not show an extra browser
+  xterm cursor.
 - The initial projection origin is top-left: column `0`, row `0`. A backend
   cursor near the right or bottom edge must not cause first attach to crop
   left-side labels or full-screen headers such as k9s `Context:`.

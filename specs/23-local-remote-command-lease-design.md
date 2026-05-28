@@ -269,6 +269,7 @@ Projection rules:
 
 - The gateway reads backend screen size, cursor, lines, and attributes from the
   backend adapter.
+- The gateway preserves backend cursor visibility when projecting snapshots.
 - The gateway maintains browser viewport state: visible `cols`, visible `rows`,
   horizontal origin, and vertical origin. The initial origin is top-left:
   column `0`, row `0`. This preserves full-screen application headers such as
@@ -277,6 +278,8 @@ Projection rules:
 - The binary frame sent to browser xterm must fit the browser viewport. For a
   backend screen wider than the browser viewport, the frame contains the
   selected horizontal slice rather than the entire backend line.
+- Each projected row starts from a reset SGR state before applying that row's
+  own ANSI attributes, avoiding highlight/color leakage across row boundaries.
 - Browser input coordinates and mouse events are translated through the current
   viewport origin before reaching the backend.
 - Component-local scroll, trackpad, keyboard navigation, or future toolbar

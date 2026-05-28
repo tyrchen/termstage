@@ -11,7 +11,7 @@ import {
   readPresentationSettings,
   themePalette
 } from './presentation';
-import { proposedTerminalSize, TerminalSize, watchTerminalResize } from './resize';
+import { proposedTerminalSize, watchTerminalResize } from './resize';
 import { connectTerminalSocket } from './socket';
 import { createTerminalSurface, resizeTerminalSurface, setTerminalFontFamily } from './terminal';
 import { watchBackendViewportNavigation } from './viewport';
@@ -25,7 +25,6 @@ if (root !== null) {
   let currentFontFamily = settings.fontFamily;
   let currentFontSize = settings.fontSize;
   let currentTheme = settings.theme;
-  let currentRuntimeSize: TerminalSize | undefined;
   let applyFontFamily = (_fontFamilyName: TerminalFontFamilyName): void => {};
   let applyFontSize = (_delta: number): void => {};
   let applyTheme = (_theme: PresentationThemeName): void => {};
@@ -54,7 +53,6 @@ if (root !== null) {
       onLeaseChange: toolbar.updateLease,
       onSessionReady: toolbar.updateSession,
       onSizeChange: (size) => {
-        currentRuntimeSize = size;
         resizeTerminalSurface(surface.terminal, size);
       }
     });
@@ -83,9 +81,9 @@ if (root !== null) {
       currentFontFamily = nextFontFamily;
       updateFontFamilyQuery(nextFontFamily);
       void setTerminalFontFamily(surface.terminal, nextFontFamily).then(() => {
-        if (currentRuntimeSize !== undefined) {
-          resizeTerminalSurface(surface.terminal, currentRuntimeSize);
-        }
+        const nextSize = proposedTerminalSize(surface.fitAddon, surface.terminal);
+        resizeTerminalSurface(surface.terminal, nextSize);
+        socket.sendResize(nextSize);
         toolbar.updateFontFamily(nextFontFamily);
         surface.terminal.focus();
       });
@@ -97,8 +95,10 @@ if (root !== null) {
         return;
       }
       currentTheme = theme;
+      const palette = themePalette(theme);
       applyThemeToDocument(theme);
-      surface.terminal.options.theme = themePalette(theme);
+      surface.terminal.options.theme = palette;
+      surface.terminal.options.minimumContrastRatio = palette.minimumContrastRatio;
       updateThemeQuery(theme);
       toolbar.updateTheme(theme);
       surface.terminal.focus();
@@ -113,10 +113,9 @@ if (root !== null) {
       currentFontSize = nextFontSize;
       surface.terminal.options.fontSize = nextFontSize;
       document.documentElement.style.setProperty('--terminal-font-size', `${nextFontSize}px`);
-      if (currentRuntimeSize !== undefined) {
-        resizeTerminalSurface(surface.terminal, currentRuntimeSize);
-      }
-      socket.sendResize(proposedTerminalSize(surface.fitAddon, surface.terminal));
+      const nextSize = proposedTerminalSize(surface.fitAddon, surface.terminal);
+      resizeTerminalSurface(surface.terminal, nextSize);
+      socket.sendResize(nextSize);
       toolbar.updateFontSize(nextFontSize);
       surface.terminal.focus();
     };
