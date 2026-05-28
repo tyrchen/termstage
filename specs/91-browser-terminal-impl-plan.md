@@ -165,15 +165,16 @@ Maps to roadmap: follow-up after M6.
 
 | # | Task | Spec | Effort |
 | --- | --- | --- | --- |
-| 9.1 | Move gateway startup under `termstage web start`, remove the top-level `serve` command, and reject root-level startup aliases with clap's missing/unknown subcommand errors. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 1 day |
-| 9.2 | Introduce `--backend <tmux|rmux>` for backend-owned sessions while keeping `--mode shell` as the compatibility path for `--command` / `--command-arg` until an argv-safe backend pane startup primitive exists. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 1 day |
-| 9.3 | Add `termstage session` commands for list, inspect, stop `--detach|--kill`, and attach-info. | [50](./50-browser-terminal-cli-design.md), [70](./70-browser-terminal-security-design.md) | 2 days |
+| 9.1 | Move backend session creation under `termstage session create --backend <backend> --name <name> [--command <cmd>]`, persist a generated session id under `$HOME/.termstage`, and reject root-level startup aliases with clap's missing/unknown subcommand errors. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 1 day |
+| 9.2 | Introduce argv-safe tmux pane startup for `session create --command <cmd> -g <arg>` while keeping `--mode shell` as the compatibility path for browser-only command runs. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 1 day |
+| 9.3 | Add `termstage session` commands for list, inspect, and stop `--detach|--kill`; inspect returns backend-native attach info, so a separate attach-info command is unnecessary. | [50](./50-browser-terminal-cli-design.md), [70](./70-browser-terminal-security-design.md) | 2 days |
 | 9.4 | Add `termstage api` commands for send-text, send-key, run-command wait/capture, and read-screen as CLI wrappers over the semantic API. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 2 days |
-| 9.5 | Reserve `termstage web` and `termstage auth` command groups for URL/token management and future OIDC login/logout/status flows. | [50](./50-browser-terminal-cli-design.md), [21](./21-browser-terminal-public-exposure-design.md) | 1 day |
+| 9.5 | Add `termstage web attach <session-id>` for browser/API gateway attachment to an existing session id, and reserve `termstage auth` for future OIDC login/logout/status flows. | [50](./50-browser-terminal-cli-design.md), [21](./21-browser-terminal-public-exposure-design.md) | 1 day |
 
 Exit criteria: the CLI help is organized by `session`, `api`, `web`, and `auth`
-command groups; legacy root invocation is rejected; parser tests cover command
-grouping and invalid flag placement.
+command groups; session ids resolve through the local registry; browser gateway
+attachment does not create backend sessions; legacy root invocation is rejected;
+parser tests cover command grouping and invalid flag placement.
 
 ## 14. Cross-References
 

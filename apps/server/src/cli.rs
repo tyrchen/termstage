@@ -5,14 +5,16 @@ use std::{
     ffi::OsString,
     io::{self, Write},
     net::{IpAddr, Ipv4Addr},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process,
     str::FromStr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use termstage_core::{
     protocol::{AccessToken, SessionName, TerminalSize},
@@ -22,14 +24,15 @@ use termstage_core::{
     },
     security::{BasePath, PublicBaseUrl},
     session_gateway::SessionGateway,
-    tmux_backend::TmuxBackend,
+    tmux_backend::{TmuxBackend, TmuxSessionCommand},
 };
 use tokio::{
+    fs,
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::Mutex,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use url::{Host, Url};
 
 use crate::web::{PresentationSettings, PresentationTheme, WebConfig, WebExposure, serve};
@@ -45,6 +48,13 @@ const GATEWAY_LEASE_TTL: Duration = Duration::from_secs(90);
 const GATEWAY_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const HTTP_HEADER_SEPARATOR: &[u8; 4] = b"\r\n\r\n";
 const HTTP_LINE_SEPARATOR: &[u8; 2] = b"\r\n";
+const SESSION_REGISTRY_VERSION: u16 = 1;
+const SESSION_REGISTRY_MAX_BYTES: u64 = 1024 * 1024;
+const SESSION_REGISTRY_MAX_RECORDS: usize = 1024;
+const SESSION_LABEL_MAX_BYTES: usize = 64;
+const SESSION_CREATED_AT_MAX_BYTES: usize = 64;
+const SESSION_COMMAND_MAX_ARGS: usize = 256;
+const SESSION_COMMAND_ARG_MAX_BYTES: usize = 4096;
 
 /// Browser terminal command-line arguments.
 #[derive(Debug, Parser)]
@@ -132,9 +142,6 @@ struct ServeArgs {
 
 #[derive(Debug, Clone, Args)]
 struct SessionArgs {
-    /// Backend whose sessions should be managed.
-    #[arg(long, value_enum, default_value_t = CliBackend::Tmux)]
-    backend: CliBackend,
     /// Session command.
     #[command(subcommand)]
     command: SessionCommand,
@@ -142,28 +149,47 @@ struct SessionArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 enum SessionCommand {
+    /// Create a backend session and persist its termstage session id.
+    Create {
+        /// Backend that owns the real session.
+        #[arg(long, value_enum, default_value_t = CliBackend::Tmux)]
+        backend: CliBackend,
+        /// Human-readable backend session name.
+        #[arg(long)]
+        name: String,
+        /// Command executable for the first backend pane. Defaults to $SHELL.
+        #[arg(long)]
+        command: Option<PathBuf>,
+        /// Argument passed to the backend command. Repeat for multiple args.
+        #[arg(
+            short = 'g',
+            long = "command-arg",
+            value_name = "ARG",
+            allow_hyphen_values = true
+        )]
+        command_args: Vec<OsString>,
+    },
     /// List sessions visible to termstage.
-    List,
+    List {
+        /// Optional backend filter.
+        #[arg(long, value_enum)]
+        backend: Option<CliBackend>,
+    },
     /// Inspect one session.
     Inspect {
-        /// Session name.
-        session: String,
+        /// Termstage session id.
+        session_id: String,
     },
     /// Stop managing a session or kill its backend session.
     Stop {
-        /// Session name.
-        session: String,
+        /// Termstage session id.
+        session_id: String,
         /// Kill the backend session.
         #[arg(long, conflicts_with = "detach")]
         kill: bool,
         /// Keep the backend session and detach only.
         #[arg(long, conflicts_with = "kill")]
         detach: bool,
-    },
-    /// Print backend-native attach instructions.
-    AttachInfo {
-        /// Session name.
-        session: String,
     },
 }
 
@@ -251,6 +277,8 @@ struct WebArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 enum WebCommand {
+    /// Attach the browser/API gateway to an existing termstage session id.
+    Attach(WebAttachArgs),
     /// Start the browser/API gateway.
     Start(ServeArgs),
     /// Build a tokenized browser URL from a base URL and token.
@@ -268,6 +296,40 @@ enum WebCommand {
         #[command(subcommand)]
         command: WebTokenCommand,
     },
+}
+
+#[derive(Debug, Clone, Args)]
+struct WebAttachArgs {
+    /// Termstage session id returned by `termstage session create`.
+    session_id: String,
+    /// Bind address. Non-loopback addresses require --expose-public.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: IpAddr,
+    /// TCP port. Use 0 for an OS-selected random port.
+    #[arg(long, default_value_t = 0)]
+    port: u16,
+    /// Open the tokenized URL in the default browser.
+    #[arg(long, default_value_t = false)]
+    open: bool,
+    /// Browser terminal font size in CSS pixels.
+    #[arg(long, default_value_t = DEFAULT_FONT_SIZE)]
+    font_size: u16,
+    /// Browser terminal theme.
+    #[arg(long, value_enum, default_value_t = CliTheme::HighContrast)]
+    theme: CliTheme,
+    /// Enable internet-facing pod mode behind an HTTPS ingress.
+    #[arg(long, default_value_t = false)]
+    expose_public: bool,
+    /// Browser-visible HTTPS base URL for public mode.
+    #[arg(long)]
+    public_url: Option<String>,
+    /// Environment variable containing the 64-hex-character access token.
+    #[arg(long)]
+    token_env: Option<String>,
+    /// Reverse-proxy base path under which to mount all routes
+    /// (e.g. `/p/<sessionId>/`). Must start and end with `/`.
+    #[arg(long)]
+    base_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -311,12 +373,129 @@ pub struct ValidatedCliConfig {
 }
 
 #[derive(Debug, Clone)]
+struct ValidatedWebAttachConfig {
+    session_id: SessionName,
+    host: IpAddr,
+    port: u16,
+    open: bool,
+    presentation: PresentationSettings,
+    exposure: WebExposure,
+    token: AccessToken,
+    base_path: Option<BasePath>,
+}
+
+#[derive(Debug, Clone)]
 enum ValidatedCliCommand {
     WebStart(ValidatedCliConfig),
+    WebAttach(ValidatedWebAttachConfig),
     Session(SessionArgs),
     Api(ApiArgs),
     Web(WebArgs),
     Auth(AuthArgs),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredSessionRegistry {
+    version: u16,
+    sessions: Vec<StoredSessionRecord>,
+}
+
+impl StoredSessionRegistry {
+    fn new() -> Self {
+        Self {
+            version: SESSION_REGISTRY_VERSION,
+            sessions: Vec::new(),
+        }
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.version != SESSION_REGISTRY_VERSION {
+            bail!("unsupported session registry version {}", self.version);
+        }
+        if self.sessions.len() > SESSION_REGISTRY_MAX_RECORDS {
+            bail!("session registry contains too many records");
+        }
+        for record in &self.sessions {
+            record.validate()?;
+        }
+        Ok(())
+    }
+
+    fn insert(&mut self, record: StoredSessionRecord) -> anyhow::Result<()> {
+        if self
+            .sessions
+            .iter()
+            .any(|existing| existing.id == record.id)
+        {
+            bail!("termstage session id {} already exists", record.id);
+        }
+        if self.sessions.iter().any(|existing| {
+            existing.backend == record.backend && existing.backend_session == record.backend_session
+        }) {
+            bail!(
+                "backend session {} already has a termstage session id",
+                record.backend_session
+            );
+        }
+        if self.sessions.len() >= SESSION_REGISTRY_MAX_RECORDS {
+            bail!("session registry contains too many records");
+        }
+        self.sessions.push(record);
+        Ok(())
+    }
+
+    fn find(&self, session_id: &SessionName) -> anyhow::Result<&StoredSessionRecord> {
+        self.sessions
+            .iter()
+            .find(|record| record.id == session_id.as_str())
+            .with_context(|| format!("termstage session id {} was not found", session_id.as_str()))
+    }
+
+    fn remove(&mut self, session_id: &SessionName) -> anyhow::Result<StoredSessionRecord> {
+        let index = self
+            .sessions
+            .iter()
+            .position(|record| record.id == session_id.as_str())
+            .with_context(|| {
+                format!("termstage session id {} was not found", session_id.as_str())
+            })?;
+        Ok(self.sessions.remove(index))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredSessionRecord {
+    id: String,
+    backend: CliBackend,
+    name: String,
+    backend_session: String,
+    created_at: String,
+    command: Vec<String>,
+}
+
+impl StoredSessionRecord {
+    fn validate(&self) -> anyhow::Result<()> {
+        SessionName::from_str(&self.id).context("invalid registry session id")?;
+        SessionName::from_str(&self.backend_session).context("invalid registry backend session")?;
+        validate_registry_text(&self.name, SESSION_LABEL_MAX_BYTES, "session name")?;
+        validate_registry_text(
+            &self.created_at,
+            SESSION_CREATED_AT_MAX_BYTES,
+            "session created timestamp",
+        )?;
+        if self.command.len() > SESSION_COMMAND_MAX_ARGS {
+            bail!("session command contains too many arguments");
+        }
+        if self.command.is_empty() {
+            bail!("session command must not be empty");
+        }
+        for value in &self.command {
+            validate_registry_text(value, SESSION_COMMAND_ARG_MAX_BYTES, "session command arg")?;
+        }
+        Ok(())
+    }
 }
 
 impl TryFrom<CliArgs> for ValidatedCliCommand {
@@ -327,6 +506,9 @@ impl TryFrom<CliArgs> for ValidatedCliCommand {
             CliCommand::Session(command) => Ok(Self::Session(validate_session_args(command)?)),
             CliCommand::Api(command) => Ok(Self::Api(command)),
             CliCommand::Web(command) => match command.command {
+                WebCommand::Attach(attach) => {
+                    Ok(Self::WebAttach(ValidatedWebAttachConfig::try_from(attach)?))
+                }
                 WebCommand::Start(serve) => {
                     Ok(Self::WebStart(ValidatedCliConfig::try_from(serve)?))
                 }
@@ -334,6 +516,40 @@ impl TryFrom<CliArgs> for ValidatedCliCommand {
             },
             CliCommand::Auth(command) => Ok(Self::Auth(command)),
         }
+    }
+}
+
+impl TryFrom<WebAttachArgs> for ValidatedWebAttachConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(args: WebAttachArgs) -> Result<Self, Self::Error> {
+        if !(MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(&args.font_size) {
+            bail!("font size must be in {MIN_FONT_SIZE}..={MAX_FONT_SIZE}");
+        }
+        let base_path = match args.base_path.as_deref() {
+            Some(value) => Some(BasePath::from_str(value).context("invalid --base-path")?),
+            None => None,
+        };
+        let (exposure, token) = exposure_and_token_from_parts(
+            args.expose_public,
+            args.host,
+            args.public_url.as_deref(),
+            args.token_env.as_deref(),
+            |name| env::var(name),
+        )?;
+        Ok(Self {
+            session_id: SessionName::from_str(&args.session_id).context("invalid session id")?,
+            host: args.host,
+            port: args.port,
+            open: args.open,
+            presentation: PresentationSettings {
+                font_size: args.font_size,
+                theme: args.theme.into(),
+            },
+            exposure,
+            token,
+            base_path,
+        })
     }
 }
 
@@ -417,6 +633,7 @@ pub async fn run() -> anyhow::Result<()> {
 async fn run_validated_command(command: ValidatedCliCommand) -> anyhow::Result<()> {
     match command {
         ValidatedCliCommand::WebStart(config) => run_with_config(config).await,
+        ValidatedCliCommand::WebAttach(config) => run_web_attach(config).await,
         ValidatedCliCommand::Session(args) => run_session_command(args).await,
         ValidatedCliCommand::Api(args) => run_api_command(args).await,
         ValidatedCliCommand::Web(args) => run_web_command(args),
@@ -515,6 +732,64 @@ async fn run_gateway_tmux(config: ValidatedCliConfig, session: SessionName) -> a
         .context("failed to shutdown browser terminal server")
 }
 
+async fn run_web_attach(config: ValidatedWebAttachConfig) -> anyhow::Result<()> {
+    reject_root_user()?;
+    let path = session_registry_path()?;
+    let registry = load_session_registry(&path).await?;
+    let record = registry.find(&config.session_id)?.clone();
+    match record.backend {
+        CliBackend::Tmux => run_web_attach_tmux(config, record).await,
+        CliBackend::Rmux => bail!("rmux backend is not implemented in this build"),
+    }
+}
+
+async fn run_web_attach_tmux(
+    config: ValidatedWebAttachConfig,
+    record: StoredSessionRecord,
+) -> anyhow::Result<()> {
+    let backend_session =
+        SessionName::from_str(&record.backend_session).context("invalid backend session")?;
+    let backend = TmuxBackend::from_path().context("failed to resolve tmux backend")?;
+    let backend_ref = backend
+        .attach_existing_session(&backend_session)
+        .await
+        .with_context(|| format!("failed to attach tmux session {}", backend_session.as_str()))?;
+    let mut gateway = SessionGateway::new(backend, GATEWAY_LEASE_TTL);
+    gateway
+        .register_existing_session(config.session_id.clone(), backend_ref)
+        .context("failed to register backend session with gateway")?;
+    let gateway = Arc::new(Mutex::new(gateway));
+    let mut web_config = WebConfig::local_tmux_gateway(
+        config.token,
+        Arc::clone(&gateway),
+        config.session_id.clone(),
+    );
+    web_config.host = config.host;
+    web_config.port = config.port;
+    web_config.presentation = config.presentation;
+    web_config.exposure = config.exposure;
+    web_config.base_path = config.base_path;
+
+    let server = serve(web_config)
+        .await
+        .context("failed to start browser terminal server")?;
+    let launch_url = server.launch_url();
+    if config.open {
+        if let Err(error) = open::that_detached(&launch_url) {
+            eprintln!("{launch_url}");
+            info!(%error, "failed to open browser; printed launch URL");
+        }
+    } else {
+        eprintln!("{launch_url}");
+    }
+    info!(address = %server.address(), "browser terminal server started");
+    wait_for_gateway_shutdown_or_session_end(gateway, config.session_id).await;
+    server
+        .shutdown()
+        .await
+        .context("failed to shutdown browser terminal server")
+}
+
 fn shell_mode_command(path: Option<PathBuf>, args: Vec<OsString>) -> anyhow::Result<ShellCommand> {
     match path {
         Some(path) => ShellCommand::new(path, args).map_err(Into::into),
@@ -530,12 +805,22 @@ fn shell_mode_command(path: Option<PathBuf>, args: Vec<OsString>) -> anyhow::Res
 }
 
 fn validate_session_args(args: SessionArgs) -> anyhow::Result<SessionArgs> {
-    if let SessionCommand::Stop { kill, detach, .. } = &args.command {
-        match (*kill, *detach) {
+    match &args.command {
+        SessionCommand::Create {
+            command,
+            command_args,
+            ..
+        } => {
+            if command.is_none() && !command_args.is_empty() {
+                bail!("--command-arg requires --command");
+            }
+        }
+        SessionCommand::Stop { kill, detach, .. } => match (*kill, *detach) {
             (true, false) | (false, true) => {}
             (false, false) => bail!("session stop requires exactly one of --detach or --kill"),
             (true, true) => bail!("session stop cannot combine --detach and --kill"),
-        }
+        },
+        SessionCommand::List { .. } | SessionCommand::Inspect { .. } => {}
     }
     Ok(args)
 }
@@ -547,6 +832,121 @@ fn tmux_gateway_session_status(session: &SessionName, created: bool) -> String {
         session.as_str(),
         session.as_str()
     )
+}
+
+fn session_registry_path() -> anyhow::Result<PathBuf> {
+    let home = env::var_os("HOME").context("$HOME is not set")?;
+    Ok(PathBuf::from(home).join(".termstage").join("sessions.json"))
+}
+
+async fn load_session_registry(path: &Path) -> anyhow::Result<StoredSessionRegistry> {
+    match fs::metadata(path).await {
+        Ok(metadata) => {
+            if metadata.len() > SESSION_REGISTRY_MAX_BYTES {
+                bail!("session registry exceeds {SESSION_REGISTRY_MAX_BYTES} bytes");
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(StoredSessionRegistry::new());
+        }
+        Err(error) => return Err(error).context("failed to stat session registry"),
+    }
+    let text = fs::read_to_string(path)
+        .await
+        .context("failed to read session registry")?;
+    let registry: StoredSessionRegistry =
+        serde_json::from_str(&text).context("failed to parse session registry")?;
+    registry.validate()?;
+    Ok(registry)
+}
+
+async fn save_session_registry(
+    path: &Path,
+    registry: &StoredSessionRegistry,
+) -> anyhow::Result<()> {
+    registry.validate()?;
+    let parent = path
+        .parent()
+        .context("session registry path must include a parent directory")?;
+    fs::create_dir_all(parent)
+        .await
+        .context("failed to create session registry directory")?;
+    let temporary = path.with_extension("json.tmp");
+    let text =
+        serde_json::to_string_pretty(registry).context("failed to serialize session registry")?;
+    fs::write(&temporary, text)
+        .await
+        .context("failed to write session registry")?;
+    set_owner_only_file_permissions(&temporary).await?;
+    fs::rename(&temporary, path)
+        .await
+        .context("failed to replace session registry")?;
+    Ok(())
+}
+
+async fn set_owner_only_file_permissions(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(path, permissions)
+            .await
+            .context("failed to set registry permissions")?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _path = path;
+    }
+    Ok(())
+}
+
+fn validate_registry_text(value: &str, max_bytes: usize, label: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        bail!("{label} must not be empty");
+    }
+    if value.len() > max_bytes {
+        bail!("{label} must be at most {max_bytes} bytes");
+    }
+    if value.bytes().any(|byte| byte.is_ascii_control()) {
+        bail!("{label} must not contain control characters");
+    }
+    Ok(())
+}
+
+fn generate_session_id() -> anyhow::Result<SessionName> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before unix epoch")?;
+    let value = format!("ts-{:x}-{:x}", process::id(), elapsed.as_nanos());
+    SessionName::from_str(&value).context("generated session id was invalid")
+}
+
+fn command_record(command: Option<&PathBuf>, args: &[OsString]) -> anyhow::Result<Vec<String>> {
+    let Some(command) = command else {
+        return Ok(vec!["$SHELL".to_owned()]);
+    };
+    let mut values = Vec::with_capacity(args.len().saturating_add(1));
+    let command = command
+        .to_str()
+        .context("--command must be valid UTF-8 to persist session metadata")?;
+    validate_registry_text(command, SESSION_COMMAND_ARG_MAX_BYTES, "session command")?;
+    values.push(command.to_owned());
+    for arg in args {
+        let value = arg
+            .to_str()
+            .context("--command-arg must be valid UTF-8 to persist session metadata")?;
+        validate_registry_text(value, SESSION_COMMAND_ARG_MAX_BYTES, "session command arg")?;
+        values.push(value.to_owned());
+    }
+    Ok(values)
+}
+
+fn tmux_session_command(
+    command: Option<PathBuf>,
+    args: Vec<OsString>,
+) -> Option<TmuxSessionCommand> {
+    command.map(|path| TmuxSessionCommand::new(path.into_os_string(), args))
 }
 
 fn initial_terminal_size() -> anyhow::Result<TerminalSize> {
@@ -598,20 +998,31 @@ fn exposure_and_token_with_env(
     args: &ServeArgs,
     get_env: impl Fn(&str) -> Result<String, env::VarError>,
 ) -> anyhow::Result<(WebExposure, AccessToken)> {
-    if args.expose_public {
-        let public_url = args
-            .public_url
-            .as_deref()
+    exposure_and_token_from_parts(
+        args.expose_public,
+        args.host,
+        args.public_url.as_deref(),
+        args.token_env.as_deref(),
+        get_env,
+    )
+}
+
+fn exposure_and_token_from_parts(
+    expose_public: bool,
+    host: IpAddr,
+    public_url: Option<&str>,
+    token_env: Option<&str>,
+    get_env: impl Fn(&str) -> Result<String, env::VarError>,
+) -> anyhow::Result<(WebExposure, AccessToken)> {
+    if expose_public {
+        let public_url = public_url
             .context("--public-url is required with --expose-public")
             .and_then(|value| {
                 value
                     .parse::<PublicBaseUrl>()
                     .context("invalid --public-url for public exposure")
             })?;
-        let token_env = args
-            .token_env
-            .as_deref()
-            .context("--token-env is required with --expose-public")?;
+        let token_env = token_env.context("--token-env is required with --expose-public")?;
         validate_token_env_name(token_env)?;
         let token_value = get_env(token_env)
             .with_context(|| format!("failed to read access token from ${token_env}"))?;
@@ -619,13 +1030,13 @@ fn exposure_and_token_with_env(
             .with_context(|| format!("invalid access token in ${token_env}"))?;
         Ok((WebExposure::Public { public_url }, token))
     } else {
-        if !args.host.is_loopback() {
+        if !host.is_loopback() {
             bail!("browser terminal bind host must be loopback unless --expose-public is set");
         }
-        if args.public_url.is_some() {
+        if public_url.is_some() {
             bail!("--public-url requires --expose-public");
         }
-        if args.token_env.is_some() {
+        if token_env.is_some() {
             bail!("--token-env requires --expose-public");
         }
         let token = AccessToken::generate().context("failed to generate browser access token")?;
@@ -701,28 +1112,128 @@ async fn wait_for_gateway_shutdown_or_session_end(
 }
 
 async fn run_session_command(args: SessionArgs) -> anyhow::Result<()> {
-    let backend = session_tmux_backend(args.backend)?;
     match args.command {
-        SessionCommand::List => {
-            let sessions = backend
-                .list_sessions()
-                .await
-                .context("failed to list tmux sessions")?;
+        SessionCommand::Create {
+            backend,
+            name,
+            command,
+            command_args,
+        } => run_session_create(backend, name, command, command_args).await,
+        SessionCommand::List { backend } => {
+            let path = session_registry_path()?;
+            let registry = load_session_registry(&path).await?;
             let mut stdout = io::stdout().lock();
-            for session in sessions {
-                writeln!(stdout, "{}", session.as_str()).context("failed to write session list")?;
+            for record in registry
+                .sessions
+                .iter()
+                .filter(|record| backend.is_none_or(|kind| kind == record.backend))
+            {
+                writeln!(
+                    stdout,
+                    "{}\t{}\t{}\t{}",
+                    record.id,
+                    record.backend.as_str(),
+                    record.name,
+                    record.backend_session
+                )
+                .context("failed to write session list")?;
             }
             Ok(())
         }
-        SessionCommand::Inspect { session } => {
-            let session = SessionName::from_str(&session).context("invalid session name")?;
+        SessionCommand::Inspect { session_id } => run_session_inspect(session_id).await,
+        SessionCommand::Stop {
+            session_id,
+            kill,
+            detach,
+        } => run_session_stop(session_id, kill, detach).await,
+    }
+}
+
+async fn run_session_create(
+    backend: CliBackend,
+    name: String,
+    command: Option<PathBuf>,
+    command_args: Vec<OsString>,
+) -> anyhow::Result<()> {
+    let backend_session = SessionName::from_str(&name).context("invalid session name")?;
+    let session_id = generate_session_id()?;
+    let initial_size = initial_terminal_size()?;
+    let command_metadata = command_record(command.as_ref(), &command_args)?;
+    let command = tmux_session_command(command, command_args);
+    let path = session_registry_path()?;
+    let mut registry = load_session_registry(&path).await?;
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before unix epoch")?
+        .as_secs()
+        .to_string();
+    registry.insert(StoredSessionRecord {
+        id: session_id.as_str().to_owned(),
+        backend,
+        name,
+        backend_session: backend_session.as_str().to_owned(),
+        created_at,
+        command: command_metadata,
+    })?;
+    create_backend_session(backend, &backend_session, initial_size, command.as_ref()).await?;
+    if let Err(error) = save_session_registry(&path, &registry).await {
+        if let Err(rollback_error) = kill_backend_session(backend, &backend_session).await {
+            warn!(
+                %rollback_error,
+                backend = backend.as_str(),
+                backend_session = backend_session.as_str(),
+                "failed to rollback backend session after registry save failure"
+            );
+        }
+        return Err(error).context("failed to persist created session");
+    }
+
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "id: {}", session_id.as_str()).context("failed to write session create")?;
+    writeln!(stdout, "backend: {}", backend.as_str()).context("failed to write session create")?;
+    writeln!(stdout, "name: {}", backend_session.as_str())
+        .context("failed to write session create")?;
+    writeln!(
+        stdout,
+        "attach: tmux attach -t {}",
+        backend_session.as_str()
+    )
+    .context("failed to write session create")?;
+    writeln!(stdout, "web: termstage web attach {}", session_id.as_str())
+        .context("failed to write session create")?;
+    Ok(())
+}
+
+async fn run_session_inspect(session_id: String) -> anyhow::Result<()> {
+    let session_id = SessionName::from_str(&session_id).context("invalid session id")?;
+    let path = session_registry_path()?;
+    let registry = load_session_registry(&path).await?;
+    let record = registry.find(&session_id)?;
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "id: {}", record.id).context("failed to write session details")?;
+    writeln!(stdout, "backend: {}", record.backend.as_str())
+        .context("failed to write session details")?;
+    writeln!(stdout, "name: {}", record.name).context("failed to write session details")?;
+    writeln!(stdout, "backend-session: {}", record.backend_session)
+        .context("failed to write session details")?;
+    writeln!(stdout, "created-at: {}", record.created_at)
+        .context("failed to write session details")?;
+    writeln!(stdout, "command: {}", record.command.join(" "))
+        .context("failed to write session details")?;
+    match record.backend {
+        CliBackend::Tmux => {
+            let backend_session = SessionName::from_str(&record.backend_session)
+                .context("invalid backend session")?;
+            let backend = TmuxBackend::from_path().context("failed to resolve tmux backend")?;
             let info = backend
-                .inspect_session(&session)
+                .inspect_session(&backend_session)
                 .await
-                .with_context(|| format!("failed to inspect tmux session {}", session.as_str()))?;
-            let mut stdout = io::stdout().lock();
-            writeln!(stdout, "session: {}", info.session().as_str())
-                .context("failed to write session details")?;
+                .with_context(|| {
+                    format!(
+                        "failed to inspect tmux session {}",
+                        backend_session.as_str()
+                    )
+                })?;
             writeln!(stdout, "window: {}", info.window().as_str())
                 .context("failed to write session details")?;
             writeln!(stdout, "pane: {}", info.pane().as_str())
@@ -734,48 +1245,114 @@ async fn run_session_command(args: SessionArgs) -> anyhow::Result<()> {
                 info.size().rows.get()
             )
             .context("failed to write session details")?;
-            writeln!(stdout, "attach: tmux attach -t {}", info.session().as_str())
+            writeln!(
+                stdout,
+                "attach: tmux attach -t {}",
+                backend_session.as_str()
+            )
+            .context("failed to write session details")?;
+            writeln!(stdout, "web: termstage web attach {}", record.id)
                 .context("failed to write session details")?;
-            Ok(())
         }
-        SessionCommand::Stop {
-            session,
-            kill,
-            detach: _detach,
-        } => {
-            let session = SessionName::from_str(&session).context("invalid session name")?;
-            if kill {
-                backend
-                    .kill_session_by_name(&session)
-                    .await
-                    .with_context(|| format!("failed to kill tmux session {}", session.as_str()))?;
-                writeln!(io::stdout(), "killed tmux session {}", session.as_str())
+        CliBackend::Rmux => bail!("rmux backend is not implemented in this build"),
+    }
+    Ok(())
+}
+
+async fn run_session_stop(session_id: String, kill: bool, detach: bool) -> anyhow::Result<()> {
+    let session_id = SessionName::from_str(&session_id).context("invalid session id")?;
+    let path = session_registry_path()?;
+    let mut registry = load_session_registry(&path).await?;
+    let record = registry.remove(&session_id)?;
+    if kill {
+        match record.backend {
+            CliBackend::Tmux => {
+                let backend_session = SessionName::from_str(&record.backend_session)
+                    .context("invalid backend session")?;
+                if kill_backend_session(CliBackend::Tmux, &backend_session).await? {
+                    writeln!(
+                        io::stdout(),
+                        "killed tmux session {} for termstage session {}",
+                        backend_session.as_str(),
+                        session_id.as_str()
+                    )
                     .context("failed to write stop result")?;
-            } else {
-                writeln!(
-                    io::stdout(),
-                    "detached termstage supervisor state for {}; backend session is still \
-                     available with: tmux attach -t {}",
-                    session.as_str(),
-                    session.as_str()
-                )
-                .context("failed to write stop result")?;
+                } else {
+                    writeln!(
+                        io::stdout(),
+                        "removed stale termstage session {}; backend session {} was already gone",
+                        session_id.as_str(),
+                        backend_session.as_str()
+                    )
+                    .context("failed to write stop result")?;
+                }
             }
+            CliBackend::Rmux => bail!("rmux backend is not implemented in this build"),
+        }
+    } else if detach {
+        writeln!(
+            io::stdout(),
+            "detached termstage session {}; backend session is still available with: {}",
+            session_id.as_str(),
+            native_attach_command(&record)
+        )
+        .context("failed to write stop result")?;
+    }
+    save_session_registry(&path, &registry).await?;
+    Ok(())
+}
+
+async fn create_backend_session(
+    backend: CliBackend,
+    backend_session: &SessionName,
+    initial_size: TerminalSize,
+    command: Option<&TmuxSessionCommand>,
+) -> anyhow::Result<()> {
+    match backend {
+        CliBackend::Tmux => {
+            let tmux = TmuxBackend::from_path().context("failed to resolve tmux backend")?;
+            tmux.create_new_session(backend_session, initial_size, command)
+                .await
+                .with_context(|| {
+                    format!("failed to create tmux session {}", backend_session.as_str())
+                })?;
             Ok(())
         }
-        SessionCommand::AttachInfo { session } => {
-            let session = SessionName::from_str(&session).context("invalid session name")?;
-            writeln!(io::stdout(), "tmux attach -t {}", session.as_str())
-                .context("failed to write attach command")?;
-            Ok(())
-        }
+        CliBackend::Rmux => bail!("rmux backend is not implemented in this build"),
     }
 }
 
-fn session_tmux_backend(backend: CliBackend) -> anyhow::Result<TmuxBackend> {
+async fn kill_backend_session(
+    backend: CliBackend,
+    backend_session: &SessionName,
+) -> anyhow::Result<bool> {
     match backend {
-        CliBackend::Tmux => TmuxBackend::from_path().context("failed to resolve tmux backend"),
+        CliBackend::Tmux => {
+            let tmux = TmuxBackend::from_path().context("failed to resolve tmux backend")?;
+            if !tmux
+                .session_exists_by_name(backend_session)
+                .await
+                .with_context(|| {
+                    format!("failed to check tmux session {}", backend_session.as_str())
+                })?
+            {
+                return Ok(false);
+            }
+            tmux.kill_session_by_name(backend_session)
+                .await
+                .with_context(|| {
+                    format!("failed to kill tmux session {}", backend_session.as_str())
+                })?;
+            Ok(true)
+        }
         CliBackend::Rmux => bail!("rmux backend is not implemented in this build"),
+    }
+}
+
+fn native_attach_command(record: &StoredSessionRecord) -> String {
+    match record.backend {
+        CliBackend::Tmux => format!("tmux attach -t {}", record.backend_session),
+        CliBackend::Rmux => format!("rmux attach -t {}", record.backend_session),
     }
 }
 
@@ -875,6 +1452,7 @@ fn api_request(args: ApiArgs) -> anyhow::Result<(SessionName, ApiEndpoint, Value
 
 fn run_web_command(args: WebArgs) -> anyhow::Result<()> {
     match args.command {
+        WebCommand::Attach(_attach) => bail!("web attach must be dispatched before web helpers"),
         WebCommand::Start(_serve) => bail!("web start must be dispatched before web helpers"),
         WebCommand::Url { base_url, token } => {
             let token = AccessToken::from_str(&token).context("invalid --token")?;
@@ -1160,10 +1738,20 @@ fn reject_root_user() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "camelCase")]
 enum CliBackend {
     Tmux,
     Rmux,
+}
+
+impl CliBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tmux => "tmux",
+            Self::Rmux => "rmux",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1528,8 +2116,102 @@ mod tests {
         let ValidatedCliCommand::Session(args) = command else {
             anyhow::bail!("session command group must validate to session args");
         };
-        assert!(matches!(args.backend, CliBackend::Tmux));
-        assert!(matches!(args.command, SessionCommand::List));
+        assert!(matches!(
+            args.command,
+            SessionCommand::List { backend: None }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_parse_session_create_command() -> anyhow::Result<()> {
+        let args = CliArgs::try_parse_from([
+            "termstage",
+            "session",
+            "create",
+            "--backend",
+            "tmux",
+            "--name",
+            "demo",
+            "--command",
+            "k9s",
+            "-g=--readonly",
+        ])?;
+        let command = ValidatedCliCommand::try_from(args)?;
+        let ValidatedCliCommand::Session(args) = command else {
+            anyhow::bail!("session command group must validate to session args");
+        };
+        assert!(matches!(
+            args.command,
+            SessionCommand::Create {
+                backend: CliBackend::Tmux,
+                ref name,
+                ref command,
+                ref command_args,
+            } if name == "demo"
+                && command.as_ref().is_some_and(|path| path == &PathBuf::from("k9s"))
+                && command_args == &[OsString::from("--readonly")]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_session_create_args_without_command() -> anyhow::Result<()> {
+        let args = CliArgs::try_parse_from([
+            "termstage",
+            "session",
+            "create",
+            "--name",
+            "demo",
+            "-g=--readonly",
+        ])?;
+        assert!(ValidatedCliCommand::try_from(args).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_record_default_session_command_as_shell() -> anyhow::Result<()> {
+        assert_eq!(command_record(None, &[])?, ["$SHELL".to_owned()]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_parse_web_attach_command() -> anyhow::Result<()> {
+        let args = CliArgs::try_parse_from(["termstage", "web", "attach", "ts-1-2", "--open"])?;
+        let command = ValidatedCliCommand::try_from(args)?;
+        let ValidatedCliCommand::WebAttach(config) = command else {
+            anyhow::bail!("web attach command must validate to web attach config");
+        };
+        assert_eq!(config.session_id.as_str(), "ts-1-2");
+        assert!(config.open);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_round_trip_session_registry() -> anyhow::Result<()> {
+        let root = env::temp_dir().join(format!(
+            "termstage-registry-test-{}-{}",
+            process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir_all(&root).await?;
+        let path = root.join("sessions.json");
+        let mut registry = StoredSessionRegistry::new();
+        registry.insert(StoredSessionRecord {
+            id: "ts-1-2".to_owned(),
+            backend: CliBackend::Tmux,
+            name: "demo".to_owned(),
+            backend_session: "demo".to_owned(),
+            created_at: "1".to_owned(),
+            command: vec!["k9s".to_owned(), "--readonly".to_owned()],
+        })?;
+
+        save_session_registry(&path, &registry).await?;
+        let loaded = load_session_registry(&path).await?;
+
+        assert_eq!(loaded.find(&SessionName::from_str("ts-1-2")?)?.name, "demo");
+        fs::remove_file(path).await?;
+        fs::remove_dir(root).await?;
         Ok(())
     }
 
