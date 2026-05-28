@@ -256,6 +256,11 @@ pub enum RuntimeCommand {
         /// Terminal bytes.
         bytes: Bytes,
     },
+    /// Acquire browser control without writing terminal bytes.
+    AcquireControl {
+        /// Client id.
+        client_id: ClientId,
+    },
     /// Resize the PTY.
     Resize {
         /// New PTY size.
@@ -655,6 +660,12 @@ impl SessionActor {
                 } else {
                     None
                 }
+            }
+            RuntimeCommand::AcquireControl { client_id } => {
+                if self.browser_controller == Some(client_id) && !self.child_exited {
+                    self.claim_browser(client_id);
+                }
+                None
             }
             RuntimeCommand::Resize { size } => self.resize(size),
             RuntimeCommand::BrowserResize { client_id, size } => {
@@ -1365,6 +1376,30 @@ mod tests {
         anyhow::bail!("runtime output did not report process exit");
     }
 
+    async fn recv_until_lease_owner(
+        output: &mut ClientOutputRx,
+        owner: LeaseOwner,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let message = timeout(remaining, output.recv())
+                .await
+                .context("test runtime output timed out")?
+                .context("client output channel closed")?;
+            if matches!(
+                message,
+                ClientOutput::Control(ServerControlMessage::LeaseChanged {
+                    owner: observed,
+                    ..
+                }) if observed == owner
+            ) {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("runtime output did not report requested lease owner");
+    }
+
     async fn recv_until_replay_finished(
         output: &mut ClientOutputRx,
     ) -> anyhow::Result<Vec<ClientOutput>> {
@@ -1436,6 +1471,36 @@ mod tests {
                 client_id: ClientId::new(1),
             })
             .await?;
+        session.shutdown(ShutdownReason::Supervisor).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_acquire_browser_control_without_input() -> anyhow::Result<()> {
+        let config = RuntimeConfig {
+            mode: SessionMode::NewShell {
+                shell: test_shell_command()?,
+            },
+            initial_size: test_size()?,
+            reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::Hold,
+        };
+        let session = RuntimeSession::start(config)?;
+        let (output_tx, mut output_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(1),
+                output: output_tx,
+            })
+            .await?;
+        recv_until_replay_finished(&mut output_rx).await?;
+
+        session
+            .send(RuntimeCommand::AcquireControl {
+                client_id: ClientId::new(1),
+            })
+            .await?;
+        recv_until_lease_owner(&mut output_rx, LeaseOwner::Browser).await?;
         session.shutdown(ShutdownReason::Supervisor).await?;
         Ok(())
     }

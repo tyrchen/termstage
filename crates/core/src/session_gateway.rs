@@ -230,6 +230,24 @@ where
             .map_err(Into::into)
     }
 
+    /// Reports whether a backend-native local client is attached to the
+    /// session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionGatewayError`] when the session is missing or the
+    /// backend cannot inspect native client state.
+    pub async fn has_native_client(
+        &mut self,
+        session: &SessionName,
+    ) -> Result<bool, SessionGatewayError> {
+        let record = self.registry.get(session)?.clone();
+        self.backend
+            .has_native_client(record.backend())
+            .await
+            .map_err(Into::into)
+    }
+
     /// Scrolls backend-visible pane history when `controller` owns the lease.
     ///
     /// # Errors

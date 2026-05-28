@@ -4,7 +4,11 @@
 //! commands to create/find a session, resolve the active pane, write input,
 //! resize the pane, read the visible screen, and close the session.
 
-use std::path::{Path, PathBuf};
+use std::{
+    env,
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 use bytes::Bytes;
 use tokio::process::Command;
@@ -52,11 +56,16 @@ impl TmuxBackend {
         &self.tmux
     }
 
-    async fn ensure_session(&self, session: &SessionName) -> Result<(), BackendError> {
+    async fn ensure_session(
+        &self,
+        session: &SessionName,
+        size: TerminalSize,
+    ) -> Result<bool, BackendError> {
         if self.session_exists(session).await? {
-            return Ok(());
+            return Ok(false);
         }
-        self.create_session(session).await
+        self.create_session(session, size).await?;
+        Ok(true)
     }
 
     async fn session_exists(&self, session: &SessionName) -> Result<bool, BackendError> {
@@ -71,7 +80,13 @@ impl TmuxBackend {
         Ok(output.status.success())
     }
 
-    async fn create_session(&self, session: &SessionName) -> Result<(), BackendError> {
+    async fn create_session(
+        &self,
+        session: &SessionName,
+        size: TerminalSize,
+    ) -> Result<(), BackendError> {
+        let cols = size.cols.get().to_string();
+        let rows = size.rows.get().to_string();
         let output = self
             .command()
             .env("COLORTERM", TERMINAL_COLOR_MODE)
@@ -84,6 +99,10 @@ impl TmuxBackend {
             .arg("-d")
             .arg("-s")
             .arg(session.as_str())
+            .arg("-x")
+            .arg(&cols)
+            .arg("-y")
+            .arg(&rows)
             .arg("-e")
             .arg(format!("COLORTERM={TERMINAL_COLOR_MODE}"))
             .arg("-e")
@@ -95,6 +114,7 @@ impl TmuxBackend {
                 "TERM_PROGRAM_VERSION={}",
                 env!("CARGO_PKG_VERSION")
             ))
+            .arg(default_shell_command())
             .output()
             .await
             .map_err(BackendError::Io)?;
@@ -132,7 +152,7 @@ impl TmuxBackend {
             env!("CARGO_PKG_VERSION"),
         ])
         .await?;
-        self.run(["set-option", "-t", session.as_str(), "mouse", "on"])
+        self.run(["set-option", "-t", session.as_str(), "mouse", "off"])
             .await?;
         self.run([
             "set-option",
@@ -140,6 +160,34 @@ impl TmuxBackend {
             session.as_str(),
             "history-limit",
             TMUX_HISTORY_LIMIT,
+        ])
+        .await
+    }
+
+    async fn has_attached_client(&self, session: &SessionName) -> Result<bool, BackendError> {
+        let output = self
+            .command()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                session.as_str(),
+                "#{session_attached}",
+            ])
+            .output()
+            .await
+            .map_err(BackendError::Io)?;
+        let text = Self::success_stdout(output, "tmux display-message failed")?;
+        Ok(parse_u16(text.trim())? > 0)
+    }
+
+    async fn set_window_size_latest(&self, target: &BackendSessionRef) -> Result<(), BackendError> {
+        self.run([
+            "set-window-option",
+            "-t",
+            target.window().as_str(),
+            "window-size",
+            "latest",
         ])
         .await
     }
@@ -229,10 +277,14 @@ impl BackendAdapter for TmuxBackend {
         session: &SessionName,
         size: TerminalSize,
     ) -> Result<BackendSessionRef, BackendError> {
-        self.ensure_session(session).await?;
+        let created = self.ensure_session(session, size).await?;
         self.prepare_session(session).await?;
         let reference = self.resolve_reference(session).await?;
-        self.resize(&reference, size).await?;
+        if created {
+            self.set_window_size_latest(&reference).await?;
+        } else {
+            self.resize(&reference, size).await?;
+        }
         Ok(reference)
     }
 
@@ -260,8 +312,18 @@ impl BackendAdapter for TmuxBackend {
         target: &BackendSessionRef,
         key: &str,
     ) -> Result<(), BackendError> {
-        self.run(["send-keys", "-t", target.pane().as_str(), "--", key])
-            .await
+        if key == "Enter" {
+            return self
+                .run(["send-keys", "-t", target.pane().as_str(), "C-j"])
+                .await;
+        }
+        if key.starts_with('-') {
+            self.run(["send-keys", "-t", target.pane().as_str(), "--", key])
+                .await
+        } else {
+            self.run(["send-keys", "-t", target.pane().as_str(), key])
+                .await
+        }
     }
 
     async fn run_command(
@@ -269,8 +331,8 @@ impl BackendAdapter for TmuxBackend {
         target: &BackendSessionRef,
         command: &str,
     ) -> Result<(), BackendError> {
-        self.send_text(target, command).await?;
-        self.send_key(target, "Enter").await
+        self.run(["send-keys", "-t", target.pane().as_str(), command, "Enter"])
+            .await
     }
 
     async fn resize(
@@ -299,7 +361,8 @@ impl BackendAdapter for TmuxBackend {
             "-y",
             &rows,
         ])
-        .await
+        .await?;
+        self.set_window_size_latest(target).await
     }
 
     async fn read_screen(
@@ -346,7 +409,7 @@ impl BackendAdapter for TmuxBackend {
         let cursor_row = parse_u16(cursor_row)?;
         let output = self
             .command()
-            .args(["capture-pane", "-p", "-t", target.pane().as_str()])
+            .args(["capture-pane", "-e", "-p", "-t", target.pane().as_str()])
             .output()
             .await
             .map_err(BackendError::Io)?;
@@ -355,6 +418,13 @@ impl BackendAdapter for TmuxBackend {
         Ok(BackendScreenSnapshot::new(
             size, cursor_col, cursor_row, lines,
         ))
+    }
+
+    async fn has_native_client(
+        &mut self,
+        target: &BackendSessionRef,
+    ) -> Result<bool, BackendError> {
+        self.has_attached_client(target.session()).await
     }
 
     async fn scroll(
@@ -396,6 +466,12 @@ fn parse_u16(value: &str) -> Result<u16, BackendError> {
     })
 }
 
+fn default_shell_command() -> OsString {
+    env::var_os("SHELL")
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or_else(|| OsString::from("/bin/sh"))
+}
+
 fn output_message(
     output: std::process::Output,
     fallback: &'static str,
@@ -411,7 +487,7 @@ fn output_message(
 
 #[cfg(test)]
 mod tests {
-    use std::{process::Stdio, time::Duration};
+    use std::{path::Path, process::Stdio, time::Duration};
 
     use anyhow::Context;
     use tokio::{process::Command as TokioCommand, time::sleep};
@@ -471,11 +547,12 @@ mod tests {
         assert_eq!(reference.session(), &session);
         assert!(!reference.window().as_str().is_empty());
         assert!(!reference.pane().as_str().is_empty());
+        assert_eq!(session_option(&tmux, &session, "mouse").await?, "off");
 
         backend
             .run_command(&reference, "printf termstage-backend-ok")
             .await?;
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(300)).await;
         let snapshot = backend.read_screen(&reference).await?;
         assert!(
             snapshot
@@ -486,7 +563,7 @@ mod tests {
 
         backend.send_text(&reference, "printf text-ok").await?;
         backend.send_key(&reference, "Enter").await?;
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(300)).await;
         let snapshot = backend.read_screen(&reference).await?;
         assert!(snapshot.lines().iter().any(|line| line.contains("text-ok")));
 
@@ -495,6 +572,10 @@ mod tests {
             .await?;
         let resized = backend.read_screen(&reference).await?;
         assert_eq!(resized.size(), TerminalSize::new(100, 30)?);
+        assert_eq!(
+            window_size_option(&tmux, reference.window()).await?,
+            "latest"
+        );
 
         backend.close_session(&reference).await?;
         cleanup.disarm();
@@ -510,6 +591,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_should_preserve_color_attributes_when_reading_tmux_screen() -> anyhow::Result<()>
+    {
+        let tmux = which::which("tmux").context("tmux unavailable")?;
+        let session = SessionName::new(format!("termstage-backend-color-{}", std::process::id()))?;
+        let _cleanup = TmuxSessionCleanup::new(tmux.clone(), session.clone());
+        let status = TokioCommand::new(&tmux)
+            .env_remove("TMUX")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                session.as_str(),
+                "printf '\\033[31mtermstage-red\\033[0m\\n'; sleep 2",
+            ])
+            .status()
+            .await
+            .context("failed to create tmux color test session")?;
+        if !status.success() {
+            anyhow::bail!("tmux color test session exited with {status}");
+        }
+        let mut backend = TmuxBackend::new(tmux);
+        let reference = backend
+            .create_or_find_session(&session, TerminalSize::new(80, 24)?)
+            .await?;
+        sleep(Duration::from_millis(300)).await;
+        let snapshot = backend.read_screen(&reference).await?;
+
+        assert!(
+            snapshot
+                .lines()
+                .iter()
+                .any(|line| line.contains("termstage-red") && line.contains("\x1b[")),
+            "tmux capture did not preserve color attributes: {:?}",
+            snapshot.lines()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_detect_attached_tmux_client() -> anyhow::Result<()> {
+        let tmux = which::which("tmux").context("tmux unavailable")?;
+        let session = SessionName::new(format!("termstage-backend-attach-{}", std::process::id()))?;
+        let mut cleanup = TmuxSessionCleanup::new(tmux.clone(), session.clone());
+        let mut backend = TmuxBackend::new(tmux.clone());
+        let reference = backend
+            .create_or_find_session(&session, TerminalSize::new(80, 24)?)
+            .await?;
+        assert!(!backend.has_native_client(&reference).await?);
+        let mut client = TokioCommand::new(&tmux)
+            .env_remove("TMUX")
+            .args(["-C", "attach-session", "-t", session.as_str()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to spawn tmux control client")?;
+        sleep(Duration::from_millis(200)).await;
+
+        assert!(backend.has_native_client(&reference).await?);
+
+        let _kill_result = client.kill().await;
+        let _status = client.wait().await.context("tmux control client failed")?;
+        backend.close_session(&reference).await?;
+        cleanup.disarm();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_should_report_missing_tmux_backend() -> anyhow::Result<()> {
         let mut backend = TmuxBackend::new(PathBuf::from("/definitely/missing/tmux"));
         let result = backend
@@ -521,5 +670,41 @@ mod tests {
 
         assert!(matches!(result, Err(BackendError::Io(_))));
         Ok(())
+    }
+
+    async fn window_size_option(tmux: &Path, window: &BackendWindowId) -> anyhow::Result<String> {
+        let output = TokioCommand::new(tmux)
+            .env_remove("TMUX")
+            .args([
+                "show-window-options",
+                "-v",
+                "-t",
+                window.as_str(),
+                "window-size",
+            ])
+            .output()
+            .await?;
+        if !output.status.success() {
+            anyhow::bail!("tmux show-window-options exited with {}", output.status);
+        }
+        let value = String::from_utf8(output.stdout)?;
+        Ok(value.trim().to_owned())
+    }
+
+    async fn session_option(
+        tmux: &Path,
+        session: &SessionName,
+        option: &str,
+    ) -> anyhow::Result<String> {
+        let output = TokioCommand::new(tmux)
+            .env_remove("TMUX")
+            .args(["show-options", "-v", "-t", session.as_str(), option])
+            .output()
+            .await?;
+        if !output.status.success() {
+            anyhow::bail!("tmux show-options exited with {}", output.status);
+        }
+        let value = String::from_utf8(output.stdout)?;
+        Ok(value.trim().to_owned())
     }
 }

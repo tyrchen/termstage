@@ -291,6 +291,19 @@ pub trait BackendAdapter: Send {
         target: &BackendSessionRef,
     ) -> Result<BackendScreenSnapshot, BackendError>;
 
+    /// Reports whether a backend-native local client is attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when the backend cannot inspect native client
+    /// state.
+    async fn has_native_client(
+        &mut self,
+        _target: &BackendSessionRef,
+    ) -> Result<bool, BackendError> {
+        Ok(false)
+    }
+
     /// Scrolls backend-visible pane history.
     ///
     /// # Errors

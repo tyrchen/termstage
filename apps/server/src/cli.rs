@@ -3,9 +3,11 @@
 use std::{
     env,
     ffi::OsString,
+    io,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
     str::FromStr,
+    sync::Arc,
     time::Duration,
 };
 
@@ -22,7 +24,7 @@ use termstage_core::{
     tmux_backend::TmuxBackend,
 };
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::web::{PresentationSettings, PresentationTheme, WebConfig, WebExposure, serve};
 
@@ -33,6 +35,7 @@ const MAX_FONT_SIZE: u16 = 96;
 const TOKEN_ENV_MAX_BYTES: usize = 128;
 const ACTOR_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const GATEWAY_LEASE_TTL: Duration = Duration::from_secs(90);
+const GATEWAY_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Browser terminal command-line arguments.
 #[derive(Debug, Parser)]
@@ -131,7 +134,7 @@ impl TryFrom<CliArgs> for ValidatedCliConfig {
             None => None,
         };
         let (exposure, token) = exposure_and_token(&args)?;
-        let initial_size = TerminalSize::new(80, 24).context("default terminal size is invalid")?;
+        let initial_size = initial_terminal_size()?;
         if args.command.is_some() && !matches!(args.mode, CliMode::Shell) {
             bail!("--command requires --mode shell");
         }
@@ -245,11 +248,9 @@ async fn run_gateway_tmux(config: ValidatedCliConfig, session: SessionName) -> a
         )
         .await
         .context("failed to create or find tmux backend session")?;
-    let mut web_config = WebConfig::local_tmux_gateway(
-        config.token,
-        std::sync::Arc::new(Mutex::new(gateway)),
-        session,
-    );
+    let gateway = Arc::new(Mutex::new(gateway));
+    let mut web_config =
+        WebConfig::local_tmux_gateway(config.token, Arc::clone(&gateway), session.clone());
     web_config.host = config.host;
     web_config.port = config.port;
     web_config.presentation = config.presentation;
@@ -269,7 +270,7 @@ async fn run_gateway_tmux(config: ValidatedCliConfig, session: SessionName) -> a
         eprintln!("{launch_url}");
     }
     info!(address = %server.address(), "browser terminal server started");
-    wait_for_gateway_shutdown().await;
+    wait_for_gateway_shutdown_or_session_end(gateway, session).await;
     server
         .shutdown()
         .await
@@ -288,6 +289,43 @@ fn shell_mode_command(path: Option<PathBuf>, args: Vec<OsString>) -> anyhow::Res
             ShellCommand::new(executable, command_args).map_err(Into::into)
         }
     }
+}
+
+fn initial_terminal_size() -> anyhow::Result<TerminalSize> {
+    terminal_size_from_tty()
+        .or_else(|_tty_error| terminal_size_from_env())
+        .or_else(|_env_error| default_terminal_size())
+}
+
+fn default_terminal_size() -> anyhow::Result<TerminalSize> {
+    TerminalSize::new(80, 24).context("default terminal size is invalid")
+}
+
+fn terminal_size_from_env() -> anyhow::Result<TerminalSize> {
+    let cols = env::var("COLUMNS").context("$COLUMNS is not set")?;
+    let rows = env::var("LINES").context("$LINES is not set")?;
+    terminal_size_from_values(&cols, &rows)
+}
+
+fn terminal_size_from_tty() -> anyhow::Result<TerminalSize> {
+    #[cfg(unix)]
+    {
+        let size = rustix::termios::tcgetwinsize(io::stdin())
+            .or_else(|_stdin_error| rustix::termios::tcgetwinsize(io::stdout()))
+            .or_else(|_stdout_error| rustix::termios::tcgetwinsize(io::stderr()))
+            .context("failed to read terminal size from stdio")?;
+        TerminalSize::new(size.ws_col, size.ws_row).context("terminal size is invalid")
+    }
+    #[cfg(not(unix))]
+    {
+        Err(anyhow::anyhow!("terminal size detection is unsupported"))
+    }
+}
+
+fn terminal_size_from_values(cols: &str, rows: &str) -> anyhow::Result<TerminalSize> {
+    let cols = cols.parse::<u16>().context("invalid terminal columns")?;
+    let rows = rows.parse::<u16>().context("invalid terminal rows")?;
+    TerminalSize::new(cols, rows).context("terminal size is invalid")
 }
 
 fn exposure_and_token(args: &CliArgs) -> anyhow::Result<(WebExposure, AccessToken)> {
@@ -372,8 +410,32 @@ async fn wait_for_shutdown_or_runtime_exit(session: &RuntimeSession) -> Shutdown
     }
 }
 
-async fn wait_for_gateway_shutdown() {
-    let _result = tokio::signal::ctrl_c().await;
+async fn wait_for_gateway_shutdown_or_session_end(
+    gateway: Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    session: SessionName,
+) {
+    let mut interval = tokio::time::interval(GATEWAY_EXIT_POLL_INTERVAL);
+    loop {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                match result {
+                    Ok(()) | Err(_) => {}
+                }
+                return;
+            }
+            _ = interval.tick() => {
+                let result = {
+                    let mut gateway = gateway.lock().await;
+                    gateway.read_screen(&session).await
+                };
+                if let Err(error) = result {
+                    debug!(%error, session = session.as_str(), "tmux gateway session ended");
+                    tokio::time::sleep(GATEWAY_EXIT_POLL_INTERVAL).await;
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn init_tracing() {
@@ -649,6 +711,22 @@ mod tests {
         let result =
             CliArgs::try_parse_from(["termstage", "--mode", "shell", "--command", "abc", "-a"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_should_parse_initial_terminal_size_values() -> anyhow::Result<()> {
+        assert_eq!(
+            terminal_size_from_values("132", "43")?,
+            TerminalSize::new(132, 43)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_invalid_initial_terminal_size_values() {
+        assert!(terminal_size_from_values("0", "24").is_err());
+        assert!(terminal_size_from_values("80", "0").is_err());
+        assert!(terminal_size_from_values("wide", "24").is_err());
     }
 
     #[test]

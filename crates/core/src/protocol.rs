@@ -390,6 +390,8 @@ impl FromStr for AccessToken {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ClientControlMessage {
+    /// Request browser input control for the current client.
+    AcquireControl,
     /// Resize the PTY to the validated dimensions.
     Resize {
         /// Terminal columns.
@@ -569,6 +571,16 @@ mod tests {
         };
         let json = serde_json::to_string(&message)?;
         assert_eq!(json, r#"{"type":"resize","cols":100,"rows":30}"#);
+        let decoded: ClientControlMessage = serde_json::from_str(&json)?;
+        assert_eq!(decoded, message);
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_round_trip_acquire_control_as_camel_case() -> anyhow::Result<()> {
+        let message = ClientControlMessage::AcquireControl;
+        let json = serde_json::to_string(&message)?;
+        assert_eq!(json, r#"{"type":"acquireControl"}"#);
         let decoded: ClientControlMessage = serde_json::from_str(&json)?;
         assert_eq!(decoded, message);
         Ok(())
