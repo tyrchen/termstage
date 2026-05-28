@@ -120,6 +120,39 @@ impl BackendSessionRef {
     }
 }
 
+/// Result of creating or finding a backend session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendSessionResolution {
+    reference: BackendSessionRef,
+    created: bool,
+}
+
+impl BackendSessionResolution {
+    /// Creates a backend session resolution.
+    #[must_use]
+    pub const fn new(reference: BackendSessionRef, created: bool) -> Self {
+        Self { reference, created }
+    }
+
+    /// Returns the resolved backend reference.
+    #[must_use]
+    pub const fn reference(&self) -> &BackendSessionRef {
+        &self.reference
+    }
+
+    /// Returns whether the backend session was created by this operation.
+    #[must_use]
+    pub const fn created(&self) -> bool {
+        self.created
+    }
+
+    /// Consumes the resolution and returns the backend reference.
+    #[must_use]
+    pub fn into_reference(self) -> BackendSessionRef {
+        self.reference
+    }
+}
+
 /// Snapshot of a backend pane screen for semantic API responses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendScreenSnapshot {
@@ -217,7 +250,8 @@ pub enum BackendError {
 #[allow(async_fn_in_trait)]
 /// Adapter boundary for backend-owned terminal sessions.
 pub trait BackendAdapter: Send {
-    /// Creates or finds a backend session and returns its active pane reference.
+    /// Creates or finds a backend session and returns its active pane reference
+    /// plus whether a new backend session was created.
     ///
     /// # Errors
     ///
@@ -227,7 +261,7 @@ pub trait BackendAdapter: Send {
         &mut self,
         session: &SessionName,
         size: TerminalSize,
-    ) -> Result<BackendSessionRef, BackendError>;
+    ) -> Result<BackendSessionResolution, BackendError>;
 
     /// Writes terminal input bytes to a backend pane.
     ///
@@ -341,6 +375,22 @@ mod tests {
         assert_eq!(reference.session().as_str(), "demo");
         assert_eq!(reference.window().as_str(), "0");
         assert_eq!(reference.pane().as_str(), "%1");
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_create_backend_session_resolution() -> anyhow::Result<()> {
+        let reference = BackendSessionRef::new(
+            BackendKind::Tmux,
+            SessionName::new("demo")?,
+            BackendWindowId::new("0")?,
+            BackendPaneId::new("%1")?,
+        );
+        let resolution = BackendSessionResolution::new(reference.clone(), true);
+
+        assert!(resolution.created());
+        assert_eq!(resolution.reference(), &reference);
+        assert_eq!(resolution.into_reference(), reference);
         Ok(())
     }
 

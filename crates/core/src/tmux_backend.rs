@@ -16,7 +16,7 @@ use tokio::process::Command;
 use crate::{
     backend::{
         BackendAdapter, BackendError, BackendKind, BackendPaneId, BackendScreenSnapshot,
-        BackendScrollDirection, BackendSessionRef, BackendWindowId,
+        BackendScrollDirection, BackendSessionRef, BackendSessionResolution, BackendWindowId,
     },
     protocol::{SafeMessage, SessionName, TerminalSize},
 };
@@ -392,7 +392,7 @@ impl BackendAdapter for TmuxBackend {
         &mut self,
         session: &SessionName,
         size: TerminalSize,
-    ) -> Result<BackendSessionRef, BackendError> {
+    ) -> Result<BackendSessionResolution, BackendError> {
         let created = self.ensure_session(session, size).await?;
         self.prepare_session(session).await?;
         let reference = self.resolve_reference(session).await?;
@@ -401,7 +401,7 @@ impl BackendAdapter for TmuxBackend {
         } else {
             self.resize(&reference, size).await?;
         }
-        Ok(reference)
+        Ok(BackendSessionResolution::new(reference, created))
     }
 
     async fn write_input(
@@ -699,9 +699,11 @@ mod tests {
         let session = SessionName::new(format!("termstage-backend-test-{}", std::process::id()))?;
         let mut cleanup = TmuxSessionCleanup::new(tmux.clone(), session.clone());
         let mut backend = TmuxBackend::new(tmux.clone());
-        let reference = backend
+        let resolution = backend
             .create_or_find_session(&session, TerminalSize::new(80, 24)?)
             .await?;
+        assert!(resolution.created());
+        let reference = resolution.into_reference();
 
         assert_eq!(reference.kind(), BackendKind::Tmux);
         assert_eq!(reference.session(), &session);
@@ -772,9 +774,11 @@ mod tests {
             anyhow::bail!("tmux color test session exited with {status}");
         }
         let mut backend = TmuxBackend::new(tmux);
-        let reference = backend
+        let resolution = backend
             .create_or_find_session(&session, TerminalSize::new(80, 24)?)
             .await?;
+        assert!(!resolution.created());
+        let reference = resolution.into_reference();
         sleep(Duration::from_millis(300)).await;
         let snapshot = backend.read_screen(&reference).await?;
 
@@ -797,7 +801,8 @@ mod tests {
         let mut backend = TmuxBackend::new(tmux.clone());
         let reference = backend
             .create_or_find_session(&session, TerminalSize::new(80, 24)?)
-            .await?;
+            .await?
+            .into_reference();
         assert!(!backend.has_native_client(&reference).await?);
         let mut client = TokioCommand::new(&tmux)
             .env_remove("TMUX")

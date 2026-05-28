@@ -324,7 +324,7 @@ impl TryFrom<CliArgs> for ValidatedCliCommand {
 
     fn try_from(args: CliArgs) -> Result<Self, Self::Error> {
         match args.command {
-            CliCommand::Session(command) => Ok(Self::Session(command)),
+            CliCommand::Session(command) => Ok(Self::Session(validate_session_args(command)?)),
             CliCommand::Api(command) => Ok(Self::Api(command)),
             CliCommand::Web(command) => match command.command {
                 WebCommand::Start(serve) => {
@@ -474,7 +474,7 @@ async fn run_legacy_runtime(config: ValidatedCliConfig) -> anyhow::Result<()> {
 async fn run_gateway_tmux(config: ValidatedCliConfig, session: SessionName) -> anyhow::Result<()> {
     let backend = TmuxBackend::from_path().context("failed to resolve tmux backend")?;
     let mut gateway = SessionGateway::new(backend, GATEWAY_LEASE_TTL);
-    gateway
+    let registration = gateway
         .create_or_find_session(
             session.clone(),
             session.clone(),
@@ -482,6 +482,10 @@ async fn run_gateway_tmux(config: ValidatedCliConfig, session: SessionName) -> a
         )
         .await
         .context("failed to create or find tmux backend session")?;
+    eprintln!(
+        "{}",
+        tmux_gateway_session_status(&session, registration.backend_created())
+    );
     let gateway = Arc::new(Mutex::new(gateway));
     let mut web_config =
         WebConfig::local_tmux_gateway(config.token, Arc::clone(&gateway), session.clone());
@@ -523,6 +527,26 @@ fn shell_mode_command(path: Option<PathBuf>, args: Vec<OsString>) -> anyhow::Res
             ShellCommand::new(executable, command_args).map_err(Into::into)
         }
     }
+}
+
+fn validate_session_args(args: SessionArgs) -> anyhow::Result<SessionArgs> {
+    if let SessionCommand::Stop { kill, detach, .. } = &args.command {
+        match (*kill, *detach) {
+            (true, false) | (false, true) => {}
+            (false, false) => bail!("session stop requires exactly one of --detach or --kill"),
+            (true, true) => bail!("session stop cannot combine --detach and --kill"),
+        }
+    }
+    Ok(args)
+}
+
+fn tmux_gateway_session_status(session: &SessionName, created: bool) -> String {
+    let action = if created { "created" } else { "reused" };
+    format!(
+        "tmux session {} {action}; attach with: tmux attach -t {}",
+        session.as_str(),
+        session.as_str()
+    )
 }
 
 fn initial_terminal_size() -> anyhow::Result<TerminalSize> {
@@ -1506,6 +1530,53 @@ mod tests {
         };
         assert!(matches!(args.backend, CliBackend::Tmux));
         assert!(matches!(args.command, SessionCommand::List));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_require_session_stop_action() -> anyhow::Result<()> {
+        let args = CliArgs::try_parse_from(["termstage", "session", "stop", "demo"])?;
+        assert!(ValidatedCliCommand::try_from(args).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_conflicting_session_stop_actions() {
+        let result =
+            CliArgs::try_parse_from(["termstage", "session", "stop", "demo", "--detach", "--kill"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_should_accept_session_stop_detach_action() -> anyhow::Result<()> {
+        let args = CliArgs::try_parse_from(["termstage", "session", "stop", "demo", "--detach"])?;
+        let command = ValidatedCliCommand::try_from(args)?;
+        let ValidatedCliCommand::Session(args) = command else {
+            anyhow::bail!("session command group must validate to session args");
+        };
+        assert!(matches!(
+            args.command,
+            SessionCommand::Stop {
+                kill: false,
+                detach: true,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_report_tmux_gateway_session_status() -> anyhow::Result<()> {
+        let session = SessionName::from_str("demo")?;
+
+        assert_eq!(
+            tmux_gateway_session_status(&session, true),
+            "tmux session demo created; attach with: tmux attach -t demo"
+        );
+        assert_eq!(
+            tmux_gateway_session_status(&session, false),
+            "tmux session demo reused; attach with: tmux attach -t demo"
+        );
         Ok(())
     }
 
