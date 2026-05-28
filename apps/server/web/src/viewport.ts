@@ -1,9 +1,5 @@
 import type { TerminalViewportOrigin } from './socket';
-
-const VIEWPORT_ORIGIN_MAX = 10000;
-const WHEEL_PIXEL_CELL = 36;
-const WHEEL_LINE_CELL = 3;
-const WHEEL_PAGE_CELL = 24;
+import { browserTerminalViewportSettings } from './settings';
 
 export function watchBackendViewportNavigation(
   root: HTMLElement,
@@ -40,14 +36,18 @@ function horizontalViewportDelta(event: WheelEvent): number {
   const direction = Math.sign(rawDelta);
   const magnitude = Math.abs(rawDelta);
   if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
-    return direction * WHEEL_PAGE_CELL;
+    return direction * browserTerminalViewportSettings.wheelPageCell;
   }
   if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) {
-    return direction * Math.max(1, Math.round(magnitude * WHEEL_LINE_CELL));
+    return (
+      direction * Math.max(1, Math.round(magnitude * browserTerminalViewportSettings.wheelLineCell))
+    );
   }
-  return direction * Math.max(1, Math.round(magnitude / WHEEL_PIXEL_CELL));
+  return (
+    direction * Math.max(1, Math.round(magnitude / browserTerminalViewportSettings.wheelPixelCell))
+  );
 }
 
 function clampViewportOrigin(value: number): number {
-  return Math.min(VIEWPORT_ORIGIN_MAX, Math.max(0, value));
+  return Math.min(browserTerminalViewportSettings.originMax, Math.max(0, value));
 }

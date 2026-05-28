@@ -1,15 +1,12 @@
 import { FitAddon } from '@xterm/addon-fit';
 import { Terminal } from '@xterm/xterm';
 
+import { browserTerminalResizeSettings } from './settings';
+
 export interface TerminalSize {
   cols: number;
   rows: number;
 }
-
-const TERMINAL_COLS_MIN = 20;
-const TERMINAL_COLS_MAX = 300;
-const TERMINAL_ROWS_MIN = 5;
-const TERMINAL_ROWS_MAX = 120;
 
 export function watchTerminalResize(
   root: HTMLElement,
@@ -27,7 +24,7 @@ export function watchTerminalResize(
         lastSize = nextSize;
         sendResize(nextSize);
       }
-    }, 80);
+    }, browserTerminalResizeSettings.observerDebounceMs);
   });
   resizeObserver.observe(root);
   sendResize(lastSize);
@@ -43,8 +40,16 @@ export function proposedTerminalSize(fitAddon: FitAddon, terminal: Terminal): Te
 
 export function clampTerminalSize(size: TerminalSize): TerminalSize {
   return {
-    cols: clampDimension(size.cols, TERMINAL_COLS_MIN, TERMINAL_COLS_MAX),
-    rows: clampDimension(size.rows, TERMINAL_ROWS_MIN, TERMINAL_ROWS_MAX)
+    cols: clampDimension(
+      size.cols,
+      browserTerminalResizeSettings.colsMin,
+      browserTerminalResizeSettings.colsMax
+    ),
+    rows: clampDimension(
+      size.rows,
+      browserTerminalResizeSettings.rowsMin,
+      browserTerminalResizeSettings.rowsMax
+    )
   };
 }
 

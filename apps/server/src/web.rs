@@ -2,7 +2,7 @@
 
 use std::{
     fmt::{self, Debug, Formatter, Write as FmtWrite},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::{
         Arc,
@@ -53,7 +53,10 @@ use tokio::{
 };
 use tracing::debug;
 
-use crate::assets::{asset_response, index_response};
+use crate::{
+    assets::{asset_response, index_response},
+    settings::{backend_gateway, browser_socket, http_server, runtime_tunnel, semantic_api},
+};
 
 type BrowserSocketSender = futures_util::stream::SplitSink<WebSocket, Message>;
 
@@ -106,31 +109,6 @@ impl GatewayViewport {
         self.origin_row
     }
 }
-
-const DEFAULT_BIND_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
-const MAX_FRAME_SIZE: usize = 16 * 1024;
-const MAX_MESSAGE_SIZE: usize = 64 * 1024;
-const API_BODY_LIMIT_BYTES: usize = 8 * 1024;
-const SEMANTIC_TEXT_MAX_BYTES: usize = 4096;
-const SEMANTIC_KEY_MAX_BYTES: usize = 32;
-const SEMANTIC_SCROLL_MAX_AMOUNT: u16 = 100;
-const SEMANTIC_WAIT_TEXT_MAX_BYTES: usize = 4096;
-const SEMANTIC_WAIT_TIMEOUT_DEFAULT_MS: u64 = 5_000;
-const SEMANTIC_WAIT_TIMEOUT_MAX_MS: u64 = 60_000;
-const SEMANTIC_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const CLIENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
-const CLIENT_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
-const SERVER_PING_INTERVAL: Duration = Duration::from_secs(25);
-const GATEWAY_SCREEN_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const GATEWAY_SCREEN_ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const GATEWAY_SCREEN_ACTIVE_POLL_WINDOW: Duration = Duration::from_secs(2);
-const SERVER_PING_PAYLOAD: &[u8] = b"termstage";
-const TUNNEL_CHANNEL_CAPACITY: usize = 32;
-const CLOSE_REASON_SESSION_ENDED: &str = "session ended";
-const CLOSE_REASON_SERVER_SHUTDOWN: &str = "server shutting down";
-const CLOSE_REASON_CLIENT_DISCONNECTED: &str = "client disconnected";
-const CLOSE_REASON_CONTROLLER_REPLACED: &str = "controller replaced";
-const CLOSE_REASON_RUNTIME_ERROR: &str = "runtime error";
 
 /// Presentation theme sent to the frontend through the HTML document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,7 +176,7 @@ impl WebConfig {
         _runtime: RuntimeConfig,
     ) -> Self {
         Self {
-            host: DEFAULT_BIND_HOST,
+            host: http_server::DEFAULT_BIND_HOST,
             port: 0,
             exposure: WebExposure::Local,
             token,
@@ -216,7 +194,7 @@ impl WebConfig {
         session: SessionName,
     ) -> Self {
         Self {
-            host: DEFAULT_BIND_HOST,
+            host: http_server::DEFAULT_BIND_HOST,
             port: 0,
             exposure: WebExposure::Local,
             token,
@@ -443,7 +421,9 @@ pub fn router(config: WebConfig) -> Result<Router, SecurityError> {
         router = router.route(prefix, get(index));
     }
     Ok(router
-        .layer(DefaultBodyLimit::max(API_BODY_LIMIT_BYTES))
+        .layer(DefaultBodyLimit::max(
+            http_server::API_REQUEST_BODY_LIMIT_BYTES,
+        ))
         .with_state(state))
 }
 
@@ -669,8 +649,8 @@ async fn ws(
     validate_http_request(&state, peer, &headers, &query, true)?;
     let browser_viewport = query.browser_viewport();
     Ok(upgrade
-        .max_frame_size(MAX_FRAME_SIZE)
-        .max_message_size(MAX_MESSAGE_SIZE)
+        .max_frame_size(http_server::WEBSOCKET_MAX_FRAME_BYTES)
+        .max_message_size(http_server::WEBSOCKET_MAX_MESSAGE_BYTES)
         .on_upgrade(move |socket| bridge_socket(state, socket, browser_viewport))
         .into_response())
 }
@@ -815,7 +795,7 @@ async fn api_scroll(
     Json(request): Json<ScrollRequest>,
 ) -> Result<Json<OperationResponse>, ApiError> {
     validate_api_request(&state, peer, &headers, &query)?;
-    if request.amount == 0 || request.amount > SEMANTIC_SCROLL_MAX_AMOUNT {
+    if request.amount == 0 || request.amount > semantic_api::SCROLL_MAX_AMOUNT {
         return Err(ApiError::BadRequest);
     }
     let controller = agent_controller(request.controller_id)?;
@@ -873,8 +853,8 @@ async fn bridge_runtime_socket(
     }
 
     let mut last_client_message = Instant::now();
-    let mut heartbeat_check = time::interval(CLIENT_HEARTBEAT_CHECK_INTERVAL);
-    let mut server_ping = time::interval(SERVER_PING_INTERVAL);
+    let mut heartbeat_check = time::interval(browser_socket::CLIENT_HEARTBEAT_CHECK_INTERVAL);
+    let mut server_ping = time::interval(browser_socket::SERVER_PING_INTERVAL);
     loop {
         tokio::select! {
             result = &mut bridge_task, if !bridge_finished => {
@@ -899,7 +879,7 @@ async fn bridge_runtime_socket(
                 }
             }
             _ = heartbeat_check.tick() => {
-                if last_client_message.elapsed() >= CLIENT_HEARTBEAT_TIMEOUT {
+                if last_client_message.elapsed() >= browser_socket::CLIENT_HEARTBEAT_TIMEOUT {
                     debug!(client_id = client_id.get(), "closing stale browser terminal websocket");
                     let _result = sender.send(Message::Close(Some(client_timeout_close()))).await;
                     break;
@@ -966,10 +946,10 @@ async fn bridge_gateway_socket(
     let mut last_client_message = Instant::now();
     let mut browser_viewport = browser_viewport;
     let mut last_screen = Bytes::new();
-    let mut heartbeat_check = time::interval(CLIENT_HEARTBEAT_CHECK_INTERVAL);
-    let mut server_ping = time::interval(SERVER_PING_INTERVAL);
-    let mut screen_poll = time::interval(GATEWAY_SCREEN_IDLE_POLL_INTERVAL);
-    let mut active_screen_poll = time::interval(GATEWAY_SCREEN_ACTIVE_POLL_INTERVAL);
+    let mut heartbeat_check = time::interval(browser_socket::CLIENT_HEARTBEAT_CHECK_INTERVAL);
+    let mut server_ping = time::interval(browser_socket::SERVER_PING_INTERVAL);
+    let mut screen_poll = time::interval(backend_gateway::SCREEN_IDLE_POLL_INTERVAL);
+    let mut active_screen_poll = time::interval(backend_gateway::SCREEN_ACTIVE_POLL_INTERVAL);
     let mut active_screen_poll_until: Option<Instant> = None;
     loop {
         tokio::select! {
@@ -988,7 +968,7 @@ async fn bridge_gateway_socket(
                     break;
                 }
                 if action.should_refresh() {
-                    active_screen_poll_until = Some(Instant::now() + GATEWAY_SCREEN_ACTIVE_POLL_WINDOW);
+                    active_screen_poll_until = Some(Instant::now() + backend_gateway::SCREEN_ACTIVE_POLL_WINDOW);
                     if poll_gateway_screen(&gateway, &session, controller, &mut lease, browser_viewport, &mut sender, &mut last_screen).await.should_close() {
                         break;
                     }
@@ -1009,7 +989,7 @@ async fn bridge_gateway_socket(
                 }
             }
             _ = heartbeat_check.tick() => {
-                if last_client_message.elapsed() >= CLIENT_HEARTBEAT_TIMEOUT {
+                if last_client_message.elapsed() >= browser_socket::CLIENT_HEARTBEAT_TIMEOUT {
                     debug!(client_id = client_id.get(), "closing stale gateway browser terminal websocket");
                     let _result = sender.send(Message::Close(Some(client_timeout_close()))).await;
                     break;
@@ -1659,8 +1639,10 @@ impl TunnelTransport for InProcessTunnelTransport {
 }
 
 fn in_process_tunnel_pair() -> (BrowserTunnelPeer, InProcessTunnelTransport) {
-    let (browser_to_runtime_tx, browser_to_runtime_rx) = mpsc::channel(TUNNEL_CHANNEL_CAPACITY);
-    let (runtime_to_browser_tx, runtime_to_browser_rx) = mpsc::channel(TUNNEL_CHANNEL_CAPACITY);
+    let (browser_to_runtime_tx, browser_to_runtime_rx) =
+        mpsc::channel(runtime_tunnel::CHANNEL_CAPACITY);
+    let (runtime_to_browser_tx, runtime_to_browser_rx) =
+        mpsc::channel(runtime_tunnel::CHANNEL_CAPACITY);
     (
         BrowserTunnelPeer {
             inbound: runtime_to_browser_rx,
@@ -1827,7 +1809,9 @@ async fn send_server_ping(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
 ) -> Result<(), axum::Error> {
     sender
-        .send(Message::Ping(Bytes::from_static(SERVER_PING_PAYLOAD)))
+        .send(Message::Ping(Bytes::from_static(
+            browser_socket::SERVER_PING_PAYLOAD,
+        )))
         .await
 }
 
@@ -2093,7 +2077,7 @@ fn protocol_close() -> CloseFrame {
 fn runtime_unavailable_close() -> CloseFrame {
     CloseFrame {
         code: close_code::NORMAL,
-        reason: CLOSE_REASON_SESSION_ENDED.into(),
+        reason: browser_socket::CLOSE_REASON_SESSION_ENDED.into(),
     }
 }
 
@@ -2106,11 +2090,11 @@ fn client_timeout_close() -> CloseFrame {
 
 fn close_frame_for_tunnel_reason(reason: TunnelCloseReason) -> CloseFrame {
     let reason = match reason {
-        TunnelCloseReason::Supervisor => CLOSE_REASON_SERVER_SHUTDOWN,
-        TunnelCloseReason::ClientDisconnect => CLOSE_REASON_CLIENT_DISCONNECTED,
-        TunnelCloseReason::ControllerReplaced => CLOSE_REASON_CONTROLLER_REPLACED,
-        TunnelCloseReason::ChildExit => CLOSE_REASON_SESSION_ENDED,
-        TunnelCloseReason::RuntimeError(_error) => CLOSE_REASON_RUNTIME_ERROR,
+        TunnelCloseReason::Supervisor => browser_socket::CLOSE_REASON_SERVER_SHUTDOWN,
+        TunnelCloseReason::ClientDisconnect => browser_socket::CLOSE_REASON_CLIENT_DISCONNECTED,
+        TunnelCloseReason::ControllerReplaced => browser_socket::CLOSE_REASON_CONTROLLER_REPLACED,
+        TunnelCloseReason::ChildExit => browser_socket::CLOSE_REASON_SESSION_ENDED,
+        TunnelCloseReason::RuntimeError(_error) => browser_socket::CLOSE_REASON_RUNTIME_ERROR,
     };
     CloseFrame {
         code: close_code::NORMAL,
@@ -2154,7 +2138,7 @@ struct WaitForScreenTextResult {
 }
 
 fn bounded_semantic_text(text: String) -> Result<String, ApiError> {
-    if text.len() > SEMANTIC_TEXT_MAX_BYTES || text.as_bytes().contains(&0) {
+    if text.len() > semantic_api::TEXT_MAX_BYTES || text.as_bytes().contains(&0) {
         return Err(ApiError::BadRequest);
     }
     Ok(text)
@@ -2168,7 +2152,9 @@ fn semantic_command_text(command: String) -> Result<String, ApiError> {
 }
 
 fn bounded_wait_text(text: String) -> Result<String, ApiError> {
-    if text.is_empty() || text.len() > SEMANTIC_WAIT_TEXT_MAX_BYTES || text.as_bytes().contains(&0)
+    if text.is_empty()
+        || text.len() > semantic_api::WAIT_TEXT_MAX_BYTES
+        || text.as_bytes().contains(&0)
     {
         return Err(ApiError::BadRequest);
     }
@@ -2176,15 +2162,15 @@ fn bounded_wait_text(text: String) -> Result<String, ApiError> {
 }
 
 fn semantic_wait_timeout(value: Option<u64>) -> Result<Duration, ApiError> {
-    let millis = value.unwrap_or(SEMANTIC_WAIT_TIMEOUT_DEFAULT_MS);
-    if millis == 0 || millis > SEMANTIC_WAIT_TIMEOUT_MAX_MS {
+    let millis = value.unwrap_or(semantic_api::WAIT_TIMEOUT_DEFAULT_MS);
+    if millis == 0 || millis > semantic_api::WAIT_TIMEOUT_MAX_MS {
         return Err(ApiError::BadRequest);
     }
     Ok(Duration::from_millis(millis))
 }
 
 fn semantic_key_token(key: &str) -> Result<String, ApiError> {
-    if key.is_empty() || key.len() > SEMANTIC_KEY_MAX_BYTES {
+    if key.is_empty() || key.len() > semantic_api::KEY_MAX_BYTES {
         return Err(ApiError::BadRequest);
     }
     let token = match key {
@@ -2269,7 +2255,7 @@ async fn wait_for_screen_text(
                 snapshot: Some(snapshot),
             });
         }
-        time::sleep(SEMANTIC_WAIT_POLL_INTERVAL).await;
+        time::sleep(semantic_api::WAIT_POLL_INTERVAL).await;
     }
 }
 
@@ -2982,7 +2968,10 @@ mod tests {
         cleanup.active = false;
 
         let close_reason = read_socket_close_reason(&mut socket).await?;
-        assert_eq!(close_reason.as_deref(), Some(CLOSE_REASON_SESSION_ENDED));
+        assert_eq!(
+            close_reason.as_deref(),
+            Some(browser_socket::CLOSE_REASON_SESSION_ENDED)
+        );
         server.shutdown().await?;
         Ok(())
     }
@@ -3429,7 +3418,10 @@ mod tests {
             "websocket did not receive process-exited control before close"
         );
         let close_reason = read_socket_close_reason(&mut socket).await?;
-        assert_eq!(close_reason.as_deref(), Some(CLOSE_REASON_SESSION_ENDED));
+        assert_eq!(
+            close_reason.as_deref(),
+            Some(browser_socket::CLOSE_REASON_SESSION_ENDED)
+        );
         server.shutdown().await?;
         drop(session);
         Ok(())
@@ -3540,7 +3532,10 @@ mod tests {
 
         let mut socket = connect_test_socket(server.address(), &token).await?;
         let close_reason = read_socket_close_reason(&mut socket).await?;
-        assert_eq!(close_reason.as_deref(), Some(CLOSE_REASON_SESSION_ENDED));
+        assert_eq!(
+            close_reason.as_deref(),
+            Some(browser_socket::CLOSE_REASON_SESSION_ENDED)
+        );
         runtime_task.await.context("fake runtime task panicked")?;
         server.shutdown().await?;
         Ok(())
@@ -3564,7 +3559,10 @@ mod tests {
 
         let mut socket = connect_test_socket(server.address(), &token).await?;
         let close_reason = read_socket_close_reason(&mut socket).await?;
-        assert_eq!(close_reason.as_deref(), Some(CLOSE_REASON_SESSION_ENDED));
+        assert_eq!(
+            close_reason.as_deref(),
+            Some(browser_socket::CLOSE_REASON_SESSION_ENDED)
+        );
         server.shutdown().await?;
         Ok(())
     }
@@ -3593,7 +3591,10 @@ mod tests {
             .send(TungsteniteMessage::Binary(Bytes::from_static(b"x")))
             .await?;
         let close_reason = read_socket_close_reason(&mut socket).await?;
-        assert_eq!(close_reason.as_deref(), Some(CLOSE_REASON_SESSION_ENDED));
+        assert_eq!(
+            close_reason.as_deref(),
+            Some(browser_socket::CLOSE_REASON_SESSION_ENDED)
+        );
         runtime_task.await.context("fake runtime task panicked")?;
         server.shutdown().await?;
         Ok(())
@@ -3627,7 +3628,7 @@ mod tests {
         socket
             .send(TungsteniteMessage::Binary(Bytes::from(vec![
                 b'x';
-                MAX_MESSAGE_SIZE
+                http_server::WEBSOCKET_MAX_MESSAGE_BYTES
                     + 1
             ])))
             .await?;
