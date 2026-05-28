@@ -7,9 +7,12 @@
 pub mod backend;
 pub mod operation_lock;
 pub mod protocol;
+#[cfg(feature = "backend-rmux")]
+pub mod rmux_backend;
 pub mod runtime;
 pub mod security;
 pub mod session_gateway;
 pub mod session_registry;
+mod settings;
 pub mod tmux_backend;
 pub mod tunnel;

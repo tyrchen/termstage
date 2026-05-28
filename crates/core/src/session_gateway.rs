@@ -10,7 +10,10 @@ use bytes::Bytes;
 use thiserror::Error;
 
 use crate::{
-    backend::{BackendAdapter, BackendError, BackendScreenSnapshot, BackendScrollDirection},
+    backend::{
+        BackendAdapter, BackendError, BackendScreenSnapshot, BackendScrollDirection,
+        BackendSessionRef,
+    },
     operation_lock::{ControllerRef, OperationLease, OperationLockError, OperationLockTable},
     protocol::{SessionName, TerminalSize},
     session_registry::{SessionRecord, SessionRegistry, SessionRegistryError},
@@ -28,6 +31,36 @@ pub enum SessionGatewayError {
     /// Operation lock failed.
     #[error("operation lock failed")]
     Lock(#[from] OperationLockError),
+}
+
+/// Result of registering a backend session with the gateway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRegistration {
+    record: SessionRecord,
+    backend_created: bool,
+}
+
+impl SessionRegistration {
+    /// Creates a session registration result.
+    #[must_use]
+    pub const fn new(record: SessionRecord, backend_created: bool) -> Self {
+        Self {
+            record,
+            backend_created,
+        }
+    }
+
+    /// Returns the registered session record.
+    #[must_use]
+    pub const fn record(&self) -> &SessionRecord {
+        &self.record
+    }
+
+    /// Returns whether the backend created a new session.
+    #[must_use]
+    pub const fn backend_created(&self) -> bool {
+        self.backend_created
+    }
 }
 
 /// Gateway that binds termstage sessions, operation locks, and a backend adapter.
@@ -66,20 +99,43 @@ where
         termstage_session: SessionName,
         backend_session: SessionName,
         size: TerminalSize,
-    ) -> Result<(), SessionGatewayError> {
+    ) -> Result<SessionRegistration, SessionGatewayError> {
         if self.registry.get(&termstage_session).is_ok() {
             return Err(SessionRegistryError::AlreadyRegistered {
                 session: termstage_session,
             }
             .into());
         }
-        let backend_ref = self
+        let resolution = self
             .backend
             .create_or_find_session(&backend_session, size)
             .await?;
-        self.registry
-            .register(SessionRecord::new(termstage_session, backend_ref))?;
-        Ok(())
+        let backend_created = resolution.created();
+        let record = SessionRecord::new(termstage_session, resolution.into_reference());
+        self.registry.register(record.clone())?;
+        Ok(SessionRegistration::new(record, backend_created))
+    }
+
+    /// Registers an existing backend session under a `termstage` session id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionGatewayError`] when the termstage session id is already
+    /// registered.
+    pub fn register_existing_session(
+        &mut self,
+        termstage_session: SessionName,
+        backend_ref: BackendSessionRef,
+    ) -> Result<SessionRegistration, SessionGatewayError> {
+        if self.registry.get(&termstage_session).is_ok() {
+            return Err(SessionRegistryError::AlreadyRegistered {
+                session: termstage_session,
+            }
+            .into());
+        }
+        let record = SessionRecord::new(termstage_session, backend_ref);
+        self.registry.register(record.clone())?;
+        Ok(SessionRegistration::new(record, false))
     }
 
     /// Acquires or renews the Level 1 write lease for a session.
@@ -230,6 +286,24 @@ where
             .map_err(Into::into)
     }
 
+    /// Reports whether a backend-native local client is attached to the
+    /// session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionGatewayError`] when the session is missing or the
+    /// backend cannot inspect native client state.
+    pub async fn has_native_client(
+        &mut self,
+        session: &SessionName,
+    ) -> Result<bool, SessionGatewayError> {
+        let record = self.registry.get(session)?.clone();
+        self.backend
+            .has_native_client(record.backend())
+            .await
+            .map_err(Into::into)
+    }
+
     /// Scrolls backend-visible pane history when `controller` owns the lease.
     ///
     /// # Errors
@@ -293,7 +367,8 @@ mod tests {
     use super::*;
     use crate::{
         backend::{
-            BackendKind, BackendPaneId, BackendScrollDirection, BackendSessionRef, BackendWindowId,
+            BackendKind, BackendPaneId, BackendScrollDirection, BackendSessionRef,
+            BackendSessionResolution, BackendWindowId,
         },
         operation_lock::{ControllerId, ControllerKind},
         protocol::SafeMessage,
@@ -328,9 +403,12 @@ mod tests {
             &mut self,
             session: &SessionName,
             _size: TerminalSize,
-        ) -> Result<BackendSessionRef, BackendError> {
+        ) -> Result<BackendSessionResolution, BackendError> {
             self.created.push(session.clone());
-            Self::reference(session)
+            Ok(BackendSessionResolution::new(
+                Self::reference(session)?,
+                true,
+            ))
         }
 
         async fn write_input(
@@ -566,6 +644,45 @@ mod tests {
         ));
         let backend = gateway.into_backend();
         assert_eq!(backend.created, [SessionName::new("backend-demo")?]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_report_backend_created_status() -> anyhow::Result<()> {
+        let mut gateway = SessionGateway::new(FakeBackend::default(), Duration::from_secs(30));
+
+        let registration = gateway
+            .create_or_find_session(
+                SessionName::new("demo")?,
+                SessionName::new("backend-demo")?,
+                TerminalSize::new(80, 24)?,
+            )
+            .await?;
+
+        assert_eq!(registration.record().termstage_session().as_str(), "demo");
+        assert!(registration.backend_created());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_should_register_existing_backend_session() -> anyhow::Result<()> {
+        let mut gateway = SessionGateway::new(FakeBackend::default(), Duration::from_secs(30));
+        let termstage_session = SessionName::new("demo")?;
+        let backend_session = SessionName::new("backend-demo")?;
+
+        let registration = gateway.register_existing_session(
+            termstage_session.clone(),
+            FakeBackend::reference(&backend_session)?,
+        )?;
+
+        assert_eq!(
+            registration.record().termstage_session(),
+            &termstage_session
+        );
+        assert!(!registration.backend_created());
+        assert_eq!(gateway.registry().len(), 1);
+        let backend = gateway.into_backend();
+        assert!(backend.created.is_empty());
         Ok(())
     }
 

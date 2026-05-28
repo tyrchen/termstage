@@ -120,12 +120,46 @@ impl BackendSessionRef {
     }
 }
 
+/// Result of creating or finding a backend session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendSessionResolution {
+    reference: BackendSessionRef,
+    created: bool,
+}
+
+impl BackendSessionResolution {
+    /// Creates a backend session resolution.
+    #[must_use]
+    pub const fn new(reference: BackendSessionRef, created: bool) -> Self {
+        Self { reference, created }
+    }
+
+    /// Returns the resolved backend reference.
+    #[must_use]
+    pub const fn reference(&self) -> &BackendSessionRef {
+        &self.reference
+    }
+
+    /// Returns whether the backend session was created by this operation.
+    #[must_use]
+    pub const fn created(&self) -> bool {
+        self.created
+    }
+
+    /// Consumes the resolution and returns the backend reference.
+    #[must_use]
+    pub fn into_reference(self) -> BackendSessionRef {
+        self.reference
+    }
+}
+
 /// Snapshot of a backend pane screen for semantic API responses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendScreenSnapshot {
     size: TerminalSize,
     cursor_col: u16,
     cursor_row: u16,
+    cursor_visible: bool,
     lines: Vec<String>,
 }
 
@@ -137,6 +171,25 @@ impl BackendScreenSnapshot {
             size,
             cursor_col,
             cursor_row,
+            cursor_visible: true,
+            lines,
+        }
+    }
+
+    /// Creates a backend screen snapshot with explicit cursor visibility.
+    #[must_use]
+    pub fn new_with_cursor_visibility(
+        size: TerminalSize,
+        cursor_col: u16,
+        cursor_row: u16,
+        cursor_visible: bool,
+        lines: Vec<String>,
+    ) -> Self {
+        Self {
+            size,
+            cursor_col,
+            cursor_row,
+            cursor_visible,
             lines,
         }
     }
@@ -157,6 +210,12 @@ impl BackendScreenSnapshot {
     #[must_use]
     pub const fn cursor_row(&self) -> u16 {
         self.cursor_row
+    }
+
+    /// Returns whether the backend cursor is visible.
+    #[must_use]
+    pub const fn cursor_visible(&self) -> bool {
+        self.cursor_visible
     }
 
     /// Returns screen lines.
@@ -217,7 +276,8 @@ pub enum BackendError {
 #[allow(async_fn_in_trait)]
 /// Adapter boundary for backend-owned terminal sessions.
 pub trait BackendAdapter: Send {
-    /// Creates or finds a backend session and returns its active pane reference.
+    /// Creates or finds a backend session and returns its active pane reference
+    /// plus whether a new backend session was created.
     ///
     /// # Errors
     ///
@@ -227,7 +287,7 @@ pub trait BackendAdapter: Send {
         &mut self,
         session: &SessionName,
         size: TerminalSize,
-    ) -> Result<BackendSessionRef, BackendError>;
+    ) -> Result<BackendSessionResolution, BackendError>;
 
     /// Writes terminal input bytes to a backend pane.
     ///
@@ -291,6 +351,19 @@ pub trait BackendAdapter: Send {
         target: &BackendSessionRef,
     ) -> Result<BackendScreenSnapshot, BackendError>;
 
+    /// Reports whether a backend-native local client is attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when the backend cannot inspect native client
+    /// state.
+    async fn has_native_client(
+        &mut self,
+        _target: &BackendSessionRef,
+    ) -> Result<bool, BackendError> {
+        Ok(false)
+    }
+
     /// Scrolls backend-visible pane history.
     ///
     /// # Errors
@@ -332,6 +405,22 @@ mod tests {
     }
 
     #[test]
+    fn test_should_create_backend_session_resolution() -> anyhow::Result<()> {
+        let reference = BackendSessionRef::new(
+            BackendKind::Tmux,
+            SessionName::new("demo")?,
+            BackendWindowId::new("0")?,
+            BackendPaneId::new("%1")?,
+        );
+        let resolution = BackendSessionResolution::new(reference.clone(), true);
+
+        assert!(resolution.created());
+        assert_eq!(resolution.reference(), &reference);
+        assert_eq!(resolution.into_reference(), reference);
+        Ok(())
+    }
+
+    #[test]
     fn test_should_create_screen_snapshot() -> anyhow::Result<()> {
         let snapshot =
             BackendScreenSnapshot::new(TerminalSize::new(80, 24)?, 4, 3, vec!["prompt".to_owned()]);
@@ -339,7 +428,17 @@ mod tests {
         assert_eq!(snapshot.size(), TerminalSize::new(80, 24)?);
         assert_eq!(snapshot.cursor_col(), 4);
         assert_eq!(snapshot.cursor_row(), 3);
+        assert!(snapshot.cursor_visible());
         assert_eq!(snapshot.lines(), ["prompt"]);
+
+        let hidden_cursor = BackendScreenSnapshot::new_with_cursor_visibility(
+            TerminalSize::new(80, 24)?,
+            4,
+            3,
+            false,
+            vec!["prompt".to_owned()],
+        );
+        assert!(!hidden_cursor.cursor_visible());
         Ok(())
     }
 }

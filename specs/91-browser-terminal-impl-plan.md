@@ -2,7 +2,7 @@
 
 Status: draft v1
 Owner: termstage
-Last updated: 2026-05-19
+Last updated: 2026-05-28
 
 ## 0. Readiness Assessment
 
@@ -89,10 +89,12 @@ Maps to roadmap: closes M1.
 | --- | --- | --- | --- |
 | 4.1 | Add frontend terminal app with xterm.js, fit addon, and custom socket protocol. | [20](./20-browser-terminal-web-design.md) | 1.5 days |
 | 4.2 | Add presentation theme/font presets and CLI plumbing. | [50](./50-browser-terminal-cli-design.md) | 1 day |
-| 4.3 | Add Playwright smoke tests and screenshots. | [72](./72-browser-terminal-verification-plan.md) | 1 day |
+| 4.3 | Make xterm an embedded component that fits its terminal container rather than the whole page. | [20](./20-browser-terminal-web-design.md), [72](./72-browser-terminal-verification-plan.md) | 0.5 day |
+| 4.4 | Add Playwright smoke tests and screenshots. | [72](./72-browser-terminal-verification-plan.md) | 1 day |
 
 Exit criteria: M1 roadmap criteria pass and screenshots are non-empty across target
-viewports.
+viewports. The page can contain toolbar/future HTML around the terminal without
+changing xterm sizing semantics.
 
 ## 8. Phase 5 - Reconnect and Hardening
 
@@ -148,18 +150,39 @@ Maps to roadmap: closes M6.
 
 | # | Task | Spec | Effort |
 | --- | --- | --- | --- |
-| 8.1 | Add a session registry that maps `termstage` session ids to backend session/window/pane references. | [23](./23-local-remote-command-lease-design.md), [11](./11-browser-terminal-runtime-design.md) | 1 day |
-| 8.2 | Define the backend adapter trait and implement the first tmux adapter path for create/find, write input, resize, and read-screen. Start rmux-specific follow-up work from the dedicated rmux adapter spec. | [23](./23-local-remote-command-lease-design.md), [25](./25-rmux-backend-adapter-design.md), [61](./61-browser-terminal-crates-and-features.md) | 2 days |
+| 8.1 | Add an in-memory gateway registry that maps request session ids to backend session/window/pane references for the active web/API gateway process. | [23](./23-local-remote-command-lease-design.md), [11](./11-browser-terminal-runtime-design.md) | 1 day |
+| 8.2 | Define the backend adapter trait and implement the first rmux/tmux adapter path for create/find, stream output, write input, resize, and read-screen. | [23](./23-local-remote-command-lease-design.md), [61](./61-browser-terminal-crates-and-features.md) | 2 days |
 | 8.3 | Route browser WebSocket traffic through Termstage Protocol into the backend adapter. | [10](./10-browser-terminal-protocol-design.md), [20](./20-browser-terminal-web-design.md), [23](./23-local-remote-command-lease-design.md) | 1.5 days |
 | 8.4 | Add Semantic Operations API for press-key, write-text, run-command, read-screen, and scroll. | [23](./23-local-remote-command-lease-design.md), [70](./70-browser-terminal-security-design.md) | 2 days |
 | 8.5 | Implement Level 1 operation lock with owner kind, owner id, epoch, TTL, and conflict responses. | [23](./23-local-remote-command-lease-design.md), [72](./72-browser-terminal-verification-plan.md) | 1 day |
-| 8.6 | Add integration tests for browser/API synchronization, lock conflict, native backend attach compatibility, and semantic request/response behavior. | [23](./23-local-remote-command-lease-design.md), [72](./72-browser-terminal-verification-plan.md) | 1.5 days |
+| 8.6 | Implement backend-screen to browser-viewport projection for backend-owned gateway sessions. Browser resize updates viewport state and must not resize the backend pane. | [20](./20-browser-terminal-web-design.md), [23](./23-local-remote-command-lease-design.md), [72](./72-browser-terminal-verification-plan.md) | 1 day |
+| 8.7 | Add integration tests for browser/API synchronization, lock conflict, native backend attach compatibility, viewport projection, and semantic request/response behavior. | [23](./23-local-remote-command-lease-design.md), [72](./72-browser-terminal-verification-plan.md) | 1.5 days |
 
 Exit criteria: M6 roadmap criteria pass; browser and Agent API operate the same
 backend session; exactly one controller can write at a time; backend-native local
-attach does not share stdout/stderr with `termstage`.
+attach does not share stdout/stderr with `termstage`; backend screens larger than
+the browser terminal container remain navigable without resizing the backend pane.
 
-## 13. Cross-References
+## 13. Phase 9 - CLI Command Groups
+
+Maps to roadmap: follow-up after M6.
+
+| # | Task | Spec | Effort |
+| --- | --- | --- | --- |
+| 9.1 | Move backend session creation under `termstage session create --backend <backend> --name <name> [--command <cmd>]`, use the backend session id as the termstage session id, and reject root-level startup aliases with clap's missing/unknown subcommand errors. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 1 day |
+| 9.2 | Introduce argv-safe tmux pane startup for `session create --command <cmd> -g <arg>` while keeping `--mode shell` as the compatibility path for browser-only command runs. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 1 day |
+| 9.3 | Add `termstage session` commands for list, inspect, and stop. `session stop <session-id>` kills the backend session; inspect returns backend-native attach info, so a separate attach-info command is unnecessary. | [50](./50-browser-terminal-cli-design.md), [70](./70-browser-terminal-security-design.md) | 2 days |
+| 9.4 | Add `termstage api` commands for send-text, send-key, run-command wait/capture, and read-screen as CLI wrappers over the semantic API. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 2 days |
+| 9.5 | Add `termstage browser attach <session-id>` for browser/API gateway attachment to an existing session id, and reserve `termstage auth` for future OIDC login/logout/status flows. | [50](./50-browser-terminal-cli-design.md), [21](./21-browser-terminal-public-exposure-design.md) | 1 day |
+
+Exit criteria: the CLI help is organized by `session`, `browser`, `api`, `web`,
+and `auth` command groups; termstage-created backend sessions use the `TerminalUse-`
+prefix; attach resolution checks exact names, `TerminalUse-` fallback, and tmux
+legacy `ts-` fallback for unprefixed names; browser gateway attachment does not
+create backend sessions; legacy root invocation is rejected; parser tests cover
+command grouping and invalid flag placement.
+
+## 14. Cross-References
 
 - Depends on: all numbered browser terminal specs.
 - Pairs with: [90-browser-terminal-roadmap.md](./90-browser-terminal-roadmap.md).

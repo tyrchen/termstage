@@ -11,7 +11,6 @@ use std::{
     process::Stdio,
     sync::mpsc::{self, RecvTimeoutError},
     thread::{self, JoinHandle},
-    time::Duration,
 };
 
 use bytes::Bytes;
@@ -21,22 +20,13 @@ use thiserror::Error;
 use tokio::sync::mpsc::{self as tokio_mpsc, error::TrySendError};
 use tracing::warn;
 
-use crate::protocol::{
-    ErrorCode, LeaseOwner, ProtocolError, SafeMessage, ServerControlMessage, SessionName,
-    TerminalSize, WarningCode,
+use crate::{
+    protocol::{
+        ErrorCode, LeaseOwner, ProtocolError, SafeMessage, ServerControlMessage, SessionName,
+        TerminalSize, WarningCode,
+    },
+    settings::{runtime_actor as runtime_settings, tmux_backend as tmux_settings},
 };
-
-const COMMAND_MAILBOX_CAPACITY: usize = 128;
-const CLIENT_OUTPUT_CAPACITY: usize = 256;
-const PTY_READ_CHUNK_SIZE: usize = 8192;
-const REPLAY_BUFFER_BYTES: usize = 1024 * 1024;
-const REPLAY_BUFFER_CHUNKS: usize = CLIENT_OUTPUT_CAPACITY / 2;
-const ACTOR_IDLE_WAIT: Duration = Duration::from_millis(10);
-const TERMINAL_TERM: &str = "xterm-256color";
-const TERMINAL_COLOR_MODE: &str = "truecolor";
-const TERMINAL_PROGRAM: &str = "termstage";
-const TMUX_HISTORY_LIMIT: &str = "100000";
-const DISABLE_COLOR_ENV: [&str; 2] = ["NO_COLOR", "ANSI_COLORS_DISABLED"];
 
 /// Runtime failure.
 #[derive(Debug, Error)]
@@ -256,6 +246,11 @@ pub enum RuntimeCommand {
         /// Terminal bytes.
         bytes: Bytes,
     },
+    /// Acquire browser control without writing terminal bytes.
+    AcquireControl {
+        /// Client id.
+        client_id: ClientId,
+    },
     /// Resize the PTY.
     Resize {
         /// New PTY size.
@@ -303,8 +298,9 @@ impl RuntimeSession {
             .take_writer()
             .map_err(RuntimeError::TakeWriter)?;
         let child = spawn_child(&*pair.slave, &config.mode)?;
-        let (command_tx, command_rx) = tokio_mpsc::channel(COMMAND_MAILBOX_CAPACITY);
-        let (pty_tx, pty_rx) = mpsc::sync_channel(COMMAND_MAILBOX_CAPACITY);
+        let (command_tx, command_rx) =
+            tokio_mpsc::channel(runtime_settings::COMMAND_MAILBOX_CAPACITY);
+        let (pty_tx, pty_rx) = mpsc::sync_channel(runtime_settings::COMMAND_MAILBOX_CAPACITY);
         let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
         let reader = spawn_reader(reader, pty_tx.clone(), 0)?;
         let initial_size = config.initial_size;
@@ -360,7 +356,7 @@ impl RuntimeSession {
     /// Creates a bounded client output mailbox.
     #[must_use]
     pub fn client_mailbox() -> (ClientOutputTx, ClientOutputRx) {
-        tokio_mpsc::channel(CLIENT_OUTPUT_CAPACITY)
+        tokio_mpsc::channel(runtime_settings::CLIENT_OUTPUT_CAPACITY)
     }
 
     /// Sends a command to the actor.
@@ -540,9 +536,9 @@ impl SessionActor {
             }
 
             if self.child_exited {
-                thread::sleep(ACTOR_IDLE_WAIT);
+                thread::sleep(runtime_settings::ACTOR_IDLE_WAIT);
             } else {
-                match self.pty_rx.recv_timeout(ACTOR_IDLE_WAIT) {
+                match self.pty_rx.recv_timeout(runtime_settings::ACTOR_IDLE_WAIT) {
                     Ok(event) => {
                         if let Some(reason) = self.handle_pty_event(event) {
                             return reason;
@@ -655,6 +651,12 @@ impl SessionActor {
                 } else {
                     None
                 }
+            }
+            RuntimeCommand::AcquireControl { client_id } => {
+                if self.browser_controller == Some(client_id) && !self.child_exited {
+                    self.claim_browser(client_id);
+                }
+                None
             }
             RuntimeCommand::Resize { size } => self.resize(size),
             RuntimeCommand::BrowserResize { client_id, size } => {
@@ -915,7 +917,9 @@ impl SessionActor {
 fn record_replay_chunk(replay: &mut VecDeque<Bytes>, replay_bytes: &mut usize, bytes: Bytes) {
     *replay_bytes = replay_bytes.saturating_add(bytes.len());
     replay.push_back(bytes);
-    while *replay_bytes > REPLAY_BUFFER_BYTES || replay.len() > REPLAY_BUFFER_CHUNKS {
+    while *replay_bytes > runtime_settings::REPLAY_BUFFER_BYTES
+        || replay.len() > runtime_settings::REPLAY_BUFFER_CHUNKS
+    {
         if let Some(removed) = replay.pop_front() {
             *replay_bytes = replay_bytes.saturating_sub(removed.len());
         } else {
@@ -953,12 +957,12 @@ fn spawn_child(
 }
 
 fn apply_terminal_environment(command: &mut CommandBuilder) {
-    command.env("TERM", TERMINAL_TERM);
-    command.env("COLORTERM", TERMINAL_COLOR_MODE);
+    command.env("TERM", runtime_settings::TERMINAL_TERM);
+    command.env("COLORTERM", tmux_settings::TERMINAL_COLOR_MODE);
     command.env("CLICOLOR", "1");
-    command.env("TERM_PROGRAM", TERMINAL_PROGRAM);
+    command.env("TERM_PROGRAM", tmux_settings::TERMINAL_PROGRAM);
     command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-    for name in DISABLE_COLOR_ENV {
+    for name in tmux_settings::DISABLE_COLOR_ENV_KEYS {
         command.env_remove(name);
     }
 }
@@ -968,17 +972,27 @@ fn prepare_tmux_server_environment(tmux: &Path) -> Result<(), RuntimeError> {
         return Ok(());
     }
 
-    for name in DISABLE_COLOR_ENV {
+    for name in tmux_settings::DISABLE_COLOR_ENV_KEYS {
         run_tmux_environment_command(tmux, ["set-environment", "-g", "-u", name])?;
     }
     run_tmux_environment_command(
         tmux,
-        ["set-environment", "-g", "COLORTERM", TERMINAL_COLOR_MODE],
+        [
+            "set-environment",
+            "-g",
+            "COLORTERM",
+            tmux_settings::TERMINAL_COLOR_MODE,
+        ],
     )?;
     run_tmux_environment_command(tmux, ["set-environment", "-g", "CLICOLOR", "1"])?;
     run_tmux_environment_command(
         tmux,
-        ["set-environment", "-g", "TERM_PROGRAM", TERMINAL_PROGRAM],
+        [
+            "set-environment",
+            "-g",
+            "TERM_PROGRAM",
+            tmux_settings::TERMINAL_PROGRAM,
+        ],
     )?;
     run_tmux_environment_command(
         tmux,
@@ -996,7 +1010,7 @@ fn prepare_tmux_session_environment(
     tmux: &Path,
     session: &SessionName,
 ) -> Result<(), RuntimeError> {
-    for name in DISABLE_COLOR_ENV {
+    for name in tmux_settings::DISABLE_COLOR_ENV_KEYS {
         run_tmux_environment_command(
             tmux,
             ["set-environment", "-t", session.as_str(), "-u", name],
@@ -1009,7 +1023,7 @@ fn prepare_tmux_session_environment(
             "-t",
             session.as_str(),
             "COLORTERM",
-            TERMINAL_COLOR_MODE,
+            tmux_settings::TERMINAL_COLOR_MODE,
         ],
     )?;
     run_tmux_environment_command(
@@ -1023,7 +1037,7 @@ fn prepare_tmux_session_environment(
             "-t",
             session.as_str(),
             "TERM_PROGRAM",
-            TERMINAL_PROGRAM,
+            tmux_settings::TERMINAL_PROGRAM,
         ],
     )?;
     run_tmux_environment_command(
@@ -1056,7 +1070,7 @@ fn prepare_tmux_session_options(tmux: &Path, session: &SessionName) -> Result<()
             "-t",
             session.as_str(),
             "history-limit",
-            TMUX_HISTORY_LIMIT,
+            tmux_settings::HISTORY_LIMIT,
         ],
     )?;
     Ok(())
@@ -1104,10 +1118,10 @@ fn tmux_session_exists(tmux: &Path, session: &SessionName) -> Result<bool, Runti
 fn create_tmux_session(tmux: &Path, session: &SessionName) -> Result<(), RuntimeError> {
     let status = std::process::Command::new(tmux)
         .env_remove("TMUX")
-        .env("TERM", TERMINAL_TERM)
-        .env("COLORTERM", TERMINAL_COLOR_MODE)
+        .env("TERM", runtime_settings::TERMINAL_TERM)
+        .env("COLORTERM", tmux_settings::TERMINAL_COLOR_MODE)
         .env("CLICOLOR", "1")
-        .env("TERM_PROGRAM", TERMINAL_PROGRAM)
+        .env("TERM_PROGRAM", tmux_settings::TERMINAL_PROGRAM)
         .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"))
         .env_remove("NO_COLOR")
         .env_remove("ANSI_COLORS_DISABLED")
@@ -1116,11 +1130,11 @@ fn create_tmux_session(tmux: &Path, session: &SessionName) -> Result<(), Runtime
         .arg("-s")
         .arg(session.as_str())
         .arg("-e")
-        .arg(format!("COLORTERM={TERMINAL_COLOR_MODE}"))
+        .arg(format!("COLORTERM={}", tmux_settings::TERMINAL_COLOR_MODE))
         .arg("-e")
         .arg("CLICOLOR=1")
         .arg("-e")
-        .arg(format!("TERM_PROGRAM={TERMINAL_PROGRAM}"))
+        .arg(format!("TERM_PROGRAM={}", tmux_settings::TERMINAL_PROGRAM))
         .arg("-e")
         .arg(format!(
             "TERM_PROGRAM_VERSION={}",
@@ -1191,7 +1205,7 @@ fn spawn_reader(
     thread::Builder::new()
         .name("termstage-pty-reader".to_owned())
         .spawn(move || {
-            let mut buffer = [0_u8; PTY_READ_CHUNK_SIZE];
+            let mut buffer = [0_u8; runtime_settings::PTY_READ_CHUNK_SIZE];
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => {
@@ -1262,7 +1276,12 @@ fn safe_fallback_message(_error: ProtocolError) -> SafeMessage {
     reason = "runtime tests use blocking subprocess probes to validate tmux integration"
 )]
 mod tests {
-    use std::{collections::VecDeque, ffi::OsStr, process::Command, time::Instant};
+    use std::{
+        collections::VecDeque,
+        ffi::OsStr,
+        process::Command,
+        time::{Duration, Instant},
+    };
 
     use anyhow::Context;
     use tokio::{
@@ -1365,6 +1384,30 @@ mod tests {
         anyhow::bail!("runtime output did not report process exit");
     }
 
+    async fn recv_until_lease_owner(
+        output: &mut ClientOutputRx,
+        owner: LeaseOwner,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let message = timeout(remaining, output.recv())
+                .await
+                .context("test runtime output timed out")?
+                .context("client output channel closed")?;
+            if matches!(
+                message,
+                ClientOutput::Control(ServerControlMessage::LeaseChanged {
+                    owner: observed,
+                    ..
+                }) if observed == owner
+            ) {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("runtime output did not report requested lease owner");
+    }
+
     async fn recv_until_replay_finished(
         output: &mut ClientOutputRx,
     ) -> anyhow::Result<Vec<ClientOutput>> {
@@ -1436,6 +1479,36 @@ mod tests {
                 client_id: ClientId::new(1),
             })
             .await?;
+        session.shutdown(ShutdownReason::Supervisor).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_should_acquire_browser_control_without_input() -> anyhow::Result<()> {
+        let config = RuntimeConfig {
+            mode: SessionMode::NewShell {
+                shell: test_shell_command()?,
+            },
+            initial_size: test_size()?,
+            reconnect_policy: ReconnectPolicy::TerminateOnShutdown,
+            exit_policy: ExitPolicy::Hold,
+        };
+        let session = RuntimeSession::start(config)?;
+        let (output_tx, mut output_rx) = RuntimeSession::client_mailbox();
+        session
+            .send(RuntimeCommand::AttachClient {
+                client_id: ClientId::new(1),
+                output: output_tx,
+            })
+            .await?;
+        recv_until_replay_finished(&mut output_rx).await?;
+
+        session
+            .send(RuntimeCommand::AcquireControl {
+                client_id: ClientId::new(1),
+            })
+            .await?;
+        recv_until_lease_owner(&mut output_rx, LeaseOwner::Browser).await?;
         session.shutdown(ShutdownReason::Supervisor).await?;
         Ok(())
     }
@@ -1677,7 +1750,7 @@ mod tests {
         );
         assert_eq!(
             tmux_environment_value(&tmux, &session_name, "COLORTERM")?,
-            Some(TERMINAL_COLOR_MODE.to_owned())
+            Some(tmux_settings::TERMINAL_COLOR_MODE.to_owned())
         );
         assert_eq!(
             tmux_environment_value(&tmux, &session_name, "CLICOLOR")?,
@@ -1717,7 +1790,7 @@ mod tests {
         );
         assert_eq!(
             tmux_option_value(&tmux, &session_name, "history-limit")?,
-            Some(TMUX_HISTORY_LIMIT.to_owned())
+            Some(tmux_settings::HISTORY_LIMIT.to_owned())
         );
         Ok(())
     }
@@ -1737,7 +1810,7 @@ mod tests {
         assert!(tmux_session_exists(&tmux, &session_name)?);
         assert_eq!(
             tmux_environment_value(&tmux, &session_name, "COLORTERM")?,
-            Some(TERMINAL_COLOR_MODE.to_owned())
+            Some(tmux_settings::TERMINAL_COLOR_MODE.to_owned())
         );
         assert_eq!(
             tmux_option_value(&tmux, &session_name, "mouse")?,
@@ -1745,7 +1818,7 @@ mod tests {
         );
         assert_eq!(
             tmux_option_value(&tmux, &session_name, "history-limit")?,
-            Some(TMUX_HISTORY_LIMIT.to_owned())
+            Some(tmux_settings::HISTORY_LIMIT.to_owned())
         );
         Ok(())
     }
@@ -1793,7 +1866,7 @@ mod tests {
         );
         assert_eq!(
             tmux_global_environment_value(&tmux, "COLORTERM")?,
-            Some(TERMINAL_COLOR_MODE.to_owned())
+            Some(tmux_settings::TERMINAL_COLOR_MODE.to_owned())
         );
         assert_eq!(
             tmux_global_environment_value(&tmux, "CLICOLOR")?,
@@ -2165,7 +2238,7 @@ mod tests {
 
     #[test]
     fn test_should_bound_replay_by_chunks_with_mailbox_headroom() {
-        let total_chunks = CLIENT_OUTPUT_CAPACITY + 25;
+        let total_chunks = runtime_settings::CLIENT_OUTPUT_CAPACITY + 25;
         let mut replay = VecDeque::new();
         let mut replay_bytes = 0;
 
@@ -2177,14 +2250,14 @@ mod tests {
             );
         }
 
-        assert_eq!(replay.len(), REPLAY_BUFFER_CHUNKS);
-        assert!(replay.len() + 1 < CLIENT_OUTPUT_CAPACITY);
+        assert_eq!(replay.len(), runtime_settings::REPLAY_BUFFER_CHUNKS);
+        assert!(replay.len() + 1 < runtime_settings::CLIENT_OUTPUT_CAPACITY);
         assert_eq!(replay_bytes, replay.iter().map(Bytes::len).sum::<usize>());
         assert_eq!(
             replay.front(),
             Some(&Bytes::from(format!(
                 "chunk-{:03}",
-                total_chunks - REPLAY_BUFFER_CHUNKS
+                total_chunks - runtime_settings::REPLAY_BUFFER_CHUNKS
             )))
         );
         assert_eq!(

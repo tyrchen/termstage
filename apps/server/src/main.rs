@@ -2,6 +2,7 @@
 
 mod assets;
 mod cli;
+mod settings;
 mod web;
 
 #[tokio::main]

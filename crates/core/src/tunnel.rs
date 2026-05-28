@@ -201,6 +201,11 @@ pub enum TunnelFrame {
         /// Terminal bytes.
         bytes: TunnelTerminalPayload,
     },
+    /// Web side requests browser control without terminal input bytes.
+    BrowserAcquireControl {
+        /// Browser client id.
+        client_id: ClientId,
+    },
     /// Web side forwards browser terminal dimensions to the runtime side.
     BrowserResize {
         /// Browser client id.
@@ -446,6 +451,9 @@ impl RuntimeTunnelBridge {
                     bytes: bytes.into_bytes(),
                 })
             }
+            TunnelFrame::BrowserAcquireControl { client_id } => {
+                RuntimeTunnelAction::Command(RuntimeCommand::AcquireControl { client_id })
+            }
             TunnelFrame::BrowserResize { client_id, size } => {
                 RuntimeTunnelAction::Command(RuntimeCommand::BrowserResize { client_id, size })
             }
@@ -561,6 +569,21 @@ mod tests {
 
         assert_eq!(id, client_id);
         assert_eq!(bytes, Bytes::from_static(b"pwd\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_map_browser_acquire_control_to_runtime_command() -> anyhow::Result<()> {
+        let client_id = ClientId::new(4);
+        let frame = TunnelFrame::BrowserAcquireControl { client_id };
+
+        let RuntimeTunnelAction::Command(RuntimeCommand::AcquireControl { client_id: id }) =
+            RuntimeTunnelBridge::action_from_frame(frame)
+        else {
+            anyhow::bail!("expected runtime acquire-control command");
+        };
+
+        assert_eq!(id, client_id);
         Ok(())
     }
 

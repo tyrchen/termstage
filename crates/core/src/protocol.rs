@@ -21,6 +21,7 @@ const TERMINAL_COLS_MIN: u16 = 20;
 const TERMINAL_COLS_MAX: u16 = 300;
 const TERMINAL_ROWS_MIN: u16 = 5;
 const TERMINAL_ROWS_MAX: u16 = 120;
+const VIEWPORT_ORIGIN_MAX: u16 = 10_000;
 
 /// Protocol validation failure.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -46,6 +47,9 @@ pub enum ProtocolError {
     /// A heartbeat sequence increment would overflow.
     #[error("heartbeat sequence overflow")]
     HeartbeatOverflow,
+    /// A browser viewport origin is outside the supported range.
+    #[error("viewport origin must be in 0..=10000")]
+    InvalidViewportOrigin,
 }
 
 /// Valid tmux/session identifier for browser terminal mode.
@@ -125,6 +129,11 @@ impl<'de> Deserialize<'de> for SessionName {
 pub struct TerminalCols(NonZeroU16);
 
 impl TerminalCols {
+    /// Smallest supported terminal column count.
+    pub const MIN: u16 = TERMINAL_COLS_MIN;
+    /// Largest supported terminal column count.
+    pub const MAX: u16 = TERMINAL_COLS_MAX;
+
     /// Creates a validated terminal column count.
     ///
     /// # Errors
@@ -170,6 +179,11 @@ impl<'de> Deserialize<'de> for TerminalCols {
 pub struct TerminalRows(NonZeroU16);
 
 impl TerminalRows {
+    /// Smallest supported terminal row count.
+    pub const MIN: u16 = TERMINAL_ROWS_MIN;
+    /// Largest supported terminal row count.
+    pub const MAX: u16 = TERMINAL_ROWS_MAX;
+
     /// Creates a validated terminal row count.
     ///
     /// # Errors
@@ -232,6 +246,50 @@ impl TerminalSize {
             cols: TerminalCols::new(cols)?,
             rows: TerminalRows::new(rows)?,
         })
+    }
+}
+
+/// Zero-based browser viewport origin in backend screen cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct ViewportOrigin(u16);
+
+impl ViewportOrigin {
+    /// Creates a validated browser viewport origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::InvalidViewportOrigin`] when `value` is larger
+    /// than the supported viewport origin cap.
+    pub fn new(value: u16) -> Result<Self, ProtocolError> {
+        if value <= VIEWPORT_ORIGIN_MAX {
+            Ok(Self(value))
+        } else {
+            Err(ProtocolError::InvalidViewportOrigin)
+        }
+    }
+
+    /// Returns the origin as `u16`.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl TryFrom<u16> for ViewportOrigin {
+    type Error = ProtocolError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for ViewportOrigin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u16::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -390,12 +448,23 @@ impl FromStr for AccessToken {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ClientControlMessage {
+    /// Request browser input control for the current client.
+    AcquireControl,
     /// Resize the PTY to the validated dimensions.
     Resize {
         /// Terminal columns.
         cols: TerminalCols,
         /// Terminal rows.
         rows: TerminalRows,
+    },
+    /// Change the browser-local viewport origin over a backend-owned screen.
+    Viewport {
+        /// Zero-based first visible backend column.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        col: Option<ViewportOrigin>,
+        /// Zero-based first visible backend row.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        row: Option<ViewportOrigin>,
     },
     /// Browser heartbeat with a monotonic sequence.
     Heartbeat {
@@ -551,6 +620,17 @@ mod tests {
     }
 
     #[test]
+    fn test_should_validate_viewport_origin() -> anyhow::Result<()> {
+        assert_eq!(ViewportOrigin::new(0)?.get(), 0);
+        assert_eq!(ViewportOrigin::new(10_000)?.get(), 10_000);
+        assert!(matches!(
+            ViewportOrigin::new(10_001),
+            Err(ProtocolError::InvalidViewportOrigin)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn test_should_reject_unknown_control_fields() -> anyhow::Result<()> {
         let Err(error) = serde_json::from_str::<ClientControlMessage>(
             r#"{"type":"resize","cols":80,"rows":24,"extra":true}"#,
@@ -569,6 +649,29 @@ mod tests {
         };
         let json = serde_json::to_string(&message)?;
         assert_eq!(json, r#"{"type":"resize","cols":100,"rows":30}"#);
+        let decoded: ClientControlMessage = serde_json::from_str(&json)?;
+        assert_eq!(decoded, message);
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_round_trip_viewport_control_as_camel_case() -> anyhow::Result<()> {
+        let message = ClientControlMessage::Viewport {
+            col: Some(ViewportOrigin::new(12)?),
+            row: Some(ViewportOrigin::new(3)?),
+        };
+        let json = serde_json::to_string(&message)?;
+        assert_eq!(json, r#"{"type":"viewport","col":12,"row":3}"#);
+        let decoded: ClientControlMessage = serde_json::from_str(&json)?;
+        assert_eq!(decoded, message);
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_round_trip_acquire_control_as_camel_case() -> anyhow::Result<()> {
+        let message = ClientControlMessage::AcquireControl;
+        let json = serde_json::to_string(&message)?;
+        assert_eq!(json, r#"{"type":"acquireControl"}"#);
         let decoded: ClientControlMessage = serde_json::from_str(&json)?;
         assert_eq!(decoded, message);
         Ok(())

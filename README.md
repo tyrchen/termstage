@@ -92,7 +92,7 @@ cargo run -p termstage --bin termstage -- \
 
 | Option                | Default               | Meaning                                            |
 | --------------------- | --------------------- | -------------------------------------------------- |
-| `--session <name>`    | `presentation`        | Attach to or create this validated tmux session.   |
+| `--session <name>`    | `presentation`        | Attach to or create this backend session as `TerminalUse-<name>`. |
 | `--mode <tmux         | shell>`               | `tmux`                                             | Use a shared tmux session or a fresh shell.    |
 | `--command <path>`      | `$SHELL` or `/bin/sh` | Command executable for shell mode.                   |
 | `-g, --command-arg <arg>` | unset               | Repeatable argv tail for shell mode.               |

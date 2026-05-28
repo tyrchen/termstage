@@ -62,7 +62,8 @@ npm --version
 
 ## Starting a Presentation Session
 
-Use the default tmux session name, `presentation`:
+Use the default session name, `presentation`; backend sessions created by
+termstage are named `TerminalUse-<name>`:
 
 ```bash
 cargo run -p termstage --bin termstage -- --session presentation --open
@@ -97,7 +98,7 @@ browser.
 
 | Option | Default | Use When |
 | --- | --- | --- |
-| `--session <name>` | `presentation` | You want a stable tmux session name for a talk. |
+| `--session <name>` | `presentation` | You want a stable backend session named `TerminalUse-<name>` for a talk. |
 | `--mode tmux` | `tmux` | You want refresh-safe demo state. |
 | `--mode shell` | `tmux` | You want a fresh local shell for quick testing. |
 | `--command <path>` | `$SHELL` or `/bin/sh` | You use shell mode and want a specific executable. |
@@ -337,7 +338,8 @@ npm --version
 
 ## 启动一个演示会话
 
-最常用的启动方式是使用默认 tmux 会话名 `presentation`：
+最常用的启动方式是使用默认会话名 `presentation`；termstage 创建的 backend
+session 会命名为 `TerminalUse-<name>`：
 
 ```bash
 cargo run -p termstage --bin termstage -- --session presentation --open
@@ -372,7 +374,7 @@ CLI 启动
 
 | 选项 | 默认值 | 什么时候用 |
 | --- | --- | --- |
-| `--session <name>` | `presentation` | 想给演示固定一个 tmux 会话名。 |
+| `--session <name>` | `presentation` | 想给演示固定一个 `TerminalUse-<name>` backend 会话名。 |
 | `--mode tmux` | `tmux` | 希望刷新浏览器后还能接回原来的演示状态。 |
 | `--mode shell` | `tmux` | 只是临时开一个新 shell 做测试。 |
 | `--command <path>` | `$SHELL` 或 `/bin/sh` | shell 模式下想指定具体命令。 |
