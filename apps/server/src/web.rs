@@ -26,7 +26,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use termstage_core::{
-    backend::{BackendScreenSnapshot, BackendScrollDirection},
+    backend::{BackendScreenSnapshot, BackendScrollDirection, BackendTerminalSnapshot},
     operation_lock::{
         ControllerId, ControllerKind, ControllerRef, OperationLease, OperationLockError,
     },
@@ -280,6 +280,22 @@ impl BackendGateway {
             Self::Rmux(gateway) => {
                 let mut gateway = gateway.lock().await;
                 gateway.read_screen(session).await
+            }
+        }
+    }
+
+    async fn read_terminal_screen(
+        &self,
+        session: &SessionName,
+    ) -> Result<BackendTerminalSnapshot, SessionGatewayError> {
+        match self {
+            Self::Tmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.read_terminal_screen(session).await
+            }
+            Self::Rmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.read_terminal_screen(session).await
             }
         }
     }
@@ -1347,7 +1363,7 @@ async fn attach_gateway_browser(
             Err(error) => return Err(error),
         }
     };
-    let snapshot = gateway.read_screen(session).await?;
+    let snapshot = gateway.read_terminal_screen(session).await?;
     send_server_control(
         sender,
         ServerControlMessage::LeaseChanged {
@@ -1672,7 +1688,7 @@ async fn send_gateway_screen_if_changed(
     sender: &mut BrowserSocketSender,
     last_screen: &mut Bytes,
 ) -> BrowserSocketAction {
-    let snapshot = match gateway.read_screen(session).await {
+    let snapshot = match gateway.read_terminal_screen(session).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
             debug!(%error, "gateway screen read failed");
@@ -2055,7 +2071,7 @@ fn clamped_browser_terminal_size(cols: u16, rows: u16) -> Result<TerminalSize, P
 }
 
 fn screen_snapshot_bytes(
-    snapshot: &BackendScreenSnapshot,
+    snapshot: &BackendTerminalSnapshot,
     viewport: Option<GatewayViewport>,
 ) -> Bytes {
     let viewport = viewport.unwrap_or_else(|| GatewayViewport::new(snapshot.size()));
@@ -3949,7 +3965,10 @@ mod tests {
         );
 
         let viewport = GatewayViewport::new(TerminalSize::new(80, 24)?);
-        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let bytes = screen_snapshot_bytes(
+            &BackendTerminalSnapshot::from_screen(snapshot),
+            Some(viewport),
+        );
         let text = std::str::from_utf8(bytes.as_ref())?;
 
         assert!(text.starts_with(
@@ -3972,7 +3991,10 @@ mod tests {
         );
 
         let viewport = GatewayViewport::new(TerminalSize::new(80, 24)?);
-        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let bytes = screen_snapshot_bytes(
+            &BackendTerminalSnapshot::from_screen(snapshot),
+            Some(viewport),
+        );
         let text = std::str::from_utf8(bytes.as_ref())?;
 
         assert!(text.starts_with(
@@ -3994,7 +4016,10 @@ mod tests {
         );
 
         let viewport = GatewayViewport::new(TerminalSize::new(20, 5)?);
-        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let bytes = screen_snapshot_bytes(
+            &BackendTerminalSnapshot::from_screen(snapshot),
+            Some(viewport),
+        );
         let text = std::str::from_utf8(bytes.as_ref())?;
 
         assert!(text.contains("00000000001111111111"));
@@ -4032,7 +4057,10 @@ mod tests {
             vec!["0123456789abcdefghijklmnopqrst".to_owned()],
         );
 
-        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let bytes = screen_snapshot_bytes(
+            &BackendTerminalSnapshot::from_screen(snapshot),
+            Some(viewport),
+        );
         let text = std::str::from_utf8(bytes.as_ref())?;
 
         assert!(text.contains("89abcdefghijklmnopq"));
@@ -4053,7 +4081,10 @@ mod tests {
             vec!["\u{1b}[31m0123456789\u{1b}[0m".to_owned()],
         );
 
-        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let bytes = screen_snapshot_bytes(
+            &BackendTerminalSnapshot::from_screen(snapshot),
+            Some(viewport),
+        );
         let text = std::str::from_utf8(bytes.as_ref())?;
 
         assert!(text.contains("\u{1b}[31m456789"));
@@ -4075,7 +4106,10 @@ mod tests {
         );
 
         let viewport = GatewayViewport::new(TerminalSize::new(20, 5)?);
-        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let bytes = screen_snapshot_bytes(
+            &BackendTerminalSnapshot::from_screen(snapshot),
+            Some(viewport),
+        );
         let text = std::str::from_utf8(bytes.as_ref())?;
 
         assert!(text.contains("\u{1b}[38;5;117m│\r\n\u{1b}[0m│ plain"));
@@ -4093,7 +4127,10 @@ mod tests {
         );
 
         let viewport = GatewayViewport::new(TerminalSize::new(20, 5)?);
-        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let bytes = screen_snapshot_bytes(
+            &BackendTerminalSnapshot::from_screen(snapshot),
+            Some(viewport),
+        );
         let text = std::str::from_utf8(bytes.as_ref())?;
 
         assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[1;1H\u{1b}[?25l"));

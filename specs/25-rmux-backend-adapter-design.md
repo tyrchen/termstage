@@ -275,8 +275,13 @@ rendering milestone can reset from a structured snapshot.
 
 ## 12. Screen Snapshot Mapping
 
-The existing `BackendScreenSnapshot` is a text projection. It stays for current
-API compatibility, but rmux requires a structured path:
+`BackendScreenSnapshot` is the semantic/API projection. It must remain plain
+text so Agent and API consumers can analyze screen contents without stripping
+terminal style sequences. Browser attach is a human-facing terminal replay path
+and should use `BackendTerminalSnapshot`, whose lines may contain ANSI escape
+sequences produced from backend style data.
+
+rmux also requires a structured path:
 
 ```text
 BackendStructuredSnapshot
@@ -296,10 +301,12 @@ BackendCell
   hyperlink
 ```
 
-`read_screen` may initially return a text projection derived from
-`PaneSnapshot::visible_lines`, but the adapter must also expose structured
-snapshot conversion before rmux becomes the default backend. That avoids
-permanently collapsing rmux's cell model into tmux `capture-pane` text.
+`read_screen` returns the plain text projection derived from
+`PaneSnapshot::visible_lines`. `read_terminal_screen` renders rmux cells into an
+ANSI terminal replay snapshot for browser xterm display. The adapter must also
+expose structured snapshot conversion before rmux becomes the default backend.
+That avoids permanently collapsing rmux's cell model into tmux `capture-pane`
+text.
 
 ## 13. Semantic Request/Response
 
@@ -349,8 +356,8 @@ right primitive. The public termstage API should still remain backend-neutral.
 | Send literal text | `Pane::send_text` | Direct rmux SDK call after termstage lock validation. |
 | Press key / send key token | `Pane::send_key` | Direct rmux SDK call after termstage lock validation. |
 | Resize pane | `Pane::resize` | Direct rmux SDK call from the active controller size. |
-| Read visible screen | `Pane::snapshot`, `PaneSnapshot::visible_lines`, `visible_text` | Direct rmux SDK call plus termstage projection into API response types. |
-| Stream browser output | `Pane::output_stream`, `render_stream` | Direct rmux stream, normalized into termstage backend events. |
+| Read visible screen | `Pane::snapshot`, `PaneSnapshot::visible_lines`, `visible_text` | Direct rmux SDK call plus plain-text termstage projection into API response types. |
+| Render browser screen | `Pane::snapshot` cells, `Pane::output_stream`, `render_stream` | Preserve colors/styles for browser terminal replay without changing semantic API output. |
 | Wait for output/text | `Pane::wait_for`, `wait_for_next`, `wait_for_text`, `wait_for_text_next` | Direct rmux SDK call used by termstage request/response operations. |
 | Find visible text | `Pane::find_text`, locators | rmux SDK primitive; termstage may expose later as an Agent API operation. |
 | Capture styled region | rmux capture helpers and `PaneSnapshot` cells | rmux SDK primitive; termstage decides response schema. |

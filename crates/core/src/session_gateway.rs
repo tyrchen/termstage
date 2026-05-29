@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::{
     backend::{
         BackendAdapter, BackendError, BackendScreenSnapshot, BackendScrollDirection,
-        BackendSessionRef,
+        BackendSessionRef, BackendTerminalSnapshot,
     },
     operation_lock::{ControllerRef, OperationLease, OperationLockError, OperationLockTable},
     protocol::{SessionName, TerminalSize},
@@ -282,6 +282,24 @@ where
         let record = self.registry.get(session)?.clone();
         self.backend
             .read_screen(record.backend())
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Reads the backend pane screen for browser terminal replay. Read
+    /// operations do not require ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionGatewayError`] when the session is missing or the
+    /// backend cannot provide terminal screen state.
+    pub async fn read_terminal_screen(
+        &mut self,
+        session: &SessionName,
+    ) -> Result<BackendTerminalSnapshot, SessionGatewayError> {
+        let record = self.registry.get(session)?.clone();
+        self.backend
+            .read_terminal_screen(record.backend())
             .await
             .map_err(Into::into)
     }

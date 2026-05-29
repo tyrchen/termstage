@@ -9,14 +9,16 @@ use std::{collections::HashMap, env, ffi::OsString, time::Duration};
 
 use bytes::Bytes;
 use rmux_sdk::{
-    EnsureSession, EnsureSessionPolicy, Pane, PaneId, Rmux, RmuxError, Session as RmuxSession,
-    SessionName as RmuxSessionName, TerminalSizeSpec,
+    EnsureSession, EnsureSessionPolicy, Pane, PaneAttributes, PaneCell, PaneColor, PaneId,
+    PaneSnapshot, Rmux, RmuxError, Session as RmuxSession, SessionName as RmuxSessionName,
+    TerminalSizeSpec,
 };
 
 use crate::{
     backend::{
         BackendAdapter, BackendError, BackendKind, BackendPaneId, BackendScreenSnapshot,
-        BackendScrollDirection, BackendSessionRef, BackendSessionResolution, BackendWindowId,
+        BackendScrollDirection, BackendSessionRef, BackendSessionResolution,
+        BackendTerminalSnapshot, BackendWindowId,
     },
     protocol::{SafeMessage, SessionName, TerminalSize},
     settings::rmux_backend as rmux_settings,
@@ -479,6 +481,26 @@ impl BackendAdapter for RmuxBackend {
         ))
     }
 
+    async fn read_terminal_screen(
+        &mut self,
+        target: &BackendSessionRef,
+    ) -> Result<BackendTerminalSnapshot, BackendError> {
+        let snapshot = self
+            .pane_for_target(target)
+            .await?
+            .snapshot()
+            .await
+            .map_err(map_rmux_error)?;
+        let size = TerminalSize::new(snapshot.cols, snapshot.rows)?;
+        Ok(BackendTerminalSnapshot::new_with_cursor_visibility(
+            size,
+            snapshot.cursor.col,
+            snapshot.cursor.row,
+            snapshot.cursor.visible,
+            rmux_terminal_lines(&snapshot),
+        ))
+    }
+
     async fn has_native_client(
         &mut self,
         target: &BackendSessionRef,
@@ -597,6 +619,171 @@ fn rmux_backend_ref(
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RmuxCellStyle {
+    attributes: PaneAttributes,
+    foreground: PaneColor,
+    background: PaneColor,
+    underline: PaneColor,
+}
+
+impl RmuxCellStyle {
+    const DEFAULT: Self = Self {
+        attributes: PaneAttributes::EMPTY,
+        foreground: PaneColor::Default,
+        background: PaneColor::Default,
+        underline: PaneColor::Default,
+    };
+
+    const fn from_cell(cell: &PaneCell) -> Self {
+        Self {
+            attributes: cell.attributes,
+            foreground: cell.foreground,
+            background: cell.background,
+            underline: cell.underline,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RmuxColorTarget {
+    Foreground,
+    Background,
+    Underline,
+}
+
+fn rmux_terminal_lines(snapshot: &PaneSnapshot) -> Vec<String> {
+    (0..snapshot.rows)
+        .map(|row| rmux_terminal_line(snapshot.row_cells(row).unwrap_or_default()))
+        .collect()
+}
+
+fn rmux_terminal_line(cells: &[PaneCell]) -> String {
+    let mut output = String::new();
+    let mut current_style = RmuxCellStyle::DEFAULT;
+    for cell in cells {
+        if cell.is_padding() {
+            continue;
+        }
+        let style = RmuxCellStyle::from_cell(cell);
+        if style != current_style {
+            push_rmux_sgr(&mut output, style);
+            current_style = style;
+        }
+        output.push_str(cell.text());
+    }
+    if current_style != RmuxCellStyle::DEFAULT {
+        output.push_str("\x1b[0m");
+    }
+    output
+}
+
+fn push_rmux_sgr(output: &mut String, style: RmuxCellStyle) {
+    let mut parameters = Vec::with_capacity(12);
+    parameters.push("0".to_owned());
+    push_rmux_attribute_sgr(&mut parameters, style.attributes);
+    push_rmux_color_sgr(
+        &mut parameters,
+        style.foreground,
+        RmuxColorTarget::Foreground,
+    );
+    push_rmux_color_sgr(
+        &mut parameters,
+        style.background,
+        RmuxColorTarget::Background,
+    );
+    push_rmux_color_sgr(&mut parameters, style.underline, RmuxColorTarget::Underline);
+    output.push_str("\x1b[");
+    output.push_str(&parameters.join(";"));
+    output.push('m');
+}
+
+fn push_rmux_attribute_sgr(parameters: &mut Vec<String>, attributes: PaneAttributes) {
+    if attributes.contains(PaneAttributes::BOLD) {
+        parameters.push("1".to_owned());
+    }
+    if attributes.contains(PaneAttributes::DIM) {
+        parameters.push("2".to_owned());
+    }
+    if attributes.contains(PaneAttributes::ITALIC) {
+        parameters.push("3".to_owned());
+    }
+    if attributes.contains(PaneAttributes::UNDERLINE) {
+        parameters.push("4".to_owned());
+    }
+    if attributes.contains(PaneAttributes::BLINK) {
+        parameters.push("5".to_owned());
+    }
+    if attributes.contains(PaneAttributes::REVERSE) {
+        parameters.push("7".to_owned());
+    }
+    if attributes.contains(PaneAttributes::HIDDEN) {
+        parameters.push("8".to_owned());
+    }
+    if attributes.contains(PaneAttributes::STRIKETHROUGH) {
+        parameters.push("9".to_owned());
+    }
+    if attributes.contains(PaneAttributes::DOUBLE_UNDERLINE) {
+        parameters.push("21".to_owned());
+    }
+    if attributes.contains(PaneAttributes::CURLY_UNDERLINE) {
+        parameters.push("4:3".to_owned());
+    }
+    if attributes.contains(PaneAttributes::DOTTED_UNDERLINE) {
+        parameters.push("4:4".to_owned());
+    }
+    if attributes.contains(PaneAttributes::DASHED_UNDERLINE) {
+        parameters.push("4:5".to_owned());
+    }
+    if attributes.contains(PaneAttributes::OVERLINE) {
+        parameters.push("53".to_owned());
+    }
+}
+
+fn push_rmux_color_sgr(parameters: &mut Vec<String>, color: PaneColor, target: RmuxColorTarget) {
+    let color = match color {
+        PaneColor::Encoded { value } => PaneColor::from_encoded(value),
+        color => color,
+    };
+    match color {
+        PaneColor::Ansi { index } => {
+            let base = match target {
+                RmuxColorTarget::Foreground => 30,
+                RmuxColorTarget::Background => 40,
+                RmuxColorTarget::Underline => 58,
+            };
+            if matches!(target, RmuxColorTarget::Underline) {
+                parameters.push(format!("58;5;{}", index.min(7)));
+            } else {
+                parameters.push((base + index.min(7)).to_string());
+            }
+        }
+        PaneColor::BrightAnsi { index } => {
+            let base = match target {
+                RmuxColorTarget::Foreground => 90,
+                RmuxColorTarget::Background => 100,
+                RmuxColorTarget::Underline => 58,
+            };
+            if matches!(target, RmuxColorTarget::Underline) {
+                parameters.push(format!("58;5;{}", index.saturating_add(8).min(15)));
+            } else {
+                parameters.push((base + index.min(7)).to_string());
+            }
+        }
+        PaneColor::Indexed { index } => match target {
+            RmuxColorTarget::Foreground => parameters.push(format!("38;5;{index}")),
+            RmuxColorTarget::Background => parameters.push(format!("48;5;{index}")),
+            RmuxColorTarget::Underline => parameters.push(format!("58;5;{index}")),
+        },
+        PaneColor::Rgb { red, green, blue } => match target {
+            RmuxColorTarget::Foreground => parameters.push(format!("38;2;{red};{green};{blue}")),
+            RmuxColorTarget::Background => parameters.push(format!("48;2;{red};{green};{blue}")),
+            RmuxColorTarget::Underline => parameters.push(format!("58;2;{red};{green};{blue}")),
+        },
+        _ => {}
+    }
+}
+
 fn pane_id_from_backend(pane: &BackendPaneId) -> Result<PaneId, BackendError> {
     let value = pane.as_str();
     let digits = value
@@ -651,6 +838,8 @@ fn safe_message(message: &str, fallback: &'static str) -> SafeMessage {
 
 #[cfg(test)]
 mod tests {
+    use rmux_sdk::{PaneCursor, PaneGlyph};
+
     use super::*;
     use crate::protocol::TerminalSize;
 
@@ -726,5 +915,42 @@ mod tests {
 
         assert!(environment.iter().any(|entry| entry == "SHELL=/bin/zsh"));
         assert!(environment.iter().any(|entry| entry == "CLICOLOR=1"));
+    }
+
+    #[test]
+    fn test_should_render_rmux_snapshot_styles_as_ansi() -> anyhow::Result<()> {
+        let mut title = PaneCell::new(PaneGlyph::new("K", 1));
+        title.attributes = PaneAttributes::BOLD;
+        title.foreground = PaneColor::ansi(1);
+        title.background = PaneColor::rgb(12, 47, 56);
+
+        let mut trailing = PaneCell::blank();
+        trailing.background = PaneColor::rgb(12, 47, 56);
+
+        let snapshot =
+            PaneSnapshot::new(2, 1, vec![title, trailing], PaneCursor::new(0, 1, true, 0))?;
+
+        let lines = rmux_terminal_lines(&snapshot);
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("\u{1b}[0;1;31;48;2;12;47;56mK"));
+        assert!(lines[0].ends_with(" \u{1b}[0m"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_skip_rmux_wide_glyph_padding_cells() -> anyhow::Result<()> {
+        let wide = PaneCell::new(PaneGlyph::new("W", 2));
+        let snapshot = PaneSnapshot::new(
+            2,
+            1,
+            vec![wide, PaneCell::padding()],
+            PaneCursor::new(0, 0, true, 0),
+        )?;
+
+        let lines = rmux_terminal_lines(&snapshot);
+
+        assert_eq!(lines, ["W"]);
+        Ok(())
     }
 }

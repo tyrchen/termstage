@@ -225,6 +225,95 @@ impl BackendScreenSnapshot {
     }
 }
 
+/// Snapshot of a backend pane screen for terminal replay.
+///
+/// Unlike [`BackendScreenSnapshot`], this type is allowed to carry terminal
+/// escape sequences in `lines` so a browser xterm can reproduce colors and
+/// other display attributes. Semantic API responses should continue to use
+/// [`BackendScreenSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendTerminalSnapshot {
+    size: TerminalSize,
+    cursor_col: u16,
+    cursor_row: u16,
+    cursor_visible: bool,
+    lines: Vec<String>,
+}
+
+impl BackendTerminalSnapshot {
+    /// Creates a backend terminal snapshot.
+    #[must_use]
+    pub fn new(size: TerminalSize, cursor_col: u16, cursor_row: u16, lines: Vec<String>) -> Self {
+        Self {
+            size,
+            cursor_col,
+            cursor_row,
+            cursor_visible: true,
+            lines,
+        }
+    }
+
+    /// Creates a backend terminal snapshot with explicit cursor visibility.
+    #[must_use]
+    pub fn new_with_cursor_visibility(
+        size: TerminalSize,
+        cursor_col: u16,
+        cursor_row: u16,
+        cursor_visible: bool,
+        lines: Vec<String>,
+    ) -> Self {
+        Self {
+            size,
+            cursor_col,
+            cursor_row,
+            cursor_visible,
+            lines,
+        }
+    }
+
+    /// Converts a semantic snapshot into a plain terminal replay snapshot.
+    #[must_use]
+    pub fn from_screen(snapshot: BackendScreenSnapshot) -> Self {
+        Self {
+            size: snapshot.size,
+            cursor_col: snapshot.cursor_col,
+            cursor_row: snapshot.cursor_row,
+            cursor_visible: snapshot.cursor_visible,
+            lines: snapshot.lines,
+        }
+    }
+
+    /// Returns the screen size.
+    #[must_use]
+    pub const fn size(&self) -> TerminalSize {
+        self.size
+    }
+
+    /// Returns the cursor column.
+    #[must_use]
+    pub const fn cursor_col(&self) -> u16 {
+        self.cursor_col
+    }
+
+    /// Returns the cursor row.
+    #[must_use]
+    pub const fn cursor_row(&self) -> u16 {
+        self.cursor_row
+    }
+
+    /// Returns whether the backend cursor is visible.
+    #[must_use]
+    pub const fn cursor_visible(&self) -> bool {
+        self.cursor_visible
+    }
+
+    /// Returns terminal replay lines.
+    #[must_use]
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+}
+
 /// Event emitted by a backend pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendEvent {
@@ -350,6 +439,24 @@ pub trait BackendAdapter: Send {
         &mut self,
         target: &BackendSessionRef,
     ) -> Result<BackendScreenSnapshot, BackendError>;
+
+    /// Reads a terminal replay snapshot from a backend pane.
+    ///
+    /// Implementations should preserve display attributes when the backend can
+    /// provide them. The default implementation falls back to the plain
+    /// semantic screen snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when the backend cannot provide screen state.
+    async fn read_terminal_screen(
+        &mut self,
+        target: &BackendSessionRef,
+    ) -> Result<BackendTerminalSnapshot, BackendError> {
+        self.read_screen(target)
+            .await
+            .map(BackendTerminalSnapshot::from_screen)
+    }
 
     /// Reports whether a backend-native local client is attached.
     ///
