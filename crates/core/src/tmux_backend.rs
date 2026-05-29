@@ -16,7 +16,8 @@ use tokio::process::Command;
 use crate::{
     backend::{
         BackendAdapter, BackendError, BackendKind, BackendPaneId, BackendScreenSnapshot,
-        BackendScrollDirection, BackendSessionRef, BackendSessionResolution, BackendWindowId,
+        BackendScrollDirection, BackendSessionRef, BackendSessionResolution,
+        BackendTerminalSnapshot, BackendWindowId,
     },
     protocol::{SafeMessage, SessionName, TerminalSize},
     settings::tmux_backend as tmux_settings,
@@ -62,6 +63,14 @@ pub struct TmuxSessionInfo {
     window: BackendWindowId,
     pane: BackendPaneId,
     size: TerminalSize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TmuxScreenMetadata {
+    size: TerminalSize,
+    cursor_col: u16,
+    cursor_row: u16,
+    cursor_visible: bool,
 }
 
 impl TmuxSessionInfo {
@@ -448,6 +457,79 @@ impl TmuxBackend {
         command
     }
 
+    async fn read_screen_metadata(
+        &self,
+        target: &BackendSessionRef,
+    ) -> Result<TmuxScreenMetadata, BackendError> {
+        let metadata = self
+            .command()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                target.pane().as_str(),
+                "#{pane_width} #{pane_height} #{cursor_x} #{cursor_y} #{cursor_flag}",
+            ])
+            .output()
+            .await
+            .map_err(BackendError::Io)?;
+        let metadata = Self::success_stdout(metadata, "tmux display-message failed")?;
+        let mut parts = metadata.split_ascii_whitespace();
+        let Some(cols) = parts.next() else {
+            return Err(BackendError::Operation(SafeMessage::from_static(
+                "tmux did not report pane width",
+            )));
+        };
+        let Some(rows) = parts.next() else {
+            return Err(BackendError::Operation(SafeMessage::from_static(
+                "tmux did not report pane height",
+            )));
+        };
+        let Some(cursor_col) = parts.next() else {
+            return Err(BackendError::Operation(SafeMessage::from_static(
+                "tmux did not report cursor column",
+            )));
+        };
+        let Some(cursor_row) = parts.next() else {
+            return Err(BackendError::Operation(SafeMessage::from_static(
+                "tmux did not report cursor row",
+            )));
+        };
+
+        let size = TerminalSize::new(parse_u16(cols)?, parse_u16(rows)?)?;
+        let cursor_col = parse_u16(cursor_col)?;
+        let cursor_row = parse_u16(cursor_row)?;
+        let cursor_visible = match parts.next() {
+            Some(cursor_flag) => parse_u16(cursor_flag)? > 0,
+            None => true,
+        };
+        Ok(TmuxScreenMetadata {
+            size,
+            cursor_col,
+            cursor_row,
+            cursor_visible,
+        })
+    }
+
+    async fn capture_screen_lines(
+        &self,
+        target: &BackendSessionRef,
+        preserve_ansi: bool,
+    ) -> Result<Vec<String>, BackendError> {
+        let mut command = self.command();
+        command.arg("capture-pane");
+        if preserve_ansi {
+            command.arg("-e");
+        }
+        let output = command
+            .args(["-p", "-t", target.pane().as_str()])
+            .output()
+            .await
+            .map_err(BackendError::Io)?;
+        let text = Self::success_stdout(output, "tmux capture-pane failed")?;
+        Ok(text.lines().map(ToOwned::to_owned).collect())
+    }
+
     fn ensure_success(
         output: std::process::Output,
         fallback: &'static str,
@@ -568,61 +650,28 @@ impl BackendAdapter for TmuxBackend {
         &mut self,
         target: &BackendSessionRef,
     ) -> Result<BackendScreenSnapshot, BackendError> {
-        let metadata = self
-            .command()
-            .args([
-                "display-message",
-                "-p",
-                "-t",
-                target.pane().as_str(),
-                "#{pane_width} #{pane_height} #{cursor_x} #{cursor_y} #{cursor_flag}",
-            ])
-            .output()
-            .await
-            .map_err(BackendError::Io)?;
-        let metadata = Self::success_stdout(metadata, "tmux display-message failed")?;
-        let mut parts = metadata.split_ascii_whitespace();
-        let Some(cols) = parts.next() else {
-            return Err(BackendError::Operation(SafeMessage::from_static(
-                "tmux did not report pane width",
-            )));
-        };
-        let Some(rows) = parts.next() else {
-            return Err(BackendError::Operation(SafeMessage::from_static(
-                "tmux did not report pane height",
-            )));
-        };
-        let Some(cursor_col) = parts.next() else {
-            return Err(BackendError::Operation(SafeMessage::from_static(
-                "tmux did not report cursor column",
-            )));
-        };
-        let Some(cursor_row) = parts.next() else {
-            return Err(BackendError::Operation(SafeMessage::from_static(
-                "tmux did not report cursor row",
-            )));
-        };
-
-        let size = TerminalSize::new(parse_u16(cols)?, parse_u16(rows)?)?;
-        let cursor_col = parse_u16(cursor_col)?;
-        let cursor_row = parse_u16(cursor_row)?;
-        let cursor_visible = match parts.next() {
-            Some(cursor_flag) => parse_u16(cursor_flag)? > 0,
-            None => true,
-        };
-        let output = self
-            .command()
-            .args(["capture-pane", "-e", "-p", "-t", target.pane().as_str()])
-            .output()
-            .await
-            .map_err(BackendError::Io)?;
-        let text = Self::success_stdout(output, "tmux capture-pane failed")?;
-        let lines = text.lines().map(ToOwned::to_owned).collect();
+        let metadata = self.read_screen_metadata(target).await?;
+        let lines = self.capture_screen_lines(target, false).await?;
         Ok(BackendScreenSnapshot::new_with_cursor_visibility(
-            size,
-            cursor_col,
-            cursor_row,
-            cursor_visible,
+            metadata.size,
+            metadata.cursor_col,
+            metadata.cursor_row,
+            metadata.cursor_visible,
+            lines,
+        ))
+    }
+
+    async fn read_terminal_screen(
+        &mut self,
+        target: &BackendSessionRef,
+    ) -> Result<BackendTerminalSnapshot, BackendError> {
+        let metadata = self.read_screen_metadata(target).await?;
+        let lines = self.capture_screen_lines(target, true).await?;
+        Ok(BackendTerminalSnapshot::new_with_cursor_visibility(
+            metadata.size,
+            metadata.cursor_col,
+            metadata.cursor_row,
+            metadata.cursor_visible,
             lines,
         ))
     }
@@ -844,8 +893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_should_preserve_color_attributes_when_reading_tmux_screen() -> anyhow::Result<()>
-    {
+    async fn test_should_split_plain_and_terminal_tmux_screen_snapshots() -> anyhow::Result<()> {
         let tmux = which::which("tmux").context("tmux unavailable")?;
         let session = SessionName::new(format!("termstage-backend-color-{}", std::process::id()))?;
         let _cleanup = TmuxSessionCleanup::new(tmux.clone(), session.clone());
@@ -871,15 +919,24 @@ mod tests {
         assert!(!resolution.created());
         let reference = resolution.into_reference();
         sleep(Duration::from_millis(300)).await;
-        let snapshot = backend.read_screen(&reference).await?;
+        let semantic_snapshot = backend.read_screen(&reference).await?;
+        let terminal_snapshot = backend.read_terminal_screen(&reference).await?;
 
         assert!(
-            snapshot
+            semantic_snapshot
+                .lines()
+                .iter()
+                .any(|line| line.contains("termstage-red") && !line.contains("\x1b[")),
+            "tmux semantic capture should be plain text: {:?}",
+            semantic_snapshot.lines()
+        );
+        assert!(
+            terminal_snapshot
                 .lines()
                 .iter()
                 .any(|line| line.contains("termstage-red") && line.contains("\x1b[")),
-            "tmux capture did not preserve color attributes: {:?}",
-            snapshot.lines()
+            "tmux terminal capture did not preserve color attributes: {:?}",
+            terminal_snapshot.lines()
         );
         Ok(())
     }

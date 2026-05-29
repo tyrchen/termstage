@@ -14,11 +14,12 @@ to map that order to user-visible milestones.
 | [00-browser-terminal-prd.md](./00-browser-terminal-prd.md) | PRD | Product problem, users, goals, non-goals, success metrics. |
 | [10-browser-terminal-protocol-design.md](./10-browser-terminal-protocol-design.md) | Data model | WebSocket message contract, session identifiers, validation ranges. |
 | [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md) | Runtime design | PTY/session actor model, lifecycle, shutdown, reconnection. |
-| [20-browser-terminal-web-design.md](./20-browser-terminal-web-design.md) | Web design | Axum server, WebSocket upgrade, static asset serving, embedded browser terminal frontend. |
+| [20-browser-terminal-web-design.md](./20-browser-terminal-web-design.md) | Web design | Axum server, WebSocket upgrade, static asset serving, browser terminal frontend. |
 | [21-browser-terminal-public-exposure-design.md](./21-browser-terminal-public-exposure-design.md) | Public exposure design | Opt-in pod/internet mode, public URL validation, token-env token source. |
 | [22-browser-terminal-base-path-design.md](./22-browser-terminal-base-path-design.md) | Base-path design | Reverse-proxy path-prefix mounting via `--base-path`. |
 | [23-local-remote-command-lease-design.md](./23-local-remote-command-lease-design.md) | Session backend gateway design | Backend-owned session model, Termstage Protocol layers, semantic API, and operation lock. |
 | [24-runtime-tunnel-architecture-design.md](./24-runtime-tunnel-architecture-design.md) | Retired runtime tunnel design | Retired embedded runtime tunnel architecture, replaced by the backend-session gateway in spec 23. |
+| [25-rmux-backend-adapter-design.md](./25-rmux-backend-adapter-design.md) | rmux backend adapter design | rmux-native backend adapter, SDK mapping, streaming output, structured snapshots, and semantic waits. |
 | [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md) | CLI design | Command surface, presentation UX, tmux/new-shell modes. |
 | [61-browser-terminal-crates-and-features.md](./61-browser-terminal-crates-and-features.md) | Crates/features | Workspace placement, dependency versions, feature policy. |
 | [70-browser-terminal-security-design.md](./70-browser-terminal-security-design.md) | Security design | Threat model and mandatory local-service controls. |
@@ -68,8 +69,14 @@ to map that order to user-visible milestones.
                 |                      ^
                 v                      |
         +----------------+             |
-        | 24 Runtime     |-------------+
-        | Tunnel Layers  |
+        | 23 Gateway     |-------------+
+        | Session backend|
+        +-------+--------+
+                |
+                v
+        +----------------+
+        | 25 rmux        |
+        | backend adapter|
         +-------+--------+
                 |
                 +----------------------+
@@ -99,8 +106,9 @@ to map that order to user-visible milestones.
 
 Phase 0 validation is recorded in
 [../docs/research/browser-terminal-phase-0-validation.md](../docs/research/browser-terminal-phase-0-validation.md).
-No committed `vendors/` prior-art source exists yet because Phase 0 only required
-local API probes for PTY, xterm.js, Axum WebSockets, and asset bundling.
+rmux backend alignment is recorded in
+[../docs/research/study-rmux-sdk-alignment.md](../docs/research/study-rmux-sdk-alignment.md)
+against `vendors/rmux`.
 
 Project engineering norms are binding through `AGENTS.md`: Rust 2024, no `unsafe`,
 no `unwrap()` or `expect()` in production code, structured errors, actor-style runtime

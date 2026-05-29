@@ -170,16 +170,17 @@ Maps to roadmap: follow-up after M6.
 | # | Task | Spec | Effort |
 | --- | --- | --- | --- |
 | 9.1 | Move backend session creation under `termstage session create --backend <backend> --name <name> [--command <cmd>]`, use the backend session id as the termstage session id, and reject root-level startup aliases with clap's missing/unknown subcommand errors. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 1 day |
-| 9.2 | Introduce argv-safe tmux pane startup for `session create --command <cmd> -g <arg>` while keeping `--mode shell` as the compatibility path for browser-only command runs. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 1 day |
-| 9.3 | Add `termstage session` commands for list, inspect, and stop `--detach|--kill`; inspect returns backend-native attach info, so a separate attach-info command is unnecessary. | [50](./50-browser-terminal-cli-design.md), [70](./70-browser-terminal-security-design.md) | 2 days |
+| 9.2 | Introduce argv-safe backend pane startup for `session create --command <cmd> -g <arg>` without shell string concatenation. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 1 day |
+| 9.3 | Add `termstage session` commands for list, inspect, and stop. `session stop <session-id>` kills the backend session; inspect returns backend-native attach info, so a separate attach-info command is unnecessary. | [50](./50-browser-terminal-cli-design.md), [70](./70-browser-terminal-security-design.md) | 2 days |
 | 9.4 | Add `termstage api` commands for send-text, send-key, run-command wait/capture, and read-screen as CLI wrappers over the semantic API. | [50](./50-browser-terminal-cli-design.md), [23](./23-local-remote-command-lease-design.md) | 2 days |
-| 9.5 | Add `termstage web attach <session-id>` for browser/API gateway attachment to an existing session id, and reserve `termstage auth` for future OIDC login/logout/status flows. | [50](./50-browser-terminal-cli-design.md), [21](./21-browser-terminal-public-exposure-design.md) | 1 day |
+| 9.5 | Add `termstage session attach <session-id>` for backend-native attach and `termstage session attach <session-id> --browser` for browser/API gateway attachment to an existing session id, and reserve `termstage auth` for future OIDC login/logout/status flows. | [50](./50-browser-terminal-cli-design.md), [21](./21-browser-terminal-public-exposure-design.md) | 1 day |
 
-Exit criteria: the CLI help is organized by `session`, `api`, `web`, and `auth`
-command groups; tmux session ids resolve directly from tmux with `ts-` fallback
-for unprefixed names; browser gateway attachment does not create backend
-sessions; legacy root invocation is rejected; parser tests cover command
-grouping and invalid flag placement.
+Exit criteria: the CLI help is organized by `session`, `api`, and `auth` command
+groups; termstage-created backend sessions use the `TerminalUse-` prefix; attach
+resolution checks exact names, `TerminalUse-` fallback, and tmux legacy `ts-`
+fallback for unprefixed names; browser gateway attachment does not create backend
+sessions; legacy root invocation and removed `web`/`browser` command groups are
+rejected; parser tests cover command grouping and invalid flag placement.
 
 ## 14. Cross-References
 

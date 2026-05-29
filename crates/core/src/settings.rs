@@ -33,3 +33,16 @@ pub(crate) mod tmux_backend {
     /// Color-disabling environment variables removed before spawning tmux commands.
     pub(crate) const DISABLE_COLOR_ENV_KEYS: [&str; 2] = ["NO_COLOR", "ANSI_COLORS_DISABLED"];
 }
+
+/// rmux backend process defaults.
+#[cfg(feature = "backend-rmux")]
+pub(crate) mod rmux_backend {
+    use super::Duration;
+
+    /// Default SDK operation timeout for daemon calls.
+    pub(crate) const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+    /// `COLORTERM` value exported into termstage-created rmux sessions.
+    pub(crate) const TERMINAL_COLOR_MODE: &str = "truecolor";
+    /// `TERM_PROGRAM` value exported into termstage-created rmux sessions.
+    pub(crate) const TERMINAL_PROGRAM: &str = "termstage";
+}

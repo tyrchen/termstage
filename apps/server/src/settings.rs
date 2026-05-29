@@ -7,8 +7,6 @@ use std::{
 
 /// CLI-only defaults and display constants.
 pub(crate) mod cli_defaults {
-    /// Default shared backend session name used by compatibility commands.
-    pub(crate) const DEFAULT_SESSION_NAME: &str = "presentation";
     /// Maximum accepted byte length for the environment variable name that
     /// carries an access token.
     pub(crate) const TOKEN_ENV_MAX_BYTES: usize = 128;
@@ -55,12 +53,16 @@ pub(crate) mod browser_socket {
     /// Close reason sent when the backend or runtime session has ended.
     pub(crate) const CLOSE_REASON_SESSION_ENDED: &str = "session ended";
     /// Close reason sent when termstage is shutting down the server.
+    #[cfg(test)]
     pub(crate) const CLOSE_REASON_SERVER_SHUTDOWN: &str = "server shutting down";
     /// Close reason used when the browser disconnects first.
+    #[cfg(test)]
     pub(crate) const CLOSE_REASON_CLIENT_DISCONNECTED: &str = "client disconnected";
     /// Close reason sent when another controller replaces this browser.
+    #[cfg(test)]
     pub(crate) const CLOSE_REASON_CONTROLLER_REPLACED: &str = "controller replaced";
     /// Close reason sent when the runtime path reports an unrecoverable error.
+    #[cfg(test)]
     pub(crate) const CLOSE_REASON_RUNTIME_ERROR: &str = "runtime error";
 }
 
@@ -80,15 +82,8 @@ pub(crate) mod backend_gateway {
     pub(crate) const SCREEN_ACTIVE_POLL_WINDOW: Duration = Duration::from_secs(2);
 }
 
-/// Local runtime actor supervisor settings used by compatibility shell mode.
-pub(crate) mod runtime_supervisor {
-    use super::Duration;
-
-    /// Poll interval used while waiting for a local runtime actor to exit.
-    pub(crate) const ACTOR_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
-}
-
 /// Runtime tunnel transport settings.
+#[cfg(test)]
 pub(crate) mod runtime_tunnel {
     /// Capacity for browser/runtime tunnel MPSC channels.
     pub(crate) const CHANNEL_CAPACITY: usize = 32;
@@ -126,6 +121,8 @@ pub(crate) mod api_client {
 
 /// Termstage-owned backend session naming rules.
 pub(crate) mod session_names {
-    /// Prefix applied to tmux sessions created by termstage.
-    pub(crate) const TERMSTAGE_TMUX_SESSION_PREFIX: &str = "ts-";
+    /// Prefix applied to backend sessions created by termstage.
+    pub(crate) const TERMSTAGE_SESSION_PREFIX: &str = "TerminalUse-";
+    /// Legacy prefix used by older termstage tmux-created sessions.
+    pub(crate) const LEGACY_TERMSTAGE_TMUX_SESSION_PREFIX: &str = "ts-";
 }

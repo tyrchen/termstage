@@ -26,36 +26,48 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use termstage_core::{
-    backend::{BackendScreenSnapshot, BackendScrollDirection},
-    operation_lock::{ControllerId, ControllerKind, ControllerRef, OperationLockError},
+    backend::{BackendScreenSnapshot, BackendScrollDirection, BackendTerminalSnapshot},
+    operation_lock::{
+        ControllerId, ControllerKind, ControllerRef, OperationLease, OperationLockError,
+    },
     protocol::{
         AccessToken, ClientControlMessage, ErrorCode, HeartbeatSequence, LeaseOwner, ProtocolError,
         SafeMessage, ServerControlMessage, SessionName, TerminalCols, TerminalRows, TerminalSize,
         ViewportOrigin,
     },
-    runtime::{ClientId, RuntimeCommand, RuntimeConfig},
+    rmux_backend::RmuxBackend,
+    runtime::ClientId,
     security::{
         AllowedHost, AllowedOrigin, BasePath, ExposurePolicy, PublicBaseUrl, SecurityError,
         validate_access_token, validate_peer_for_policy,
     },
     session_gateway::{SessionGateway, SessionGatewayError},
     tmux_backend::TmuxBackend,
+    tunnel::TunnelTerminalPayload,
+};
+#[cfg(test)]
+use termstage_core::{
+    runtime::{RuntimeCommand, RuntimeConfig},
     tunnel::{
         RuntimeTunnelBridge, RuntimeTunnelBridgeOutcome, TunnelCloseReason, TunnelError,
-        TunnelFrame, TunnelRuntimeControl, TunnelTerminalPayload, TunnelTransport,
+        TunnelFrame, TunnelRuntimeControl, TunnelTransport,
     },
 };
+#[cfg(test)]
+use tokio::sync::mpsc;
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, oneshot},
     task::JoinHandle,
     time,
 };
 use tracing::debug;
 
+#[cfg(test)]
+use crate::settings::runtime_tunnel;
 use crate::{
     assets::{asset_response, index_response},
-    settings::{backend_gateway, browser_socket, http_server, runtime_tunnel, semantic_api},
+    settings::{backend_gateway, browser_socket, http_server, semantic_api},
 };
 
 type BrowserSocketSender = futures_util::stream::SplitSink<WebSocket, Message>;
@@ -107,6 +119,198 @@ impl GatewayViewport {
 
     const fn origin_row(self) -> Option<u16> {
         self.origin_row
+    }
+}
+
+/// Shared backend-session gateway used by browser and semantic API surfaces.
+#[derive(Debug, Clone)]
+pub enum BackendGateway {
+    /// tmux-backed session gateway.
+    Tmux(Arc<Mutex<SessionGateway<TmuxBackend>>>),
+    /// rmux-backed session gateway.
+    Rmux(Arc<Mutex<SessionGateway<RmuxBackend>>>),
+}
+
+impl BackendGateway {
+    async fn acquire_controller(
+        &self,
+        session: &SessionName,
+        controller: ControllerRef,
+        now: Instant,
+    ) -> Result<OperationLease, SessionGatewayError> {
+        match self {
+            Self::Tmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.acquire_controller(session, controller, now)
+            }
+            Self::Rmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.acquire_controller(session, controller, now)
+            }
+        }
+    }
+
+    async fn release_controller(
+        &self,
+        session: &SessionName,
+        controller: ControllerRef,
+        now: Instant,
+    ) -> Result<OperationLease, SessionGatewayError> {
+        match self {
+            Self::Tmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.release_controller(session, controller, now)
+            }
+            Self::Rmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.release_controller(session, controller, now)
+            }
+        }
+    }
+
+    async fn write_input(
+        &self,
+        session: &SessionName,
+        controller: ControllerRef,
+        bytes: Bytes,
+        now: Instant,
+    ) -> Result<OperationLease, SessionGatewayError> {
+        match self {
+            Self::Tmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.write_input(session, controller, bytes, now).await
+            }
+            Self::Rmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.write_input(session, controller, bytes, now).await
+            }
+        }
+    }
+
+    async fn send_text(
+        &self,
+        session: &SessionName,
+        controller: ControllerRef,
+        text: &str,
+        now: Instant,
+    ) -> Result<OperationLease, SessionGatewayError> {
+        match self {
+            Self::Tmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.send_text(session, controller, text, now).await
+            }
+            Self::Rmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.send_text(session, controller, text, now).await
+            }
+        }
+    }
+
+    async fn send_key(
+        &self,
+        session: &SessionName,
+        controller: ControllerRef,
+        key: &str,
+        now: Instant,
+    ) -> Result<OperationLease, SessionGatewayError> {
+        match self {
+            Self::Tmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.send_key(session, controller, key, now).await
+            }
+            Self::Rmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.send_key(session, controller, key, now).await
+            }
+        }
+    }
+
+    async fn run_command(
+        &self,
+        session: &SessionName,
+        controller: ControllerRef,
+        command: &str,
+        now: Instant,
+    ) -> Result<OperationLease, SessionGatewayError> {
+        match self {
+            Self::Tmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.run_command(session, controller, command, now).await
+            }
+            Self::Rmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.run_command(session, controller, command, now).await
+            }
+        }
+    }
+
+    async fn scroll(
+        &self,
+        session: &SessionName,
+        controller: ControllerRef,
+        direction: BackendScrollDirection,
+        amount: u16,
+        now: Instant,
+    ) -> Result<OperationLease, SessionGatewayError> {
+        match self {
+            Self::Tmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway
+                    .scroll(session, controller, direction, amount, now)
+                    .await
+            }
+            Self::Rmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway
+                    .scroll(session, controller, direction, amount, now)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn read_screen(
+        &self,
+        session: &SessionName,
+    ) -> Result<BackendScreenSnapshot, SessionGatewayError> {
+        match self {
+            Self::Tmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.read_screen(session).await
+            }
+            Self::Rmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.read_screen(session).await
+            }
+        }
+    }
+
+    async fn read_terminal_screen(
+        &self,
+        session: &SessionName,
+    ) -> Result<BackendTerminalSnapshot, SessionGatewayError> {
+        match self {
+            Self::Tmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.read_terminal_screen(session).await
+            }
+            Self::Rmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.read_terminal_screen(session).await
+            }
+        }
+    }
+
+    async fn has_native_client(&self, session: &SessionName) -> Result<bool, SessionGatewayError> {
+        match self {
+            Self::Tmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.has_native_client(session).await
+            }
+            Self::Rmux(gateway) => {
+                let mut gateway = gateway.lock().await;
+                gateway.has_native_client(session).await
+            }
+        }
     }
 }
 
@@ -169,6 +373,7 @@ pub struct WebConfig {
 
 impl WebConfig {
     /// Creates a config that binds to `127.0.0.1:0`.
+    #[cfg(test)]
     #[must_use]
     pub fn local(
         token: AccessToken,
@@ -187,10 +392,21 @@ impl WebConfig {
     }
 
     /// Creates a local config backed by a tmux session gateway.
+    #[cfg(test)]
     #[must_use]
     pub fn local_tmux_gateway(
         token: AccessToken,
         gateway: Arc<Mutex<SessionGateway<TmuxBackend>>>,
+        session: SessionName,
+    ) -> Self {
+        Self::local_backend_gateway(token, BackendGateway::Tmux(gateway), session)
+    }
+
+    /// Creates a local config backed by a backend-owned session gateway.
+    #[must_use]
+    pub fn local_backend_gateway(
+        token: AccessToken,
+        gateway: BackendGateway,
         session: SessionName,
     ) -> Self {
         Self {
@@ -198,7 +414,7 @@ impl WebConfig {
             port: 0,
             exposure: WebExposure::Local,
             token,
-            session: WebSession::TmuxGateway { gateway, session },
+            session: WebSession::BackendGateway { gateway, session },
             presentation: PresentationSettings::default(),
             base_path: None,
         }
@@ -209,14 +425,15 @@ impl WebConfig {
 #[derive(Debug, Clone)]
 pub enum WebSession {
     /// Existing PTY runtime actor path used by shell mode.
+    #[cfg(test)]
     Runtime {
         /// Runtime command sender.
         commands: mpsc::Sender<RuntimeCommand>,
     },
-    /// Backend-owned tmux session gateway path.
-    TmuxGateway {
-        /// Shared session gateway.
-        gateway: Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    /// Backend-owned session gateway path.
+    BackendGateway {
+        /// Shared backend session gateway.
+        gateway: BackendGateway,
         /// Termstage session id to expose in this web server.
         session: SessionName,
     },
@@ -666,9 +883,9 @@ async fn api_acquire_lock(
     validate_api_request(&state, peer, &headers, &query)?;
     let controller = agent_controller(request.controller_id)?;
     let gateway = gateway_for_session(&state, &path.session)?;
-    let mut gateway = gateway.lock().await;
     let lease = gateway
         .acquire_controller(&path.session, controller, Instant::now())
+        .await
         .map_err(ApiError::from_gateway)?;
     Ok(Json(LeaseResponse {
         owner: LeaseOwner::Agent,
@@ -687,9 +904,9 @@ async fn api_release_lock(
     validate_api_request(&state, peer, &headers, &query)?;
     let controller = agent_controller(request.controller_id)?;
     let gateway = gateway_for_session(&state, &path.session)?;
-    let mut gateway = gateway.lock().await;
     let lease = gateway
         .release_controller(&path.session, controller, Instant::now())
+        .await
         .map_err(ApiError::from_gateway)?;
     Ok(Json(LeaseResponse {
         owner: LeaseOwner::Terminal,
@@ -739,13 +956,10 @@ async fn api_run_command(
     let wait_timeout = semantic_wait_timeout(request.wait_timeout_ms)?;
     let controller = agent_controller(request.controller_id)?;
     let gateway = gateway_for_session(&state, &path.session)?;
-    {
-        let mut gateway = gateway.lock().await;
-        gateway
-            .run_command(&path.session, controller, &command, Instant::now())
-            .await
-            .map_err(ApiError::from_gateway)?;
-    }
+    gateway
+        .run_command(&path.session, controller, &command, Instant::now())
+        .await
+        .map_err(ApiError::from_gateway)?;
 
     let mut matched = None;
     let mut screen = None;
@@ -776,13 +990,10 @@ async fn api_read_screen(
 ) -> Result<Json<ScreenResponse>, ApiError> {
     validate_api_request(&state, peer, &headers, &query)?;
     let gateway = gateway_for_session(&state, &path.session)?;
-    let snapshot = {
-        let mut gateway = gateway.lock().await;
-        gateway
-            .read_screen(&path.session)
-            .await
-            .map_err(ApiError::from_gateway)?
-    };
+    let snapshot = gateway
+        .read_screen(&path.session)
+        .await
+        .map_err(ApiError::from_gateway)?;
     Ok(Json(screen_response(&snapshot)))
 }
 
@@ -804,7 +1015,6 @@ async fn api_scroll(
         ScrollDirection::Down => BackendScrollDirection::Down,
     };
     let gateway = gateway_for_session(&state, &path.session)?;
-    let mut gateway = gateway.lock().await;
     gateway
         .scroll(
             &path.session,
@@ -824,13 +1034,15 @@ async fn bridge_socket(
     browser_viewport: Option<GatewayViewport>,
 ) {
     match state.inner.session.clone() {
+        #[cfg(test)]
         WebSession::Runtime { commands } => bridge_runtime_socket(state, socket, commands).await,
-        WebSession::TmuxGateway { gateway, session } => {
+        WebSession::BackendGateway { gateway, session } => {
             bridge_gateway_socket(state, socket, gateway, session, browser_viewport).await;
         }
     }
 }
 
+#[cfg(test)]
 async fn bridge_runtime_socket(
     state: AppState,
     socket: WebSocket,
@@ -911,7 +1123,7 @@ async fn bridge_runtime_socket(
 async fn bridge_gateway_socket(
     state: AppState,
     socket: WebSocket,
-    gateway: Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    gateway: BackendGateway,
     session: SessionName,
     browser_viewport: Option<GatewayViewport>,
 ) {
@@ -1004,16 +1216,17 @@ async fn bridge_gateway_socket(
         }
     }
 
-    if lease.owns_lease {
-        let mut gateway = gateway.lock().await;
-        if let Err(error) = gateway.release_controller(&session, controller, Instant::now()) {
-            debug!(%error, "failed to release gateway browser controller");
-        }
+    if lease.owns_lease
+        && let Err(error) = gateway
+            .release_controller(&session, controller, Instant::now())
+            .await
+    {
+        debug!(%error, "failed to release gateway browser controller");
     }
 }
 
 async fn poll_gateway_screen(
-    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    gateway: &BackendGateway,
     session: &SessionName,
     controller: ControllerRef,
     lease: &mut GatewayBrowserLease,
@@ -1054,6 +1267,7 @@ impl BrowserSocketAction {
     }
 }
 
+#[cfg(test)]
 async fn handle_bridge_completion(
     result: Result<Result<RuntimeTunnelBridgeOutcome, TunnelError>, tokio::task::JoinError>,
     tunnel: &mut BrowserTunnelPeer,
@@ -1090,6 +1304,7 @@ async fn handle_bridge_completion(
     }
 }
 
+#[cfg(test)]
 async fn handle_browser_message(
     message: Result<Message, axum::Error>,
     client_id: ClientId,
@@ -1127,35 +1342,28 @@ async fn handle_browser_message(
 }
 
 async fn attach_gateway_browser(
-    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    gateway: &BackendGateway,
     session: &SessionName,
     controller: ControllerRef,
     browser_viewport: Option<GatewayViewport>,
     sender: &mut BrowserSocketSender,
 ) -> Result<GatewayBrowserLease, SessionGatewayError> {
-    let (owns_lease, lease_owner, lease_epoch, native_attached, snapshot) = {
-        let mut gateway = gateway.lock().await;
-        let native_attached = gateway.has_native_client(session).await?;
-        let (owns_lease, lease_owner, lease_epoch) = if native_attached {
-            (false, LeaseOwner::Terminal, 0)
-        } else {
-            match gateway.acquire_controller(session, controller, Instant::now()) {
-                Ok(lease) => (true, LeaseOwner::Browser, lease.epoch()),
-                Err(SessionGatewayError::Lock(OperationLockError::LeaseConflict {
-                    owner, ..
-                })) => (false, lease_owner_from_controller(owner), 0),
-                Err(error) => return Err(error),
+    let native_attached = gateway.has_native_client(session).await?;
+    let (owns_lease, lease_owner, lease_epoch) = if native_attached {
+        (false, LeaseOwner::Terminal, 0)
+    } else {
+        match gateway
+            .acquire_controller(session, controller, Instant::now())
+            .await
+        {
+            Ok(lease) => (true, LeaseOwner::Browser, lease.epoch()),
+            Err(SessionGatewayError::Lock(OperationLockError::LeaseConflict { owner, .. })) => {
+                (false, lease_owner_from_controller(owner), 0)
             }
-        };
-        let snapshot = gateway.read_screen(session).await?;
-        (
-            owns_lease,
-            lease_owner,
-            lease_epoch,
-            native_attached,
-            snapshot,
-        )
+            Err(error) => return Err(error),
+        }
     };
+    let snapshot = gateway.read_terminal_screen(session).await?;
     send_server_control(
         sender,
         ServerControlMessage::LeaseChanged {
@@ -1184,23 +1392,20 @@ async fn attach_gateway_browser(
 }
 
 async fn sync_gateway_browser_lease(
-    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    gateway: &BackendGateway,
     session: &SessionName,
     controller: ControllerRef,
     lease: &mut GatewayBrowserLease,
     sender: &mut BrowserSocketSender,
 ) -> BrowserSocketAction {
-    let next = {
-        let mut gateway = gateway.lock().await;
-        match next_gateway_browser_lease(&mut gateway, session, controller, *lease).await {
-            Ok(next) => next,
-            Err(error) => {
-                debug!(%error, "gateway lease sync failed");
-                let _result = sender
-                    .send(Message::Close(Some(runtime_unavailable_close())))
-                    .await;
-                return BrowserSocketAction::Close;
-            }
+    let next = match next_gateway_browser_lease(gateway, session, controller, *lease).await {
+        Ok(next) => next,
+        Err(error) => {
+            debug!(%error, "gateway lease sync failed");
+            let _result = sender
+                .send(Message::Close(Some(runtime_unavailable_close())))
+                .await;
+            return BrowserSocketAction::Close;
         }
     };
     if next.owner != lease.owner || next.epoch != lease.epoch {
@@ -1222,7 +1427,7 @@ async fn sync_gateway_browser_lease(
 }
 
 async fn next_gateway_browser_lease(
-    gateway: &mut SessionGateway<TmuxBackend>,
+    gateway: &BackendGateway,
     session: &SessionName,
     controller: ControllerRef,
     current: GatewayBrowserLease,
@@ -1230,7 +1435,7 @@ async fn next_gateway_browser_lease(
     let native_attached = gateway.has_native_client(session).await?;
     if native_attached && !current.native_attached {
         if current.owns_lease {
-            release_browser_controller(gateway, session, controller);
+            release_browser_controller(gateway, session, controller).await;
         }
         return Ok(GatewayBrowserLease {
             owns_lease: false,
@@ -1252,7 +1457,10 @@ async fn next_gateway_browser_lease(
         });
     }
 
-    match gateway.acquire_controller(session, controller, Instant::now()) {
+    match gateway
+        .acquire_controller(session, controller, Instant::now())
+        .await
+    {
         Ok(lease) => Ok(GatewayBrowserLease {
             owns_lease: true,
             owner: LeaseOwner::Browser,
@@ -1272,42 +1480,42 @@ async fn next_gateway_browser_lease(
 }
 
 async fn acquire_gateway_browser_lease(
-    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    gateway: &BackendGateway,
     session: &SessionName,
     controller: ControllerRef,
     lease: &mut GatewayBrowserLease,
     sender: &mut BrowserSocketSender,
 ) -> BrowserSocketAction {
-    let next = {
-        let mut gateway = gateway.lock().await;
-        let native_attached = match gateway.has_native_client(session).await {
-            Ok(attached) => attached,
-            Err(error) => {
-                debug!(%error, "gateway native-client state read failed during browser acquire");
-                let _result = send_runtime_error(sender).await;
-                return BrowserSocketAction::Continue;
-            }
-        };
-        match gateway.acquire_controller(session, controller, Instant::now()) {
-            Ok(operation_lease) => GatewayBrowserLease {
-                owns_lease: true,
-                owner: LeaseOwner::Browser,
-                epoch: operation_lease.epoch(),
+    let native_attached = match gateway.has_native_client(session).await {
+        Ok(attached) => attached,
+        Err(error) => {
+            debug!(%error, "gateway native-client state read failed during browser acquire");
+            let _result = send_runtime_error(sender).await;
+            return BrowserSocketAction::Continue;
+        }
+    };
+    let next = match gateway
+        .acquire_controller(session, controller, Instant::now())
+        .await
+    {
+        Ok(operation_lease) => GatewayBrowserLease {
+            owns_lease: true,
+            owner: LeaseOwner::Browser,
+            epoch: operation_lease.epoch(),
+            native_attached,
+        },
+        Err(SessionGatewayError::Lock(OperationLockError::LeaseConflict { owner, .. })) => {
+            GatewayBrowserLease {
+                owns_lease: false,
+                owner: lease_owner_from_controller(owner),
+                epoch: lease.epoch,
                 native_attached,
-            },
-            Err(SessionGatewayError::Lock(OperationLockError::LeaseConflict { owner, .. })) => {
-                GatewayBrowserLease {
-                    owns_lease: false,
-                    owner: lease_owner_from_controller(owner),
-                    epoch: lease.epoch,
-                    native_attached,
-                }
             }
-            Err(error) => {
-                debug!(%error, "gateway browser acquire failed");
-                let _result = send_runtime_error(sender).await;
-                return BrowserSocketAction::Continue;
-            }
+        }
+        Err(error) => {
+            debug!(%error, "gateway browser acquire failed");
+            let _result = send_runtime_error(sender).await;
+            return BrowserSocketAction::Continue;
         }
     };
     if next.owner != lease.owner || next.epoch != lease.epoch {
@@ -1324,13 +1532,16 @@ async fn acquire_gateway_browser_lease(
     BrowserSocketAction::Continue
 }
 
-fn release_browser_controller(
-    gateway: &mut SessionGateway<TmuxBackend>,
+async fn release_browser_controller(
+    gateway: &BackendGateway,
     session: &SessionName,
     controller: ControllerRef,
 ) {
-    if let Err(error) = gateway.release_controller(session, controller, Instant::now()) {
-        debug!(%error, "failed to release browser controller during native tmux attach");
+    if let Err(error) = gateway
+        .release_controller(session, controller, Instant::now())
+        .await
+    {
+        debug!(%error, "failed to release browser controller during native backend attach");
     }
 }
 
@@ -1344,7 +1555,7 @@ const fn lease_owner_from_controller(controller: ControllerRef) -> LeaseOwner {
 
 async fn handle_gateway_browser_message(
     message: Result<Message, axum::Error>,
-    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    gateway: &BackendGateway,
     session: &SessionName,
     controller: ControllerRef,
     lease: &mut GatewayBrowserLease,
@@ -1385,7 +1596,7 @@ async fn handle_gateway_browser_message(
 
 async fn handle_gateway_binary(
     bytes: Bytes,
-    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    gateway: &BackendGateway,
     session: &SessionName,
     controller: ControllerRef,
     lease: &GatewayBrowserLease,
@@ -1404,12 +1615,9 @@ async fn handle_gateway_binary(
             return BrowserSocketAction::Close;
         }
     };
-    let result = {
-        let mut gateway = gateway.lock().await;
-        gateway
-            .write_input(session, controller, bytes.into_bytes(), Instant::now())
-            .await
-    };
+    let result = gateway
+        .write_input(session, controller, bytes.into_bytes(), Instant::now())
+        .await;
     if let Err(error) = result {
         debug!(%error, "gateway input failed");
         let _result = send_runtime_error(sender).await;
@@ -1420,7 +1628,7 @@ async fn handle_gateway_binary(
 
 async fn handle_gateway_text(
     text: &str,
-    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    gateway: &BackendGateway,
     session: &SessionName,
     controller: ControllerRef,
     lease: &mut GatewayBrowserLease,
@@ -1474,23 +1682,20 @@ async fn handle_gateway_text(
 }
 
 async fn send_gateway_screen_if_changed(
-    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    gateway: &BackendGateway,
     session: &SessionName,
     browser_viewport: Option<GatewayViewport>,
     sender: &mut BrowserSocketSender,
     last_screen: &mut Bytes,
 ) -> BrowserSocketAction {
-    let snapshot = {
-        let mut gateway = gateway.lock().await;
-        match gateway.read_screen(session).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                debug!(%error, "gateway screen read failed");
-                let _result = sender
-                    .send(Message::Close(Some(runtime_unavailable_close())))
-                    .await;
-                return BrowserSocketAction::Close;
-            }
+    let snapshot = match gateway.read_terminal_screen(session).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            debug!(%error, "gateway screen read failed");
+            let _result = sender
+                .send(Message::Close(Some(runtime_unavailable_close())))
+                .await;
+            return BrowserSocketAction::Close;
         }
     };
     let bytes = screen_snapshot_bytes(&snapshot, browser_viewport);
@@ -1505,6 +1710,7 @@ async fn send_gateway_screen_if_changed(
     }
 }
 
+#[cfg(test)]
 async fn handle_browser_binary(
     bytes: Bytes,
     client_id: ClientId,
@@ -1534,6 +1740,7 @@ async fn handle_browser_binary(
     }
 }
 
+#[cfg(test)]
 async fn handle_browser_text(
     text: &str,
     client_id: ClientId,
@@ -1567,6 +1774,7 @@ async fn handle_browser_text(
     }
 }
 
+#[cfg(test)]
 async fn handle_tunnel_frame(
     frame: Result<Option<TunnelFrame>, TunnelError>,
     sender: &mut BrowserSocketSender,
@@ -1597,11 +1805,13 @@ async fn handle_tunnel_frame(
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 struct BrowserTunnelPeer {
     inbound: mpsc::Receiver<TunnelFrame>,
     outbound: mpsc::Sender<TunnelFrame>,
 }
 
+#[cfg(test)]
 impl BrowserTunnelPeer {
     async fn send_frame(&self, frame: TunnelFrame) -> Result<(), TunnelError> {
         self.outbound
@@ -1620,11 +1830,13 @@ impl BrowserTunnelPeer {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 struct InProcessTunnelTransport {
     inbound: mpsc::Receiver<TunnelFrame>,
     outbound: mpsc::Sender<TunnelFrame>,
 }
 
+#[cfg(test)]
 impl TunnelTransport for InProcessTunnelTransport {
     async fn send_frame(&mut self, frame: TunnelFrame) -> Result<(), TunnelError> {
         self.outbound
@@ -1638,6 +1850,7 @@ impl TunnelTransport for InProcessTunnelTransport {
     }
 }
 
+#[cfg(test)]
 fn in_process_tunnel_pair() -> (BrowserTunnelPeer, InProcessTunnelTransport) {
     let (browser_to_runtime_tx, browser_to_runtime_rx) =
         mpsc::channel(runtime_tunnel::CHANNEL_CAPACITY);
@@ -1656,11 +1869,13 @@ fn in_process_tunnel_pair() -> (BrowserTunnelPeer, InProcessTunnelTransport) {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 enum SendBrowserFrameResult {
     Continue(Result<(), axum::Error>),
     Closed(Result<(), axum::Error>),
 }
 
+#[cfg(test)]
 impl SendBrowserFrameResult {
     fn is_err(&self) -> bool {
         match self {
@@ -1673,6 +1888,7 @@ impl SendBrowserFrameResult {
     }
 }
 
+#[cfg(test)]
 async fn send_tunnel_frame_to_browser(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     frame: TunnelFrame,
@@ -1731,6 +1947,7 @@ async fn send_tunnel_frame_to_browser(
     }
 }
 
+#[cfg(test)]
 async fn send_process_exited(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
 ) -> Result<(), axum::Error> {
@@ -1854,7 +2071,7 @@ fn clamped_browser_terminal_size(cols: u16, rows: u16) -> Result<TerminalSize, P
 }
 
 fn screen_snapshot_bytes(
-    snapshot: &BackendScreenSnapshot,
+    snapshot: &BackendTerminalSnapshot,
     viewport: Option<GatewayViewport>,
 ) -> Bytes {
     let viewport = viewport.unwrap_or_else(|| GatewayViewport::new(snapshot.size()));
@@ -2088,6 +2305,7 @@ fn client_timeout_close() -> CloseFrame {
     }
 }
 
+#[cfg(test)]
 fn close_frame_for_tunnel_reason(reason: TunnelCloseReason) -> CloseFrame {
     let reason = match reason {
         TunnelCloseReason::Supervisor => browser_socket::CLOSE_REASON_SERVER_SHUTDOWN,
@@ -2114,14 +2332,16 @@ fn validate_api_request(
 fn gateway_for_session(
     state: &AppState,
     requested: &SessionName,
-) -> Result<Arc<Mutex<SessionGateway<TmuxBackend>>>, ApiError> {
-    let WebSession::TmuxGateway { gateway, session } = &state.inner.session else {
-        return Err(ApiError::Unsupported);
+) -> Result<BackendGateway, ApiError> {
+    let (gateway, session) = match &state.inner.session {
+        WebSession::BackendGateway { gateway, session } => (gateway, session),
+        #[cfg(test)]
+        WebSession::Runtime { .. } => return Err(ApiError::Unsupported),
     };
     if session != requested {
         return Err(ApiError::NotFound);
     }
-    Ok(Arc::clone(gateway))
+    Ok(gateway.clone())
 }
 
 fn agent_controller(id: u64) -> Result<ControllerRef, ApiError> {
@@ -2202,7 +2422,6 @@ async fn send_semantic_text(
 ) -> Result<(), ApiError> {
     let controller = agent_controller(controller_id)?;
     let gateway = gateway_for_session(state, session)?;
-    let mut gateway = gateway.lock().await;
     gateway
         .send_text(session, controller, text, Instant::now())
         .await
@@ -2218,7 +2437,6 @@ async fn send_semantic_key(
 ) -> Result<(), ApiError> {
     let controller = agent_controller(controller_id)?;
     let gateway = gateway_for_session(state, session)?;
-    let mut gateway = gateway.lock().await;
     gateway
         .send_key(session, controller, key, Instant::now())
         .await
@@ -2227,7 +2445,7 @@ async fn send_semantic_key(
 }
 
 async fn wait_for_screen_text(
-    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    gateway: &BackendGateway,
     session: &SessionName,
     needle: &str,
     timeout: Duration,
@@ -2236,13 +2454,10 @@ async fn wait_for_screen_text(
         .checked_add(timeout)
         .ok_or(ApiError::BadRequest)?;
     loop {
-        let snapshot = {
-            let mut gateway = gateway.lock().await;
-            gateway
-                .read_screen(session)
-                .await
-                .map_err(ApiError::from_gateway)?
-        };
+        let snapshot = gateway
+            .read_screen(session)
+            .await
+            .map_err(ApiError::from_gateway)?;
         if snapshot.lines().iter().any(|line| line.contains(needle)) {
             return Ok(WaitForScreenTextResult {
                 matched: true,
@@ -2260,16 +2475,13 @@ async fn wait_for_screen_text(
 }
 
 async fn read_gateway_screen(
-    gateway: &Arc<Mutex<SessionGateway<TmuxBackend>>>,
+    gateway: &BackendGateway,
     session: &SessionName,
 ) -> Result<ScreenResponse, ApiError> {
-    let snapshot = {
-        let mut gateway = gateway.lock().await;
-        gateway
-            .read_screen(session)
-            .await
-            .map_err(ApiError::from_gateway)?
-    };
+    let snapshot = gateway
+        .read_screen(session)
+        .await
+        .map_err(ApiError::from_gateway)?;
     Ok(screen_response(&snapshot))
 }
 
@@ -2362,6 +2574,7 @@ enum ApiError {
     NotFound,
     Runtime,
     Security(WebError),
+    #[cfg(test)]
     Unsupported,
 }
 
@@ -2409,6 +2622,7 @@ impl IntoResponse for ApiError {
                         ErrorCode::Runtime,
                         SafeMessage::from_static("backend operation failed"),
                     ),
+                    #[cfg(test)]
                     Self::Unsupported => (
                         StatusCode::CONFLICT,
                         ErrorCode::Runtime,
@@ -3751,7 +3965,10 @@ mod tests {
         );
 
         let viewport = GatewayViewport::new(TerminalSize::new(80, 24)?);
-        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let bytes = screen_snapshot_bytes(
+            &BackendTerminalSnapshot::from_screen(snapshot),
+            Some(viewport),
+        );
         let text = std::str::from_utf8(bytes.as_ref())?;
 
         assert!(text.starts_with(
@@ -3774,7 +3991,10 @@ mod tests {
         );
 
         let viewport = GatewayViewport::new(TerminalSize::new(80, 24)?);
-        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let bytes = screen_snapshot_bytes(
+            &BackendTerminalSnapshot::from_screen(snapshot),
+            Some(viewport),
+        );
         let text = std::str::from_utf8(bytes.as_ref())?;
 
         assert!(text.starts_with(
@@ -3796,7 +4016,10 @@ mod tests {
         );
 
         let viewport = GatewayViewport::new(TerminalSize::new(20, 5)?);
-        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let bytes = screen_snapshot_bytes(
+            &BackendTerminalSnapshot::from_screen(snapshot),
+            Some(viewport),
+        );
         let text = std::str::from_utf8(bytes.as_ref())?;
 
         assert!(text.contains("00000000001111111111"));
@@ -3834,7 +4057,10 @@ mod tests {
             vec!["0123456789abcdefghijklmnopqrst".to_owned()],
         );
 
-        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let bytes = screen_snapshot_bytes(
+            &BackendTerminalSnapshot::from_screen(snapshot),
+            Some(viewport),
+        );
         let text = std::str::from_utf8(bytes.as_ref())?;
 
         assert!(text.contains("89abcdefghijklmnopq"));
@@ -3855,7 +4081,10 @@ mod tests {
             vec!["\u{1b}[31m0123456789\u{1b}[0m".to_owned()],
         );
 
-        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let bytes = screen_snapshot_bytes(
+            &BackendTerminalSnapshot::from_screen(snapshot),
+            Some(viewport),
+        );
         let text = std::str::from_utf8(bytes.as_ref())?;
 
         assert!(text.contains("\u{1b}[31m456789"));
@@ -3877,7 +4106,10 @@ mod tests {
         );
 
         let viewport = GatewayViewport::new(TerminalSize::new(20, 5)?);
-        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let bytes = screen_snapshot_bytes(
+            &BackendTerminalSnapshot::from_screen(snapshot),
+            Some(viewport),
+        );
         let text = std::str::from_utf8(bytes.as_ref())?;
 
         assert!(text.contains("\u{1b}[38;5;117m│\r\n\u{1b}[0m│ plain"));
@@ -3895,7 +4127,10 @@ mod tests {
         );
 
         let viewport = GatewayViewport::new(TerminalSize::new(20, 5)?);
-        let bytes = screen_snapshot_bytes(&snapshot, Some(viewport));
+        let bytes = screen_snapshot_bytes(
+            &BackendTerminalSnapshot::from_screen(snapshot),
+            Some(viewport),
+        );
         let text = std::str::from_utf8(bytes.as_ref())?;
 
         assert!(text.ends_with("\u{1b}[0m\u{1b}[?7h\u{1b}[1;1H\u{1b}[?25l"));

@@ -62,16 +62,25 @@ npm --version
 
 ## Starting a Presentation Session
 
-Use the default tmux session name, `presentation`:
+Create a backend session first. Backend sessions created by termstage are named
+`TerminalUse-<name>`:
 
 ```bash
-cargo run -p termstage --bin termstage -- --session presentation --open
+cargo run -p termstage --bin termstage -- \
+  session create --backend tmux --name presentation
 ```
 
-The command:
+Then attach the browser/API gateway to that existing session:
+
+```bash
+cargo run -p termstage --bin termstage -- \
+  session attach TerminalUse-presentation --browser --open
+```
+
+The browser-mode attach command:
 
 1. Validates CLI arguments.
-2. Starts a PTY runtime actor.
+2. Resolves the backend session.
 3. Starts a loopback-only Axum server.
 4. Generates a per-start access token.
 5. Opens a local browser URL when `--open` is present.
@@ -79,9 +88,9 @@ The command:
 ```text
 CLI start
   |
-  +--> validate session name / host / font / theme
+  +--> validate session id / host / font / theme
   |
-  +--> start runtime actor
+  +--> attach gateway to backend session
   |
   +--> bind 127.0.0.1:0
   |
@@ -95,21 +104,19 @@ browser.
 
 ## CLI Reference
 
-| Option | Default | Use When |
+| Command or Option | Default | Use When |
 | --- | --- | --- |
-| `--session <name>` | `presentation` | You want a stable tmux session name for a talk. |
-| `--mode tmux` | `tmux` | You want refresh-safe demo state. |
-| `--mode shell` | `tmux` | You want a fresh local shell for quick testing. |
-| `--command <path>` | `$SHELL` or `/bin/sh` | You use shell mode and want a specific executable. |
-| `-g, --command-arg <arg>` | unset | You need to pass argv to the shell-mode command. |
-| `--host <addr>` | `127.0.0.1` | You need a bind address. Non-loopback addresses require `--expose-public`. |
-| `--port <port>` | `0` | You need a fixed local port, otherwise let the OS choose. |
+| `session create --backend <tmux|rmux> --name <name>` | tmux | You want a stable backend session named `TerminalUse-<name>` for a talk. |
+| `--command <path>` | backend shell | You want the first backend pane to run a specific executable. |
+| `-g, --command-arg <arg>` | unset | You need to pass argv to the backend command. |
+| `session attach <session-id>` | native | You want to attach locally with tmux or rmux. |
+| `session attach <session-id> --browser` | off | You want to start the browser/API gateway. |
+| `--host <addr>` | `127.0.0.1` | You need a browser-mode bind address. Non-loopback addresses require `--expose-public`. |
+| `--port <port>` | `0` | You need a fixed browser-mode port, otherwise let the OS choose. |
 | `--open` | off | You want the default browser opened automatically. |
 | `--font-size <px>` | `24` | You need larger or smaller presentation text. |
 | `--theme high-contrast` | `high-contrast` | You want dark high-contrast terminal colors. |
 | `--theme light` | `high-contrast` | You present in a bright room or light slide deck. |
-| `--keepalive session` | `session` | You want browser refreshes to reattach to session state. |
-| `--keepalive exit` | `session` | You want shutdown to end runtime-owned state. |
 | `--expose-public` | off | You are running in a pod behind HTTPS ingress. |
 | `--public-url <url>` | unset | You need the browser-visible HTTPS URL for public mode. |
 | `--token-env <name>` | unset | You keep the access token in an environment variable. |
@@ -120,7 +127,11 @@ browser.
 
    ```bash
    cargo run -p termstage --bin termstage -- \
-     --session presentation \
+     session create --backend tmux --name presentation
+
+   cargo run -p termstage --bin termstage -- \
+     session attach TerminalUse-presentation \
+     --browser \
      --font-size 28 \
      --theme high-contrast \
      --open
@@ -136,7 +147,9 @@ browser.
 4. Share only the browser tab or browser window in your meeting software.
 5. If the browser refreshes or briefly disconnects, wait for reconnect. The terminal
    should reattach and replay recent visible output.
-6. Stop the CLI with `Ctrl-C` after the presentation.
+6. Stop the browser gateway with `Ctrl-C` after the presentation. Stop the backend
+   session separately with `termstage session stop TerminalUse-presentation` when
+   you no longer need it.
 
 ## Refresh and Reconnect Behavior
 
@@ -250,10 +263,11 @@ tmux -V
 
 ### Browser does not open
 
-Run without `--open` or copy the printed URL manually:
+Run browser-mode attach without `--open` or copy the printed URL manually:
 
 ```bash
-cargo run -p termstage --bin termstage -- --session presentation
+cargo run -p termstage --bin termstage -- \
+  session attach TerminalUse-presentation --browser
 ```
 
 ### Browser says forbidden or the WebSocket closes immediately
@@ -337,16 +351,25 @@ npm --version
 
 ## 启动一个演示会话
 
-最常用的启动方式是使用默认 tmux 会话名 `presentation`：
+先创建一个 backend session。termstage 创建的 backend session 会命名为
+`TerminalUse-<name>`：
 
 ```bash
-cargo run -p termstage --bin termstage -- --session presentation --open
+cargo run -p termstage --bin termstage -- \
+  session create --backend tmux --name presentation
 ```
 
-这条命令会按顺序做几件事：
+然后把浏览器/API gateway 接到这个已有 session：
+
+```bash
+cargo run -p termstage --bin termstage -- \
+  session attach TerminalUse-presentation --browser --open
+```
+
+浏览器 attach 命令会按顺序做几件事：
 
 1. 检查 CLI 参数。
-2. 启动 PTY runtime actor。
+2. 解析 backend session。
 3. 启动只监听 loopback 的 Axum 服务。
 4. 生成只属于这次启动的访问令牌。
 5. 如果带了 `--open`，打开本地浏览器 URL。
@@ -354,9 +377,9 @@ cargo run -p termstage --bin termstage -- --session presentation --open
 ```text
 CLI 启动
   |
-  +--> 检查 session name / host / font / theme
+  +--> 检查 session id / host / font / theme
   |
-  +--> 启动 runtime actor
+  +--> 将 gateway 接到 backend session
   |
   +--> 绑定 127.0.0.1:0
   |
@@ -370,21 +393,19 @@ CLI 启动
 
 ## CLI 参考
 
-| 选项 | 默认值 | 什么时候用 |
+| 命令或选项 | 默认值 | 什么时候用 |
 | --- | --- | --- |
-| `--session <name>` | `presentation` | 想给演示固定一个 tmux 会话名。 |
-| `--mode tmux` | `tmux` | 希望刷新浏览器后还能接回原来的演示状态。 |
-| `--mode shell` | `tmux` | 只是临时开一个新 shell 做测试。 |
-| `--command <path>` | `$SHELL` 或 `/bin/sh` | shell 模式下想指定具体命令。 |
-| `-g, --command-arg <arg>` | 未设置 | shell 模式下需要给命令传 argv。 |
-| `--host <addr>` | `127.0.0.1` | 绑定地址；非 loopback 需要显式设置 `--expose-public`。 |
-| `--port <port>` | `0` | 需要固定本地端口时指定，否则让系统分配。 |
+| `session create --backend <tmux|rmux> --name <name>` | tmux | 给演示固定一个 `TerminalUse-<name>` backend 会话。 |
+| `--command <path>` | backend shell | 希望 backend 的第一个 pane 运行指定命令。 |
+| `-g, --command-arg <arg>` | 未设置 | 需要给 backend 命令传 argv。 |
+| `session attach <session-id>` | native | 在本地终端用 tmux 或 rmux attach。 |
+| `session attach <session-id> --browser` | 关闭 | 启动浏览器/API gateway。 |
+| `--host <addr>` | `127.0.0.1` | 浏览器模式绑定地址；非 loopback 需要显式设置 `--expose-public`。 |
+| `--port <port>` | `0` | 浏览器模式需要固定本地端口时指定，否则让系统分配。 |
 | `--open` | 关闭 | 启动后自动打开默认浏览器。 |
 | `--font-size <px>` | `24` | 调整演示时的终端字号。 |
 | `--theme high-contrast` | `high-contrast` | 使用暗色高对比度主题。 |
 | `--theme light` | `high-contrast` | 在明亮环境或浅色页面旁边演示。 |
-| `--keepalive session` | `session` | 让浏览器刷新后能重新接回会话。 |
-| `--keepalive exit` | `session` | 希望关闭时结束 runtime 管理的状态。 |
 | `--expose-public` | 关闭 | 在 HTTPS ingress 后面的 pod 中运行。 |
 | `--public-url <url>` | 未设置 | public mode 下浏览器实际访问的 HTTPS URL。 |
 | `--token-env <name>` | 未设置 | 从环境变量读取访问 token。 |
@@ -395,7 +416,11 @@ CLI 启动
 
    ```bash
    cargo run -p termstage --bin termstage -- \
-     --session presentation \
+     session create --backend tmux --name presentation
+
+   cargo run -p termstage --bin termstage -- \
+     session attach TerminalUse-presentation \
+     --browser \
      --font-size 28 \
      --theme high-contrast \
      --open
@@ -410,7 +435,8 @@ CLI 启动
 
 4. 在会议软件里只共享这个浏览器标签页或窗口。
 5. 如果浏览器刷新或短暂断开，稍等它自动重连。终端会重新接上，并回放近期输出。
-6. 演示结束后回到启动命令所在的终端，按 `Ctrl-C` 停止服务。
+6. 演示结束后回到启动 gateway 的终端，按 `Ctrl-C` 停止浏览器服务。如果不再需要
+   backend session，再执行 `termstage session stop TerminalUse-presentation`。
 
 ## 浏览器刷新和重连
 
@@ -525,7 +551,8 @@ tmux -V
 可以去掉 `--open`，然后手动复制命令行打印出的 URL：
 
 ```bash
-cargo run -p termstage --bin termstage -- --session presentation
+cargo run -p termstage --bin termstage -- \
+  session attach TerminalUse-presentation --browser
 ```
 
 ### 浏览器显示 forbidden，或者 WebSocket 立刻断开

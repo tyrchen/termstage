@@ -1,8 +1,8 @@
 # Roadmap - Browser Terminal Presentation Mode
 
-Status: draft v2
+Status: draft v1
 Owner: termstage
-Last updated: 2026-05-28
+Last updated: 2026-05-19
 
 ## 1. Principles
 
@@ -33,19 +33,14 @@ Estimate: 2-3 focused weeks for one developer after Phase 0 risk retirement.
 
 ### M1 - Presentation-Ready UX
 
-User-visible outcome: terminal readability and embedded layout fit live talks,
-screen shares, and pages that contain controls around the terminal.
+User-visible outcome: terminal readability and layout fit live talks and screen shares.
 
 Specs touched: 20, 50, 72.
 
 Exit criteria:
 
 - Large-font and high-contrast presets are available through CLI flags.
-- Terminal fills its assigned page container instead of assuming it owns the
-  entire browser page.
-- Backend-owned screens larger than the browser terminal viewport remain
-  navigable through component-local viewport projection rather than accidental
-  clipping.
+- Terminal fits desktop and narrow browser viewports without clipped text.
 - Browser smoke screenshots show non-empty terminal content and successful input/output.
 - UI contains no explanatory landing page before the usable terminal.
 
@@ -133,8 +128,6 @@ Exit criteria:
   termstage-owned local command PTY abstraction.
 - Semantic API operations can write input and read screen state through the same
   backend session.
-- Browser xterm fits its page container while backend screen snapshots are
-  projected into that viewport.
 - Level 1 `termstage` lock allows one write controller and read-only observers.
 - Backend-native local attach remains independent of `termstage` stdout/stderr.
 
