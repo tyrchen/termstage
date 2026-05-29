@@ -111,6 +111,11 @@ browser.
 | `-g, --command-arg <arg>` | unset | You need to pass argv to the backend command. |
 | `session attach <session-id>` | native | You want to attach locally with tmux or rmux. |
 | `session attach <session-id> --browser` | off | You want to start the browser/API gateway. |
+| `session screen <session-id>` | JSON | You want a local plain-text screen snapshot without a gateway URL/token. |
+| `session send-text <session-id> <text>` | JSON | You want to type literal text through the backend adapter. |
+| `session send-key <session-id> <key>` | JSON | You want to press `Enter`, `CtrlC`, or another semantic key token. |
+| `session exec <session-id> -- <command...>` | JSON | You want to type a command into the existing session and press Enter. |
+| `session scroll <session-id> <up|down> <amount>` | JSON | You want to scroll backend-visible history when the backend supports it. |
 | `--host <addr>` | `127.0.0.1` | You need a browser-mode bind address. Non-loopback addresses require `--expose-public`. |
 | `--port <port>` | `0` | You need a fixed browser-mode port, otherwise let the OS choose. |
 | `--open` | off | You want the default browser opened automatically. |
@@ -400,6 +405,11 @@ CLI 启动
 | `-g, --command-arg <arg>` | 未设置 | 需要给 backend 命令传 argv。 |
 | `session attach <session-id>` | native | 在本地终端用 tmux 或 rmux attach。 |
 | `session attach <session-id> --browser` | 关闭 | 启动浏览器/API gateway。 |
+| `session screen <session-id>` | JSON | 不经过 gateway URL/token，直接读取本地 backend 的纯文本屏幕快照。 |
+| `session send-text <session-id> <text>` | JSON | 通过 backend adapter 直接输入文字。 |
+| `session send-key <session-id> <key>` | JSON | 发送 `Enter`、`CtrlC` 或其他语义 key token。 |
+| `session exec <session-id> -- <command...>` | JSON | 在现有 session 里输入命令并回车。 |
+| `session scroll <session-id> <up|down> <amount>` | JSON | backend 支持时滚动可见历史。 |
 | `--host <addr>` | `127.0.0.1` | 浏览器模式绑定地址；非 loopback 需要显式设置 `--expose-public`。 |
 | `--port <port>` | `0` | 浏览器模式需要固定本地端口时指定，否则让系统分配。 |
 | `--open` | 关闭 | 启动后自动打开默认浏览器。 |

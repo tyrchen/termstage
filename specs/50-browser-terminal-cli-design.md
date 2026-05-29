@@ -18,6 +18,10 @@ Backend-session workflow:
 termstage session create --backend tmux --name presentation --command k9s
 termstage session attach TerminalUse-presentation
 termstage session attach TerminalUse-presentation --browser --open
+termstage session screen TerminalUse-presentation
+termstage session send-text TerminalUse-presentation -- "123"
+termstage session send-key TerminalUse-presentation Enter
+termstage session exec TerminalUse-presentation -- echo hello
 ```
 
 Session creation arguments:
@@ -44,6 +48,25 @@ Session attach arguments:
 | `--expose-public` | false | Enable pod/internet mode; required before non-loopback bind addresses are accepted. |
 | `--public-url <url>` | unset | HTTPS browser-visible base URL for public mode. |
 | `--token-env <name>` | unset | Environment variable containing a 64-hex-character access token for public mode. |
+
+Local semantic operation commands:
+
+| Command | Meaning |
+| --- | --- |
+| `session screen <session-id> [--backend <backend>]` | Read a plain-text semantic screen snapshot directly from the backend. |
+| `session send-text <session-id> [--backend <backend>] <text>` | Send literal text directly to the backend pane. |
+| `session send-key <session-id> [--backend <backend>] <key>` | Send one semantic key token such as `Enter` or `CtrlC`. |
+| `session exec <session-id> [--backend <backend>] [--wait-for <text>] [--wait-timeout-ms <ms>] [--capture] -- <command...>` | Type a command into the session, press Enter, and optionally wait/capture. `run-command` is an alias. |
+| `session scroll <session-id> [--backend <backend>] <up|down> <amount>` | Invoke the backend scroll primitive. |
+
+Local semantic operation output is JSON and mirrors the semantic HTTP API shape
+where practical. `screen` returns `size`, cursor fields, and plain-text `lines`.
+Write operations return `{"ok":true}`. `exec --capture` returns the same screen
+object under `screen`; `exec --wait-for` returns `matched`.
+`send-key` accepts the same semantic tokens as the HTTP API (`Enter`, `Tab`,
+`Escape`, `Backspace`, `CtrlC`, `CtrlD`, `ArrowUp`, `ArrowDown`, `ArrowLeft`,
+`ArrowRight`, or one printable character) and maps them to backend-native key
+tokens before calling tmux/rmux.
 
 ## 2a. User Flow
 
@@ -101,8 +124,8 @@ Target top-level command groups:
 
 | Group | Purpose | Initial commands |
 | --- | --- | --- |
-| `termstage session` | Create, attach to, inspect, list, and stop backend-owned sessions. The backend session id is the termstage session id. | `session create --backend <tmux|rmux> --name <name> [--command <cmd> -g <arg>]`, `session attach <session-id> [--browser]`, `session list [--backend <backend>]`, `session inspect <session-id>`, `session stop <session-id>` |
-| `termstage api` | CLI wrapper for semantic operations used by agents and automation. | `api send-text`, `api send-key`, `api run-command --wait-for --capture`, `api read-screen` |
+| `termstage session` | Create, attach to, inspect, list, stop, and directly operate backend-owned sessions. The backend session id is the termstage session id. | `session create --backend <tmux|rmux> --name <name> [--command <cmd> -g <arg>]`, `session attach <session-id> [--browser]`, `session list [--backend <backend>]`, `session inspect <session-id>`, `session stop <session-id>`, `session screen`, `session send-text`, `session send-key`, `session exec`, `session scroll` |
+| `termstage api` | CLI wrapper for semantic operations through a running HTTP gateway, used by remote agents and automation. | `api send-text`, `api send-key`, `api run-command --wait-for --capture`, `api read-screen` |
 | `termstage auth` | Inspect or manage authentication state. | `auth status`; future `auth login/logout` |
 
 Design rules:
@@ -172,6 +195,16 @@ Session identity:
 - `session attach --browser` can attach any existing tmux session whose name is
   valid for the termstage protocol, including sessions created outside
   termstage.
+- `session screen/send-text/send-key/exec/scroll` resolve sessions the same way
+  as `session attach`. They call the selected backend adapter directly and do
+  not require a running browser/API gateway, URL, or token. Because these are
+  local backend operations, they do not enforce the HTTP gateway's auth policy
+  or Level 1 operation lock. Operators should use `termstage api ... --url ...
+  --token ...` when they need gateway-mediated auth, remote access, or browser
+  control ownership semantics.
+- `session exec` is modeled after `kubectl exec`: arguments after `--` are the
+  command text typed into the existing terminal session and then confirmed with
+  Enter. It is not a process spawn API and does not create a new pane.
 
 ## 5. AGENTS.md Binding
 

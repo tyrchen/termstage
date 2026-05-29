@@ -95,6 +95,11 @@ cargo run -p termstage --bin termstage -- \
 | `session attach <session-id> --browser` | Start the browser/API gateway for an existing session. |
 | `session list [--backend <backend>]` | List visible backend sessions. |
 | `session inspect <session-id>` | Show backend properties and attach commands. |
+| `session screen <session-id> [--backend <backend>]` | Read a plain-text screen snapshot directly from the backend. |
+| `session send-text <session-id> <text>` | Send literal text without starting a gateway. |
+| `session send-key <session-id> <key>` | Send a semantic key token such as `Enter` or `CtrlC`. |
+| `session exec <session-id> -- <command...>` | Type a command into the existing session and press Enter. |
+| `session scroll <session-id> <up|down> <amount>` | Scroll backend-visible history when supported. |
 | `session stop <session-id>` | Kill the resolved backend session. |
 
 Browser-mode options for `session attach --browser`:

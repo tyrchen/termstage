@@ -8,12 +8,14 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use termstage_core::{
+    backend::{BackendAdapter, BackendScreenSnapshot, BackendScrollDirection, BackendSessionRef},
     protocol::{AccessToken, SessionName, TerminalSize},
     rmux_backend::{RmuxBackend, RmuxSessionCommand},
     security::{BasePath, PublicBaseUrl},
@@ -25,12 +27,16 @@ use tokio::{
     net::TcpStream,
     process::Command,
     sync::Mutex,
+    time,
 };
 use tracing::{debug, info};
 use url::{Host, Url};
 
 use crate::{
-    settings::{api_client, backend_gateway, browser_presentation, cli_defaults, session_names},
+    settings::{
+        api_client, backend_gateway, browser_presentation, cli_defaults, semantic_api,
+        session_names,
+    },
     web::{BackendGateway, PresentationSettings, PresentationTheme, WebConfig, WebExposure, serve},
 };
 
@@ -100,6 +106,68 @@ enum SessionCommand {
     Inspect {
         /// Termstage session id or backend session name.
         session_id: String,
+    },
+    /// Read the visible screen directly from the backend session.
+    Screen {
+        /// Termstage session id or backend session name.
+        session_id: String,
+        /// Optional backend filter when the session id is ambiguous.
+        #[arg(long, value_enum)]
+        backend: Option<CliBackend>,
+    },
+    /// Send literal text directly to the backend session.
+    SendText {
+        /// Termstage session id or backend session name.
+        session_id: String,
+        /// Optional backend filter when the session id is ambiguous.
+        #[arg(long, value_enum)]
+        backend: Option<CliBackend>,
+        /// Text to send.
+        text: String,
+    },
+    /// Send one key token directly to the backend session.
+    SendKey {
+        /// Termstage session id or backend session name.
+        session_id: String,
+        /// Optional backend filter when the session id is ambiguous.
+        #[arg(long, value_enum)]
+        backend: Option<CliBackend>,
+        /// Key token, for example `Enter` or `CtrlC`.
+        key: String,
+    },
+    /// Type a command, press Enter, and optionally wait/capture.
+    #[command(visible_alias = "run-command")]
+    Exec {
+        /// Termstage session id or backend session name.
+        session_id: String,
+        /// Optional backend filter when the session id is ambiguous.
+        #[arg(long, value_enum)]
+        backend: Option<CliBackend>,
+        /// Visible text to wait for.
+        #[arg(long)]
+        wait_for: Option<String>,
+        /// Wait timeout in milliseconds.
+        #[arg(long)]
+        wait_timeout_ms: Option<u64>,
+        /// Return a screen capture.
+        #[arg(long, default_value_t = false)]
+        capture: bool,
+        /// Command argv to type into the session. Use `--` before the command.
+        #[arg(last = true, required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+    /// Scroll backend-visible history directly on the backend session.
+    Scroll {
+        /// Termstage session id or backend session name.
+        session_id: String,
+        /// Optional backend filter when the session id is ambiguous.
+        #[arg(long, value_enum)]
+        backend: Option<CliBackend>,
+        /// Scroll direction.
+        #[arg(value_enum)]
+        direction: CliScrollDirection,
+        /// Scroll amount.
+        amount: u16,
     },
     /// Stop a session by killing its backend session.
     Stop {
@@ -493,6 +561,11 @@ fn validate_session_args(args: SessionArgs) -> anyhow::Result<SessionArgs> {
         SessionCommand::Attach(_attach) => {}
         SessionCommand::List { .. }
         | SessionCommand::Inspect { .. }
+        | SessionCommand::Screen { .. }
+        | SessionCommand::SendText { .. }
+        | SessionCommand::SendKey { .. }
+        | SessionCommand::Exec { .. }
+        | SessionCommand::Scroll { .. }
         | SessionCommand::Stop { .. } => {}
     }
     Ok(args)
@@ -862,6 +935,44 @@ async fn run_session_command(args: SessionArgs) -> anyhow::Result<()> {
             write_session_list(&mut stdout, &records)
         }
         SessionCommand::Inspect { session_id } => run_session_inspect(session_id).await,
+        SessionCommand::Screen {
+            session_id,
+            backend,
+        } => run_session_screen(session_id, backend).await,
+        SessionCommand::SendText {
+            session_id,
+            backend,
+            text,
+        } => run_session_send_text(session_id, backend, text).await,
+        SessionCommand::SendKey {
+            session_id,
+            backend,
+            key,
+        } => run_session_send_key(session_id, backend, key).await,
+        SessionCommand::Exec {
+            session_id,
+            backend,
+            command,
+            wait_for,
+            wait_timeout_ms,
+            capture,
+        } => {
+            run_session_exec(
+                session_id,
+                backend,
+                command,
+                wait_for,
+                wait_timeout_ms,
+                capture,
+            )
+            .await
+        }
+        SessionCommand::Scroll {
+            session_id,
+            backend,
+            direction,
+            amount,
+        } => run_session_scroll(session_id, backend, direction, amount).await,
         SessionCommand::Stop { session_id } => run_session_stop(session_id).await,
     }
 }
@@ -1073,6 +1184,323 @@ async fn run_session_inspect(session_id: String) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+async fn run_session_screen(session_id: String, backend: Option<CliBackend>) -> anyhow::Result<()> {
+    let session_id = SessionName::from_str(&session_id).context("invalid session id")?;
+    let (mut backend, reference) = resolve_local_backend_session(backend, &session_id).await?;
+    let snapshot = backend.read_screen(&reference).await?;
+    write_json_line(&screen_json(&snapshot))
+}
+
+async fn run_session_send_text(
+    session_id: String,
+    backend: Option<CliBackend>,
+    text: String,
+) -> anyhow::Result<()> {
+    validate_local_text(&text, semantic_api::TEXT_MAX_BYTES, "text")?;
+    let session_id = SessionName::from_str(&session_id).context("invalid session id")?;
+    let (mut backend, reference) = resolve_local_backend_session(backend, &session_id).await?;
+    backend.send_text(&reference, &text).await?;
+    write_ok_json()
+}
+
+async fn run_session_send_key(
+    session_id: String,
+    backend: Option<CliBackend>,
+    key: String,
+) -> anyhow::Result<()> {
+    let key = local_semantic_key_token(&key)?;
+    let session_id = SessionName::from_str(&session_id).context("invalid session id")?;
+    let (mut backend, reference) = resolve_local_backend_session(backend, &session_id).await?;
+    backend.send_key(&reference, &key).await?;
+    write_ok_json()
+}
+
+async fn run_session_exec(
+    session_id: String,
+    backend: Option<CliBackend>,
+    command: Vec<String>,
+    wait_for: Option<String>,
+    wait_timeout_ms: Option<u64>,
+    capture: bool,
+) -> anyhow::Result<()> {
+    let command = local_exec_command(&command)?;
+    let wait_for = wait_for
+        .map(|text| validate_wait_text(text, "wait-for"))
+        .transpose()?;
+    let wait_timeout = semantic_wait_timeout(wait_timeout_ms)?;
+    let session_id = SessionName::from_str(&session_id).context("invalid session id")?;
+    let (mut backend, reference) = resolve_local_backend_session(backend, &session_id).await?;
+    backend.run_command(&reference, &command).await?;
+    let mut matched = None;
+    let mut screen = None;
+    if let Some(wait_for) = wait_for.as_deref() {
+        let result =
+            wait_for_local_screen_text(&mut backend, &reference, wait_for, wait_timeout).await?;
+        matched = Some(result.matched);
+        if capture {
+            screen = Some(screen_json(&result.snapshot));
+        }
+    } else if capture {
+        let snapshot = backend.read_screen(&reference).await?;
+        screen = Some(screen_json(&snapshot));
+    }
+    let mut response = json!({
+        "ok": true,
+        "matched": matched,
+        "screen": screen,
+    });
+    if matched.is_none()
+        && let Value::Object(object) = &mut response
+    {
+        object.remove("matched");
+    }
+    if screen.is_none()
+        && let Value::Object(object) = &mut response
+    {
+        object.remove("screen");
+    }
+    write_json_line(&response)
+}
+
+async fn run_session_scroll(
+    session_id: String,
+    backend: Option<CliBackend>,
+    direction: CliScrollDirection,
+    amount: u16,
+) -> anyhow::Result<()> {
+    let amount = validate_local_scroll_amount(amount)?;
+    let session_id = SessionName::from_str(&session_id).context("invalid session id")?;
+    let direction = direction.as_backend();
+    let (mut backend, reference) = resolve_local_backend_session(backend, &session_id).await?;
+    backend.scroll(&reference, direction, amount).await?;
+    write_ok_json()
+}
+
+async fn resolve_local_backend_session(
+    backend: Option<CliBackend>,
+    session_id: &SessionName,
+) -> anyhow::Result<(LocalBackend, BackendSessionRef)> {
+    match resolve_cli_session(backend, session_id).await? {
+        ResolvedCliSession::Tmux {
+            backend_session, ..
+        } => {
+            let backend = TmuxBackend::from_path().context("failed to resolve tmux backend")?;
+            let backend_ref = backend
+                .attach_existing_session(&backend_session)
+                .await
+                .with_context(|| {
+                    format!("failed to attach tmux session {}", backend_session.as_str())
+                })?;
+            Ok((LocalBackend::Tmux(backend), backend_ref))
+        }
+        ResolvedCliSession::Rmux {
+            backend_session, ..
+        } => {
+            let backend = RmuxBackend::connect()
+                .await
+                .context("failed to connect to rmux backend")?;
+            let backend_ref = backend
+                .attach_existing_session(&backend_session)
+                .await
+                .with_context(|| {
+                    format!("failed to attach rmux session {}", backend_session.as_str())
+                })?;
+            Ok((LocalBackend::Rmux(backend), backend_ref))
+        }
+    }
+}
+
+#[derive(Debug)]
+enum LocalBackend {
+    Tmux(TmuxBackend),
+    Rmux(RmuxBackend),
+}
+
+impl LocalBackend {
+    async fn read_screen(
+        &mut self,
+        reference: &BackendSessionRef,
+    ) -> Result<BackendScreenSnapshot, termstage_core::backend::BackendError> {
+        match self {
+            Self::Tmux(backend) => backend.read_screen(reference).await,
+            Self::Rmux(backend) => backend.read_screen(reference).await,
+        }
+    }
+
+    async fn send_text(
+        &mut self,
+        reference: &BackendSessionRef,
+        text: &str,
+    ) -> Result<(), termstage_core::backend::BackendError> {
+        match self {
+            Self::Tmux(backend) => backend.send_text(reference, text).await,
+            Self::Rmux(backend) => backend.send_text(reference, text).await,
+        }
+    }
+
+    async fn send_key(
+        &mut self,
+        reference: &BackendSessionRef,
+        key: &str,
+    ) -> Result<(), termstage_core::backend::BackendError> {
+        match self {
+            Self::Tmux(backend) => backend.send_key(reference, key).await,
+            Self::Rmux(backend) => backend.send_key(reference, key).await,
+        }
+    }
+
+    async fn run_command(
+        &mut self,
+        reference: &BackendSessionRef,
+        command: &str,
+    ) -> Result<(), termstage_core::backend::BackendError> {
+        match self {
+            Self::Tmux(backend) => backend.run_command(reference, command).await,
+            Self::Rmux(backend) => backend.run_command(reference, command).await,
+        }
+    }
+
+    async fn scroll(
+        &mut self,
+        reference: &BackendSessionRef,
+        direction: BackendScrollDirection,
+        amount: u16,
+    ) -> Result<(), termstage_core::backend::BackendError> {
+        match self {
+            Self::Tmux(backend) => backend.scroll(reference, direction, amount).await,
+            Self::Rmux(backend) => backend.scroll(reference, direction, amount).await,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LocalWaitResult {
+    matched: bool,
+    snapshot: BackendScreenSnapshot,
+}
+
+async fn wait_for_local_screen_text(
+    backend: &mut LocalBackend,
+    reference: &BackendSessionRef,
+    needle: &str,
+    timeout: Duration,
+) -> anyhow::Result<LocalWaitResult> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("wait deadline overflow")?;
+    loop {
+        let snapshot = backend.read_screen(reference).await?;
+        if snapshot.lines().iter().any(|line| line.contains(needle)) {
+            return Ok(LocalWaitResult {
+                matched: true,
+                snapshot,
+            });
+        }
+        if Instant::now() >= deadline {
+            return Ok(LocalWaitResult {
+                matched: false,
+                snapshot,
+            });
+        }
+        time::sleep(semantic_api::WAIT_POLL_INTERVAL).await;
+    }
+}
+
+fn screen_json(snapshot: &BackendScreenSnapshot) -> Value {
+    json!({
+        "size": snapshot.size(),
+        "cursorCol": snapshot.cursor_col(),
+        "cursorRow": snapshot.cursor_row(),
+        "cursorVisible": snapshot.cursor_visible(),
+        "lines": snapshot.lines(),
+    })
+}
+
+fn write_ok_json() -> anyhow::Result<()> {
+    write_json_line(&json!({ "ok": true }))
+}
+
+fn write_json_line(value: &Value) -> anyhow::Result<()> {
+    let mut stdout = io::stdout().lock();
+    serde_json::to_writer(&mut stdout, value).context("failed to write JSON response")?;
+    stdout
+        .write_all(b"\n")
+        .context("failed to write JSON response newline")
+}
+
+fn local_exec_command(command: &[String]) -> anyhow::Result<String> {
+    let command = command.join(" ");
+    validate_local_text(&command, semantic_api::TEXT_MAX_BYTES, "command")?;
+    if command.contains(['\r', '\n']) {
+        bail!("command must not contain line breaks");
+    }
+    Ok(command)
+}
+
+fn validate_local_text(text: &str, max_bytes: usize, field: &str) -> anyhow::Result<()> {
+    if text.len() > max_bytes {
+        bail!("{field} must be at most {max_bytes} bytes");
+    }
+    if text.as_bytes().contains(&0) {
+        bail!("{field} must not contain NUL bytes");
+    }
+    Ok(())
+}
+
+fn validate_wait_text(text: String, field: &str) -> anyhow::Result<String> {
+    if text.is_empty() {
+        bail!("{field} must not be empty");
+    }
+    validate_local_text(&text, semantic_api::WAIT_TEXT_MAX_BYTES, field)?;
+    Ok(text)
+}
+
+fn local_semantic_key_token(key: &str) -> anyhow::Result<String> {
+    if key.is_empty() || key.len() > semantic_api::KEY_MAX_BYTES {
+        bail!(
+            "key must be non-empty and at most {} bytes",
+            semantic_api::KEY_MAX_BYTES
+        );
+    }
+    let token = match key {
+        "Enter" => "Enter",
+        "Tab" => "Tab",
+        "Escape" => "Escape",
+        "Backspace" => "BSpace",
+        "CtrlC" => "C-c",
+        "CtrlD" => "C-d",
+        "ArrowUp" => "Up",
+        "ArrowDown" => "Down",
+        "ArrowRight" => "Right",
+        "ArrowLeft" => "Left",
+        _ => {
+            if key.chars().count() != 1 || key.chars().any(char::is_control) {
+                bail!("unsupported semantic key token");
+            }
+            key
+        }
+    };
+    Ok(token.to_owned())
+}
+
+fn validate_local_scroll_amount(amount: u16) -> anyhow::Result<u16> {
+    if amount == 0 || amount > semantic_api::SCROLL_MAX_AMOUNT {
+        bail!("amount must be in 1..={}", semantic_api::SCROLL_MAX_AMOUNT);
+    }
+    Ok(amount)
+}
+
+fn semantic_wait_timeout(value: Option<u64>) -> anyhow::Result<Duration> {
+    let millis = value.unwrap_or(semantic_api::WAIT_TIMEOUT_DEFAULT_MS);
+    if millis == 0 || millis > semantic_api::WAIT_TIMEOUT_MAX_MS {
+        bail!(
+            "wait timeout must be in 1..={} milliseconds",
+            semantic_api::WAIT_TIMEOUT_MAX_MS
+        );
+    }
+    Ok(Duration::from_millis(millis))
 }
 
 async fn run_session_stop(session_id: String) -> anyhow::Result<()> {
@@ -1626,6 +2054,13 @@ impl CliScrollDirection {
             Self::Down => "down",
         }
     }
+
+    const fn as_backend(self) -> BackendScrollDirection {
+        match self {
+            Self::Up => BackendScrollDirection::Up,
+            Self::Down => BackendScrollDirection::Down,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1870,6 +2305,201 @@ mod tests {
             args.command,
             SessionCommand::Attach(SessionAttachArgs { browser: true, .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_parse_session_screen_command() -> anyhow::Result<()> {
+        let args = CliArgs::try_parse_from([
+            "termstage",
+            "session",
+            "screen",
+            "demo",
+            "--backend",
+            "rmux",
+        ])?;
+        let command = ValidatedCliCommand::try_from(args)?;
+        let ValidatedCliCommand::Session(args) = command else {
+            anyhow::bail!("session command group must validate to session args");
+        };
+        assert!(matches!(
+            args.command,
+            SessionCommand::Screen {
+                ref session_id,
+                backend: Some(CliBackend::Rmux),
+            } if session_id == "demo"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_parse_session_send_text_command() -> anyhow::Result<()> {
+        let args = CliArgs::try_parse_from(["termstage", "session", "send-text", "demo", "hello"])?;
+        let command = ValidatedCliCommand::try_from(args)?;
+        let ValidatedCliCommand::Session(args) = command else {
+            anyhow::bail!("session command group must validate to session args");
+        };
+        assert!(matches!(
+            args.command,
+            SessionCommand::SendText {
+                ref session_id,
+                backend: None,
+                ref text,
+            } if session_id == "demo" && text == "hello"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_parse_session_send_key_command() -> anyhow::Result<()> {
+        let args = CliArgs::try_parse_from(["termstage", "session", "send-key", "demo", "Enter"])?;
+        let command = ValidatedCliCommand::try_from(args)?;
+        let ValidatedCliCommand::Session(args) = command else {
+            anyhow::bail!("session command group must validate to session args");
+        };
+        assert!(matches!(
+            args.command,
+            SessionCommand::SendKey {
+                ref session_id,
+                backend: None,
+                ref key,
+            } if session_id == "demo" && key == "Enter"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_parse_session_exec_command_after_separator() -> anyhow::Result<()> {
+        let args = CliArgs::try_parse_from([
+            "termstage",
+            "session",
+            "exec",
+            "demo",
+            "--backend",
+            "tmux",
+            "--wait-for",
+            "done",
+            "--capture",
+            "--",
+            "echo",
+            "done",
+        ])?;
+        let command = ValidatedCliCommand::try_from(args)?;
+        let ValidatedCliCommand::Session(args) = command else {
+            anyhow::bail!("session command group must validate to session args");
+        };
+        assert!(matches!(
+            args.command,
+            SessionCommand::Exec {
+                ref session_id,
+                backend: Some(CliBackend::Tmux),
+                ref command,
+                ref wait_for,
+                capture: true,
+                ..
+            } if session_id == "demo"
+                && command == &["echo".to_owned(), "done".to_owned()]
+                && wait_for.as_deref() == Some("done")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_parse_session_run_command_alias() -> anyhow::Result<()> {
+        let args = CliArgs::try_parse_from([
+            "termstage",
+            "session",
+            "run-command",
+            "demo",
+            "--",
+            "echo",
+            "ok",
+        ])?;
+        let command = ValidatedCliCommand::try_from(args)?;
+        let ValidatedCliCommand::Session(args) = command else {
+            anyhow::bail!("session command group must validate to session args");
+        };
+        assert!(matches!(
+            args.command,
+            SessionCommand::Exec {
+                ref session_id,
+                ref command,
+                ..
+            } if session_id == "demo" && command == &["echo".to_owned(), "ok".to_owned()]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_parse_session_scroll_command() -> anyhow::Result<()> {
+        let args =
+            CliArgs::try_parse_from(["termstage", "session", "scroll", "demo", "down", "5"])?;
+        let command = ValidatedCliCommand::try_from(args)?;
+        let ValidatedCliCommand::Session(args) = command else {
+            anyhow::bail!("session command group must validate to session args");
+        };
+        assert!(matches!(
+            args.command,
+            SessionCommand::Scroll {
+                ref session_id,
+                backend: None,
+                direction: CliScrollDirection::Down,
+                amount: 5,
+            } if session_id == "demo"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_map_session_send_key_semantic_tokens() -> anyhow::Result<()> {
+        assert_eq!(local_semantic_key_token("Enter")?, "Enter");
+        assert_eq!(local_semantic_key_token("CtrlC")?, "C-c");
+        assert_eq!(local_semantic_key_token("CtrlD")?, "C-d");
+        assert_eq!(local_semantic_key_token("ArrowUp")?, "Up");
+        assert_eq!(local_semantic_key_token("a")?, "a");
+        assert!(local_semantic_key_token("").is_err());
+        assert!(local_semantic_key_token("C-c").is_err());
+        assert!(local_semantic_key_token("\n").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_render_screen_snapshot_as_json() -> anyhow::Result<()> {
+        let snapshot = BackendScreenSnapshot::new_with_cursor_visibility(
+            TerminalSize::new(80, 24)?,
+            4,
+            3,
+            false,
+            vec!["prompt".to_owned()],
+        );
+        let response = screen_json(&snapshot);
+
+        assert_eq!(response["size"]["cols"], 80);
+        assert_eq!(response["cursorCol"], 4);
+        assert_eq!(response["cursorVisible"], false);
+        assert_eq!(response["lines"], json!(["prompt"]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_validate_session_exec_command_text() -> anyhow::Result<()> {
+        assert_eq!(
+            local_exec_command(&["echo".to_owned(), "ok".to_owned()])?,
+            "echo ok"
+        );
+        assert!(local_exec_command(&["bad\ncommand".to_owned()]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_validate_session_scroll_amount() -> anyhow::Result<()> {
+        assert_eq!(validate_local_scroll_amount(1)?, 1);
+        assert_eq!(
+            validate_local_scroll_amount(semantic_api::SCROLL_MAX_AMOUNT)?,
+            semantic_api::SCROLL_MAX_AMOUNT
+        );
+        assert!(validate_local_scroll_amount(0).is_err());
+        assert!(validate_local_scroll_amount(semantic_api::SCROLL_MAX_AMOUNT + 1).is_err());
         Ok(())
     }
 
