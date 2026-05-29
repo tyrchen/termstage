@@ -1,6 +1,6 @@
 # 20-browser-terminal-web: Server and Browser UI
 
-Status: draft v1
+Status: draft v2
 Owner: termstage
 Depends on: [10-browser-terminal-protocol-design.md](./10-browser-terminal-protocol-design.md),
 [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md),
@@ -9,7 +9,15 @@ Depends on: [10-browser-terminal-protocol-design.md](./10-browser-terminal-proto
 ## 1. Purpose
 
 The web layer owns the local Axum server, WebSocket upgrade path, bundled static
-assets, and browser terminal UI. It does not parse shell commands or own PTY state.
+assets, and browser terminal UI. It does not parse shell commands or own PTY
+state.
+
+The browser UI is an embedded terminal component inside a page, not the entire
+page. Today the page has a toolbar and one xterm surface; future versions may
+add buttons, side panels, status views, or other HTML around the terminal. The
+xterm instance must fit the container element assigned to it, and scrolling or
+viewport gestures must be scoped to that terminal container rather than the
+document body.
 
 ## 2. Interface
 
@@ -28,7 +36,7 @@ Frontend modules:
 | --- | --- |
 | `terminal.ts` | xterm.js creation, fit addon, theme/font presets. |
 | `socket.ts` | WebSocket lifecycle and protocol frame handling. |
-| `resize.ts` | Fit-to-container and debounced resize control messages. |
+| `resize.ts` | Fit-to-container measurement and debounced viewport-size control messages. |
 | `presentation.ts` | Presentation mode settings: font size, theme, cursor, copy/paste behavior. |
 
 ## 2a. Flow
@@ -36,24 +44,104 @@ Frontend modules:
 ```text
 +--------------------- selected exposure policy ----------------------+
 |                                                                     |
-|  Chrome tab                                                         |
-|  +--------------------+      binary/text WS       +--------------+  |
-|  | xterm.js frontend  | <-----------------------> | Axum routes  |  |
-|  | - @xterm/xterm     |                           | / /ws/assets |  |
-|  | - fit addon        |                           +------+-------+  |
-|  | - web-links addon  |                                  |          |
-|  +--------------------+                                  |          |
+|  Browser page                                                       |
+|  +---------------------------------------------------------------+  |
+|  | page HTML                                                     |  |
+|  | +----------------------+                                      |  |
+|  | | toolbar / controls   |                                      |  |
+|  | +----------------------+                                      |  |
+|  | +---------------------------------------------------------+   |  |
+|  | | terminal container                                      |   |  |
+|  | | - owns scroll/viewport gestures                         |   |  |
+|  | | - xterm fits this element, not the whole page           |   |  |
+|  | | +--------------------+     binary/text WS  +----------+ |   |  |
+|  | | | xterm.js frontend  | <-----------------> | /ws      | |   |  |
+|  | | | - @xterm/xterm     |                     | Axum     | |   |  |
+|  | | | - fit addon        |                     +----+-----+ |   |  |
+|  | | | - web-links addon  |                          |       |   |  |
+|  | | +--------------------+                          |       |   |  |
+|  | +--------------------------------------------------|-------+   |  |
+|  +----------------------------------------------------|----------+  |
 |                                                          v          |
 |                                                  +---------------+  |
-|                                                  | Runtime actor |  |
-|                                                  | PTY/session   |  |
+|                                                  | Runtime or    |  |
+|                                                  | Gateway state |  |
 |                                                  +-------+-------+  |
 |                                                          |          |
 +----------------------------------------------------------+----------+
                                                            |
                                                            v
-                                                   local shell/tmux
+                                                   local shell/tmux/backend
 ```
+
+## 2b. Embedded Size Model
+
+The web UI keeps three size concepts separate:
+
+```text
+Browser page
+┌──────────────────────────────────────────────────────────────┐
+│ toolbar / future buttons / future panels                     │
+├──────────────────────────────────────────────────────────────┤
+│ terminal container                                           │
+│                                                              │
+│  visible viewport from fit addon: 100x30                     │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │ xterm instance: 100x30, fills this container           │  │
+│  │                                                        │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                              │
+│  component-local scroll gestures may adjust a logical        │
+│  backend viewport; the document body must not scroll.        │
+└──────────────────────────────────────────────────────────────┘
+
+Backend session
+┌──────────────────────────────────────────────────────────────┐
+│ tmux/rmux pane screen: 188x52                                │
+│ - owned by backend                                           │
+│ - may be viewed through native attach                        │
+│ - not resized by browser container changes                   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Rules:
+
+- The xterm DOM and xterm `cols`/`rows` fit the terminal container. They do not
+  expand to the backend pane size merely because the backend screen is wider or
+  taller.
+- Browser `Resize` control messages describe the embedded terminal viewport,
+  not necessarily a backend pane resize request.
+- In runtime-owned shell/PTY mode, the server may apply viewport resize to the
+  runtime PTY because the browser owns that PTY presentation.
+- In backend-owned gateway mode, browser viewport changes do not resize the
+  backend pane. The gateway projects the backend screen snapshot into the
+  browser viewport size.
+- Backend snapshot projection must be explicit: the server selects visible rows
+  and columns from the backend screen according to viewport state, then writes a
+  frame that fits the xterm instance. It must not rely on xterm overflow,
+  autowrap suppression, or accidental clipping to hide content.
+- Backend-owned gateway rendering uses adaptive polling: idle browser sessions
+  poll backend screen state at a conservative interval, while recent browser
+  input, viewport movement, resize, or lease acquisition temporarily enables a
+  faster screen poll window for responsive feedback.
+- Backend snapshot frames reset SGR state at each projected row boundary so
+  attributes from one backend row cannot leak into the first cell of the next
+  row.
+- Backend snapshot projection preserves ANSI color sequences. Theme presets own
+  the ANSI palette mapping. Presentation themes may map ANSI black to the
+  terminal default background to avoid discontinuities between default-background
+  cells and explicit `40m` cells, and must pair that with xterm's minimum
+  contrast handling so `30m` foreground text remains readable.
+- Backend snapshot frames preserve backend cursor visibility. Full-screen
+  applications that hide the cursor in tmux must not show an extra browser
+  xterm cursor.
+- The initial projection origin is top-left: column `0`, row `0`. A backend
+  cursor near the right or bottom edge must not cause first attach to crop
+  left-side labels or full-screen headers such as k9s `Context:`.
+- Horizontal and vertical navigation over a larger backend screen is a
+  component-local terminal viewport concern. The browser sends viewport-origin
+  control frames for this navigation, and future buttons or page content must
+  not change this contract.
 
 ## 3. Invariants
 
@@ -67,6 +155,11 @@ Frontend modules:
 - WebSocket max frame size and max message size are explicitly configured.
 - Browser UI sends terminal input as binary frames and resize as JSON text frames.
 - UI text does not explain implementation details; the screen is the usable terminal.
+- The browser terminal is embeddable: adding page-level buttons or panels cannot
+  require changing the terminal protocol or backend sizing semantics.
+- In backend-owned gateway mode, xterm size equals browser container fit size,
+  while backend screen size remains backend-owned. Rendering uses a deterministic
+  snapshot projection from backend screen space to browser viewport space.
 
 ## 4. Behavior
 
@@ -81,14 +174,22 @@ public base URL. Host and Origin validation use that same public URL instead of 
 pod socket address, and non-loopback peers are accepted because ingress traffic enters
 the pod as ordinary TCP peers.
 
-The frontend uses `@xterm/xterm`, `@xterm/addon-fit`, and `@xterm/addon-web-links`.
-The WebGL addon is optional and guarded behind a frontend feature because rendering
-fallback must work on presentation machines without GPU acceleration.
+The frontend uses `@xterm/xterm`, `@xterm/addon-fit`, and
+`@xterm/addon-web-links`. The fit addon measures the terminal container, not the
+full browser page. The WebGL addon is optional and guarded behind a frontend
+feature because rendering fallback must work on presentation machines without
+GPU acceleration.
 
 The WebSocket handler splits send and receive halves. Receive frames map to
 `RuntimeCommand::Input` or validated `RuntimeCommand::Resize`. Runtime output is sent
 as binary frames to the browser. Any protocol or security error closes the socket and
 emits a redacted structured log event.
+
+For backend-owned gateway sessions, receive frames map through the backend
+adapter and operation lock instead of the runtime PTY actor. Browser resize
+frames update only the browser viewport size in gateway state. Backend screen
+snapshots are read with backend-native screen dimensions and projected into the
+browser viewport before being sent as terminal bytes.
 
 ## 5. AGENTS.md Binding
 
@@ -112,5 +213,6 @@ emits a redacted structured log event.
   [11-browser-terminal-runtime-design.md](./11-browser-terminal-runtime-design.md),
   [70-browser-terminal-security-design.md](./70-browser-terminal-security-design.md).
 - Consumed by: [50-browser-terminal-cli-design.md](./50-browser-terminal-cli-design.md),
+  [23-local-remote-command-lease-design.md](./23-local-remote-command-lease-design.md),
   [21-browser-terminal-public-exposure-design.md](./21-browser-terminal-public-exposure-design.md),
   [72-browser-terminal-verification-plan.md](./72-browser-terminal-verification-plan.md).

@@ -19,7 +19,7 @@ export interface ConnectionStatusDialog {
 export interface TerminalToolbar {
   updateFontFamily: (fontFamily: TerminalFontFamily) => void;
   updateFontSize: (fontSize: number) => void;
-  updateLease: (owner: 'terminal' | 'browser') => void;
+  updateLease: (owner: 'terminal' | 'browser' | 'agent') => void;
   updateSession: (session: string) => void;
   updateTheme: (theme: PresentationThemeName) => void;
 }
@@ -145,12 +145,9 @@ export function createTerminalToolbar(
     updateFontSize: (fontSize: number) => {
       fontSizeValue.textContent = `${fontSize}px`;
     },
-    updateLease: (owner: 'terminal' | 'browser') => {
-      const browserOwnsInput = owner === 'browser';
+    updateLease: (owner: 'terminal' | 'browser' | 'agent') => {
       controlItem.value.dataset.owner = owner;
-      controlItem.value.textContent = browserOwnsInput
-        ? 'control by browser'
-        : 'control by terminal';
+      controlItem.value.textContent = controlLabel(owner);
     },
     updateSession: (session: string) => {
       sessionItem.value.textContent = session;
@@ -159,6 +156,17 @@ export function createTerminalToolbar(
       themeSelect.value = theme;
     }
   };
+}
+
+function controlLabel(owner: 'terminal' | 'browser' | 'agent'): string {
+  switch (owner) {
+    case 'browser':
+      return 'control by browser';
+    case 'agent':
+      return 'control by agent';
+    case 'terminal':
+      return 'control by terminal';
+  }
 }
 
 function createToolbarField(

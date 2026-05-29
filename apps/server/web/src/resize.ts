@@ -1,6 +1,8 @@
 import { FitAddon } from '@xterm/addon-fit';
 import { Terminal } from '@xterm/xterm';
 
+import { browserTerminalResizeSettings } from './settings';
+
 export interface TerminalSize {
   cols: number;
   rows: number;
@@ -13,19 +15,16 @@ export function watchTerminalResize(
   sendResize: (size: TerminalSize) => void
 ): () => void {
   let timeout: number | undefined;
-  let lastSize = proposedSize(fitAddon) ?? currentSize(terminal);
+  let lastSize = proposedTerminalSize(fitAddon, terminal);
   const resizeObserver = new ResizeObserver(() => {
     window.clearTimeout(timeout);
     timeout = window.setTimeout(() => {
-      const nextSize = proposedSize(fitAddon);
-      if (nextSize === undefined) {
-        return;
-      }
+      const nextSize = proposedTerminalSize(fitAddon, terminal);
       if (nextSize.cols !== lastSize.cols || nextSize.rows !== lastSize.rows) {
         lastSize = nextSize;
         sendResize(nextSize);
       }
-    }, 80);
+    }, browserTerminalResizeSettings.observerDebounceMs);
   });
   resizeObserver.observe(root);
   sendResize(lastSize);
@@ -36,7 +35,22 @@ export function watchTerminalResize(
 }
 
 export function proposedTerminalSize(fitAddon: FitAddon, terminal: Terminal): TerminalSize {
-  return proposedSize(fitAddon) ?? currentSize(terminal);
+  return clampTerminalSize(proposedSize(fitAddon) ?? currentSize(terminal));
+}
+
+export function clampTerminalSize(size: TerminalSize): TerminalSize {
+  return {
+    cols: clampDimension(
+      size.cols,
+      browserTerminalResizeSettings.colsMin,
+      browserTerminalResizeSettings.colsMax
+    ),
+    rows: clampDimension(
+      size.rows,
+      browserTerminalResizeSettings.rowsMin,
+      browserTerminalResizeSettings.rowsMax
+    )
+  };
 }
 
 function currentSize(terminal: Terminal): TerminalSize {
@@ -55,4 +69,11 @@ function proposedSize(fitAddon: FitAddon): TerminalSize | undefined {
     cols: dimensions.cols,
     rows: dimensions.rows
   };
+}
+
+function clampDimension(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+  return Math.min(max, Math.max(min, Math.floor(value)));
 }

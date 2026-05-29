@@ -1,7 +1,8 @@
 import { Terminal } from '@xterm/xterm';
 
 import { ConnectionStatus } from './connection-status';
-import { TerminalSize } from './resize';
+import { TerminalSize, clampTerminalSize } from './resize';
+import { browserTerminalCloseReasons, browserTerminalSocketSettings } from './settings';
 import { scrollTerminalViewportToContentEnd, writeTerminalOutput } from './terminal';
 
 interface ResizeControlMessage {
@@ -15,28 +16,41 @@ interface HeartbeatControlMessage {
   sequence: number;
 }
 
-type ClientControlMessage = ResizeControlMessage | HeartbeatControlMessage;
+interface AcquireControlMessage {
+  type: 'acquireControl';
+}
+
+interface ViewportControlMessage {
+  type: 'viewport';
+  col?: number;
+  row?: number;
+}
+
+type ClientControlMessage =
+  | ResizeControlMessage
+  | HeartbeatControlMessage
+  | AcquireControlMessage
+  | ViewportControlMessage;
+
+export interface TerminalViewportOrigin {
+  col?: number;
+  row?: number;
+}
 
 export interface TerminalSocket {
   sendResize: (size: TerminalSize) => void;
+  sendViewport: (origin: TerminalViewportOrigin) => void;
   close: () => void;
 }
 
 export interface TerminalSocketOptions {
   onStatusChange?: (status: ConnectionStatus) => void;
-  onLeaseChange?: (owner: 'terminal' | 'browser') => void;
+  onLeaseChange?: (owner: 'terminal' | 'browser' | 'agent') => void;
   onSessionReady?: (session: string) => void;
   onSizeChange?: (size: TerminalSize) => void;
 }
 
-const RECONNECT_DELAYS_MS = [250, 500, 1000, 2000] as const;
-const LOST_AFTER_RECONNECT_ATTEMPTS = RECONNECT_DELAYS_MS.length;
-const SESSION_ENDED_REASON = 'session ended';
-const SERVER_SHUTDOWN_REASON = 'server shutting down';
-const RUNTIME_ERROR_REASON = 'runtime error';
-const CLIENT_DISCONNECTED_REASON = 'client disconnected';
-const CONTROLLER_REPLACED_REASON = 'controller replaced';
-const BROWSER_BACKPRESSURE_REASON = 'browser client backpressure';
+const LOST_AFTER_RECONNECT_ATTEMPTS = browserTerminalSocketSettings.reconnectDelaysMs.length;
 
 export function connectTerminalSocket(
   terminal: Terminal,
@@ -45,8 +59,6 @@ export function connectTerminalSocket(
   const token = new URLSearchParams(window.location.search).get('token') ?? '';
   const baseUrl = new URL('ws', document.baseURI);
   baseUrl.protocol = baseUrl.protocol === 'https:' ? 'wss:' : 'ws:';
-  baseUrl.search = `?token=${token}`;
-  const socketUrl = baseUrl.toString();
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   let heartbeatSequence = 0;
@@ -55,31 +67,43 @@ export function connectTerminalSocket(
   let reconnectAttempt = 0;
   let closedByClient = false;
   let terminalEnded = false;
-  let lastSize: TerminalSize = { cols: terminal.cols, rows: terminal.rows };
+  let lastSize: TerminalSize = clampTerminalSize({ cols: terminal.cols, rows: terminal.rows });
   let socket = openSocket();
   let inputForwardingSuppressed = true;
-  let leaseOwner: 'terminal' | 'browser' = 'terminal';
-  const userInputArm = createUserInputArm(terminal);
+  let leaseOwner: 'terminal' | 'browser' | 'agent' = 'terminal';
+  let lastAcquireControlAt = 0;
+  let pendingAcquireInput = '';
+  let pendingAcquireInputExpiresAt = 0;
 
   const disposable = terminal.onData((data: string) => {
-    if (
-      !inputForwardingSuppressed &&
-      (leaseOwner === 'browser' || userInputArm.isArmed()) &&
-      socket.readyState === WebSocket.OPEN
-    ) {
-      socket.send(encoder.encode(data));
+    if (socket.readyState !== WebSocket.OPEN) {
+      return;
     }
+    if (inputForwardingSuppressed) {
+      queuePendingAcquireInput(data);
+      return;
+    }
+    if (leaseOwner === 'browser') {
+      socket.send(encoder.encode(data));
+      return;
+    }
+    queuePendingAcquireInput(data);
+    requestBrowserControl();
   });
+  const acquireControlArm = createAcquireControlArm(terminal, requestBrowserControl);
 
   return {
     sendResize: (size: TerminalSize) => {
-      lastSize = size;
-      sendControl(socket, { type: 'resize', cols: size.cols, rows: size.rows });
+      lastSize = clampTerminalSize(size);
+      sendControl(socket, { type: 'resize', cols: lastSize.cols, rows: lastSize.rows });
+    },
+    sendViewport: (origin: TerminalViewportOrigin) => {
+      sendControl(socket, { type: 'viewport', ...origin });
     },
     close: () => {
       closedByClient = true;
       disposable.dispose();
-      userInputArm.dispose();
+      acquireControlArm.dispose();
       window.clearInterval(heartbeatId);
       window.clearTimeout(reconnectId);
       socket.close();
@@ -87,10 +111,12 @@ export function connectTerminalSocket(
   };
 
   function openSocket(): WebSocket {
-    const nextSocket = new WebSocket(socketUrl);
+    const nextSocket = new WebSocket(currentSocketUrl());
     nextSocket.binaryType = 'arraybuffer';
     nextSocket.addEventListener('open', () => {
       reconnectAttempt = 0;
+      lastAcquireControlAt = 0;
+      clearPendingAcquireInput();
       setInputForwardingSuppressed(true);
       emitStatus({ state: 'connected' });
       sendControl(nextSocket, { type: 'resize', cols: lastSize.cols, rows: lastSize.rows });
@@ -142,7 +168,12 @@ export function connectTerminalSocket(
 
     emitStatus({ state: 'reconnecting' });
     const delay =
-      RECONNECT_DELAYS_MS[Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)];
+      browserTerminalSocketSettings.reconnectDelaysMs[
+        Math.min(
+          reconnectAttempt,
+          browserTerminalSocketSettings.reconnectDelaysMs.length - 1
+        )
+      ];
     reconnectAttempt += 1;
     reconnectId = window.setTimeout(() => {
       socket = openSocket();
@@ -153,8 +184,14 @@ export function connectTerminalSocket(
     options.onStatusChange?.(status);
   }
 
-  function emitLeaseChange(owner: 'terminal' | 'browser'): void {
+  function emitLeaseChange(owner: 'terminal' | 'browser' | 'agent'): void {
     leaseOwner = owner;
+    lastAcquireControlAt = 0;
+    if (owner === 'browser') {
+      flushPendingAcquireInput();
+    } else {
+      clearPendingAcquireInput();
+    }
     options.onLeaseChange?.(owner);
   }
 
@@ -175,44 +212,102 @@ export function connectTerminalSocket(
     terminal.write('', () => {
       scrollTerminalViewportToContentEnd(terminal);
       setInputForwardingSuppressed(false);
+      resumePendingInput();
     });
   }
+
+  function requestBrowserControl(): void {
+    if (
+      inputForwardingSuppressed ||
+      leaseOwner === 'browser' ||
+      socket.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+    const now = Date.now();
+    if (
+      now - lastAcquireControlAt <
+      browserTerminalSocketSettings.acquireControlThrottleMs
+    ) {
+      return;
+    }
+    lastAcquireControlAt = now;
+    sendControl(socket, { type: 'acquireControl' });
+  }
+
+  function queuePendingAcquireInput(data: string): void {
+    if (
+      pendingAcquireInput.length + data.length >
+      browserTerminalSocketSettings.pendingAcquireInputMaxChars
+    ) {
+      clearPendingAcquireInput();
+      return;
+    }
+    pendingAcquireInput += data;
+    pendingAcquireInputExpiresAt =
+      Date.now() + browserTerminalSocketSettings.pendingAcquireInputTtlMs;
+  }
+
+  function flushPendingAcquireInput(): void {
+    if (pendingAcquireInput.length === 0) {
+      return;
+    }
+    const input = pendingAcquireInput;
+    const expiresAt = pendingAcquireInputExpiresAt;
+    clearPendingAcquireInput();
+    if (
+      Date.now() <= expiresAt &&
+      socket.readyState === WebSocket.OPEN &&
+      !inputForwardingSuppressed
+    ) {
+      socket.send(encoder.encode(input));
+    }
+  }
+
+  function clearPendingAcquireInput(): void {
+    pendingAcquireInput = '';
+    pendingAcquireInputExpiresAt = 0;
+  }
+
+  function resumePendingInput(): void {
+    if (pendingAcquireInput.length === 0) {
+      return;
+    }
+    if (leaseOwner === 'browser') {
+      flushPendingAcquireInput();
+    } else {
+      requestBrowserControl();
+    }
+  }
+
+  function currentSocketUrl(): string {
+    baseUrl.search = '';
+    baseUrl.searchParams.set('token', token);
+    baseUrl.searchParams.set('cols', lastSize.cols.toString());
+    baseUrl.searchParams.set('rows', lastSize.rows.toString());
+    return baseUrl.toString();
+  }
 }
 
-interface UserInputArm {
+function createAcquireControlArm(terminal: Terminal, requestBrowserControl: () => void): {
   dispose: () => void;
-  isArmed: () => boolean;
-}
-
-function createUserInputArm(terminal: Terminal): UserInputArm {
-  let armed = false;
-  let disarmTimeout: number | undefined;
+} {
   const element = terminal.element;
   if (element === undefined) {
-    return {
-      dispose: () => {},
-      isArmed: () => false
-    };
+    return { dispose: () => undefined };
   }
-  const arm = (): void => {
-    armed = true;
-    window.clearTimeout(disarmTimeout);
-    disarmTimeout = window.setTimeout(() => {
-      armed = false;
-    }, 100);
+  const listener = (): void => {
+    requestBrowserControl();
   };
-  const eventTypes = ['keydown', 'keypress', 'paste', 'compositionend', 'mousedown', 'wheel'];
-  for (const eventType of eventTypes) {
-    element.addEventListener(eventType, arm, { capture: true });
-  }
+  element.addEventListener('mousedown', listener, { capture: true });
+  element.addEventListener('keydown', listener, { capture: true });
+  element.addEventListener('paste', listener, { capture: true });
   return {
     dispose: () => {
-      window.clearTimeout(disarmTimeout);
-      for (const eventType of eventTypes) {
-        element.removeEventListener(eventType, arm, { capture: true });
-      }
-    },
-    isArmed: () => armed
+      element.removeEventListener('mousedown', listener, { capture: true });
+      element.removeEventListener('keydown', listener, { capture: true });
+      element.removeEventListener('paste', listener, { capture: true });
+    }
   };
 }
 
@@ -228,7 +323,7 @@ function handleControlMessage(
   suppressInputForwarding: (suppressed: boolean) => void,
   finishReplay: () => void,
   emitStatus: (status: ConnectionStatus) => void,
-  emitLeaseChange: (owner: 'terminal' | 'browser') => void,
+  emitLeaseChange: (owner: 'terminal' | 'browser' | 'agent') => void,
   emitSessionReady: (session: string) => void,
   emitSizeChange: (size: TerminalSize) => void
 ): boolean {
@@ -261,7 +356,7 @@ function handleControlMessage(
       (message as { owner?: string }).owner !== undefined
     ) {
       const owner = (message as { owner?: string }).owner;
-      if (owner === 'terminal' || owner === 'browser') {
+      if (owner === 'terminal' || owner === 'browser' || owner === 'agent') {
         emitStatus({ state: 'connected' });
         emitLeaseChange(owner);
         return false;
@@ -294,23 +389,28 @@ function isTerminalSize(value: unknown): value is TerminalSize {
 
 function terminalEndStatus(event: CloseEvent): ConnectionStatus | undefined {
   switch (event.reason) {
-    case SESSION_ENDED_REASON:
-    case CLIENT_DISCONNECTED_REASON:
-    case BROWSER_BACKPRESSURE_REASON:
+    case browserTerminalCloseReasons.clientDisconnected:
+    case browserTerminalCloseReasons.browserBackpressure:
       return undefined;
-    case SERVER_SHUTDOWN_REASON:
+    case browserTerminalCloseReasons.sessionEnded:
+      return {
+        state: 'ended',
+        title: 'Session ended',
+        message: 'The backend session ended.'
+      };
+    case browserTerminalCloseReasons.serverShutdown:
       return {
         state: 'ended',
         title: 'Session ended',
         message: 'The server shut down.'
       };
-    case RUNTIME_ERROR_REASON:
+    case browserTerminalCloseReasons.runtimeError:
       return {
         state: 'ended',
         title: 'Session ended',
         message: 'The terminal runtime stopped after an error.'
       };
-    case CONTROLLER_REPLACED_REASON:
+    case browserTerminalCloseReasons.controllerReplaced:
       return {
         state: 'ended',
         title: 'Session attached elsewhere',

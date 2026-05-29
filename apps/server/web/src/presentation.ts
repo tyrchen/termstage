@@ -1,3 +1,5 @@
+import { browserPresentationSettings } from './settings';
+
 export type PresentationThemeName = 'high-contrast' | 'light';
 export type TerminalFontFamilyName =
   | 'termstage'
@@ -28,6 +30,7 @@ export interface ThemePalette {
   background: string;
   foreground: string;
   cursor: string;
+  minimumContrastRatio: number;
   selectionBackground: string;
   black: string;
   red: string;
@@ -47,10 +50,10 @@ export interface ThemePalette {
   brightWhite: string;
 }
 
-const DEFAULT_FONT_SIZE = 24;
-const DEFAULT_FONT_FAMILY: TerminalFontFamilyName = 'termstage';
-export const MIN_FONT_SIZE = 12;
-export const MAX_FONT_SIZE = 96;
+const DEFAULT_FONT_FAMILY: TerminalFontFamilyName =
+  browserPresentationSettings.defaultFontFamily;
+export const MIN_FONT_SIZE = browserPresentationSettings.fontSizeMin;
+export const MAX_FONT_SIZE = browserPresentationSettings.fontSizeMax;
 
 export const FONT_FAMILIES: readonly TerminalFontFamily[] = [
   {
@@ -101,8 +104,9 @@ const THEMES: Record<PresentationThemeName, ThemePalette> = {
     background: '#0c2f38',
     foreground: '#d5dee1',
     cursor: '#f4d35e',
+    minimumContrastRatio: 4.5,
     selectionBackground: '#225866',
-    black: '#0b2028',
+    black: '#0c2f38',
     red: '#e76f51',
     green: '#65d46e',
     yellow: '#f4d35e',
@@ -123,8 +127,9 @@ const THEMES: Record<PresentationThemeName, ThemePalette> = {
     background: '#fbfcfe',
     foreground: '#121820',
     cursor: '#0057b8',
+    minimumContrastRatio: 4.5,
     selectionBackground: '#b9d7ff',
-    black: '#15191f',
+    black: '#fbfcfe',
     red: '#b42318',
     green: '#157f3b',
     yellow: '#8a6200',
@@ -184,11 +189,11 @@ export function fontFamilyByName(name: TerminalFontFamilyName): TerminalFontFami
 
 function parseFontSize(value: string | null): number {
   if (value === null) {
-    return DEFAULT_FONT_SIZE;
+    return browserPresentationSettings.defaultFontSize;
   }
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed)) {
-    return DEFAULT_FONT_SIZE;
+    return browserPresentationSettings.defaultFontSize;
   }
   return clampFontSize(parsed);
 }
